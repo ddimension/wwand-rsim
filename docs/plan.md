@@ -133,11 +133,34 @@ OpenWrt packages feed (pcsc-lite 2.5.0). `SCardConnect` T=0 (fallback T=1),
 `SCardGetStatusChange` for insert/remove events. Built only when libpcsclite
 is present (`WITH_PCSC`), so the Phoenix-only package has no dependency.
 
-### 3.3 Later
+### 3.3 Next: the helper on another machine, over SSH (decided 2026-09-26)
 
-A remote reader over IP (the helper protocol over a TCP/TLS socket, or
-osmo-remsim's RSPRO), and a software USIM (Milenage from Ki/OPc) — both are
-another card behind the same helper lines.
+The plugin talks to rsim-card only through its stdin/stdout, so a reader on
+another machine needs no new protocol: the plugin starts
+`ssh <user>@<host> rsim-card <reader>` instead of the local helper, and the
+lines travel over SSH (encrypted, key-authenticated). The card sits in the
+reader on the PC, the modem on the router uses it.
+
+- Config: `rsim_reader 'ssh:<user>@<host>:<reader>'`, e.g.
+  `ssh:rsim@pc.lan:wbsm:`; the plugin builds
+  `ssh -T -o BatchMode=yes <user>@<host> rsim-card <reader> [options]`
+  (dropbear's `dbclient` on OpenWrt; key in `/etc/wwand/rsim/id_*`,
+  `rsim_ssh_key` to override).
+- The remote side needs rsim-card and access to the reader (for `wbsm:`
+  the udev rule for 104f:0002 plus ftdi_sio `new_id`, or root).
+- Nothing else changes: a dropped connection is a helper exit, which the
+  plugin already turns into "card removed, connection unavailable" and a
+  retry with backoff.
+- Latency: a LAN adds milliseconds per APDU against a modem timeout of
+  seconds.
+
+### 3.4 Later
+
+A SIM bank: osmo-remsim (bankd with PC/SC readers, RSPRO over IP) as a
+backend for many cards and routers.
+
+A software USIM (Milenage from Ki/OPc) — another card behind the same
+helper lines.
 
 ## 4. Plugin behaviour
 
