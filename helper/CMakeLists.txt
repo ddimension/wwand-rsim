@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: GPL-2.0-only
+cmake_minimum_required(VERSION 3.13)
+project(rsim-card C)
+
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+# warnings are errors while developing; a distribution build with a newer
+# compiler than this was written against turns that off
+option(RSIM_WERROR "treat warnings as errors" ON)
+add_compile_options(-Wall -Wextra)
+if(RSIM_WERROR)
+	add_compile_options(-Werror)
+endif()
+# cfmakeraw, CRTSCTS and dprintf are outside strict C99/POSIX
+add_compile_definitions(_DEFAULT_SOURCE)
+
+# PC/SC is optional so that the Phoenix-only package has no dependency:
+# AUTO builds it when pkg-config finds libpcsclite, ON insists, OFF skips.
+set(WITH_PCSC AUTO CACHE STRING "PC/SC backend: AUTO, ON or OFF")
+set_property(CACHE WITH_PCSC PROPERTY STRINGS AUTO ON OFF)
+set(RSIM_PCSC OFF)
+if(NOT WITH_PCSC STREQUAL "OFF")
+	find_package(PkgConfig)
+	if(PKG_CONFIG_FOUND)
+		pkg_check_modules(PCSC libpcsclite)
+	endif()
+	if(PCSC_FOUND)
+		set(RSIM_PCSC ON)
+	elseif(WITH_PCSC STREQUAL "ON")
+		message(FATAL_ERROR "WITH_PCSC=ON but libpcsclite was not found by pkg-config")
+	endif()
+endif()
+message(STATUS "rsim-card: PC/SC backend ${RSIM_PCSC}")
+
+add_library(rsimcore STATIC src/atr.c src/t0.c src/json.c src/log.c)
+target_include_directories(rsimcore PUBLIC src)
+
+set(RSIM_SOURCES src/main.c src/phoenix.c src/phoenix_baud.c)
+if(RSIM_PCSC)
+	list(APPEND RSIM_SOURCES src/pcsc.c)
+endif()
+add_executable(rsim-card ${RSIM_SOURCES})
+target_link_libraries(rsim-card rsimcore)
+if(RSIM_PCSC)
+	target_compile_definitions(rsim-card PRIVATE WITH_PCSC)
+	target_include_directories(rsim-card PRIVATE ${PCSC_INCLUDE_DIRS})
+	target_link_libraries(rsim-card ${PCSC_LDFLAGS})
+endif()
+install(TARGETS rsim-card RUNTIME DESTINATION bin)
+
+include(CTest)
+if(BUILD_TESTING)
+	foreach(t atr t0 json)
+		add_executable(test_${t} tests/test_${t}.c)
+		target_link_libraries(test_${t} rsimcore)
+		add_test(NAME ${t} COMMAND test_${t})
+	endforeach()
+	find_package(Python3 COMPONENTS Interpreter)
+	if(Python3_FOUND)
+		add_test(NAME e2e_phoenix
+			COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_e2e.py $<TARGET_FILE:rsim-card>)
+		set_tests_properties(e2e_phoenix PROPERTIES TIMEOUT 120)
+	endif()
+endif()
