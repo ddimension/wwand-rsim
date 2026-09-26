@@ -168,7 +168,9 @@ function cfg_of(ext)
 			key: ext.rsim_ssh_key ?? null,
 			helper: ext.rsim_ssh_helper ?? 'rsim-card',
 		} : null,
-		slot: (slot >= 0 && slot <= 3) ? slot : 1,
+		// 1..3: the service decodes anything else to "not applicable", and
+		// its event handler serves only real slots
+		slot: (slot >= 1 && slot <= 3) ? slot : 1,
 		clock: ext.rsim_clock ?? null,
 		reset: ext.rsim_reset ?? null,
 		detect: ext.rsim_detect ?? null,
@@ -432,6 +434,11 @@ function create(deps)
 
 	// per modem: the session with the modem and the card
 	let sessions = {};
+	// per modem: the session whose teardown is still in flight. Its
+	// card-removed / connection-unavailable reach the modem asynchronously,
+	// so a new session started meanwhile would be withdrawn by the old one's
+	// connection-unavailable arriving AFTER the new offer.
+	let stopping = {};
 	// per modem: what the status shows after a session is gone
 	let notes = {};
 
@@ -440,7 +447,7 @@ function create(deps)
 	let new_session = (ref, cfg) => ({
 		ref: ref, cfg: cfg, key: sprintf('%J', cfg),
 		state: 'starting',     // starting | waiting | connected | powered | failed
-		rpc: null, client: null, atr: null,
+		rpc: null, client: null, atr: null, card_gen: 0,
 		apdus: 0, last_sw: null, last_error: null, since: now(),
 		queue: [], busy: false,
 	});
@@ -479,9 +486,15 @@ function create(deps)
 	};
 
 	// the card's ATR to the modem, after it (re)powered or reset the card
+	// Every card operation the modem asks for supersedes the ones before it:
+	// a power-up still on its way when a power-down (or a disconnect) comes
+	// in must not answer afterwards with an ATR the modem no longer wants.
+	// The helper runs them in order; `card_gen` decides whose answer counts.
 	let card_up = (s, op) => {
+		let gen = ++s.card_gen;
+
 		s.rpc.call({ op: op }, (err, res) => {
-			if (s.state == 'failed')
+			if (s.state == 'failed' || s.card_gen != gen)
 				return;
 
 			if (err || !bytes(res?.atr)) {
@@ -573,6 +586,13 @@ function create(deps)
 			if (!mine(d))
 				return;
 
+			// the card as well, not only our state: a Phoenix card would stay
+			// released from reset and a PC/SC card held exclusively
+			s.card_gen++;
+			s.queue = [];
+			s.rpc.call({ op: 'power_down' }, (err) => err
+				? log('warn', sprintf('rsim %s: powering the card down failed: %s', s.ref, err.error ?? '?'))
+				: null);
 			s.state = 'waiting';
 			log('notice', sprintf('rsim %s: the modem disconnected from the remote card', s.ref));
 		});
@@ -582,6 +602,7 @@ function create(deps)
 			if (!mine(d))
 				return;
 
+			s.card_gen++;
 			s.rpc.call({ op: 'power_down' }, () => null);
 			s.state = 'connected';
 			log('notice', sprintf('rsim %s: the modem powered the card down', s.ref));
@@ -710,7 +731,15 @@ function create(deps)
 		};
 
 		if (c && !c.destroyed) {
-			let rel = () => { deps.qmi_release(s.ref, c); back(); };
+			stopping[s.ref] = s;
+
+			let rel = () => {
+				deps.qmi_release(s.ref, c);
+				back();
+
+				if (stopping[s.ref] == s)
+					delete stopping[s.ref];
+			};
 
 			if (polite && was != 'starting') {
 				c.request('EVENT', { info: { event: EV_CARD_REMOVED, slot: s.cfg.slot } }, () =>
@@ -749,7 +778,7 @@ function create(deps)
 				s = null;
 			}
 
-			if (!cfg || s)
+			if (!cfg || s || stopping[ref])
 				return;
 
 			if (notes[ref]?.retry_at && now() < notes[ref].retry_at)

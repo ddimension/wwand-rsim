@@ -118,7 +118,9 @@ function fake_client(opt)
 	c.on = (name, cb) => { c.handlers[name] = c.handlers[name] ?? []; push(c.handlers[name], cb); };
 	c.request = (name, args, cb, o) => {
 		push(c.sent, { name: name, args: args });
-		uloop.timer(0, () => cb((c.refuse && name == 'EVENT') ? { error: 'qmi', code: 3 } : null, {}));
+		if (opt?.wire)
+			push(opt.wire, sprintf('%s:%d', c.tag ?? '?', args?.info?.event ?? -1));
+		uloop.timer(opt?.delay ?? 0, () => cb((c.refuse && name == 'EVENT') ? { error: 'qmi', code: 3 } : null, {}));
 	};
 	c.fire = (name, data) => { for (let h in (c.handlers[name] ?? [])) h(data); };
 	c.events = () => map(filter(c.sent, (s) => s.name == 'EVENT'), (s) => s.args.info.event);
@@ -155,7 +157,8 @@ function fake_reader(card)
 					ans = r.card.hang ? null : { ok: true, data: r.card.answer(req.data) };
 
 				if (ans)
-					uloop.timer(0, () => on_line(sprintf('%J', ans)));
+					uloop.timer((req.op == 'power_up') ? (r.card.up_delay ?? 0) : 0,
+						() => on_line(sprintf('%J', ans)));
 			},
 			close: () => { r.closed++; },
 		};
@@ -289,6 +292,89 @@ const EXT = { rsim_reader: 'phoenix:/dev/ttyUSB0' };
 	   'card change: and again once the modem has its own card back');
 	changes = [];
 	eq(reader.closed, 1, 'leave: the helper is closed');
+}
+
+// --- review findings (Codex, 2026-09-26) ------------------------------------------
+
+// A reader change while the old session's goodbye is still on its way: the old
+// connection-unavailable must reach the modem BEFORE the new offer, or it
+// withdraws the new session's card.
+{
+	let t = { now: 1000 };
+	let reader = fake_reader(card_model());
+	let wire = [];
+	let n = 0;
+	let p = mk(reader, (ref, schema, cb) => {
+		let c = fake_client({ delay: 30, wire: wire });
+
+		c.tag = sprintf('c%d', ++n);
+		cb(null, c);
+	}, t);
+
+	p.tick('m0', EXT);
+	run_for(80);
+	p.tick('m0', { rsim_reader: 'phoenix:/dev/ttyUSB1' });
+	p.tick('m0', { rsim_reader: 'phoenix:/dev/ttyUSB1' });
+	run_for(150);
+	p.tick('m0', { rsim_reader: 'phoenix:/dev/ttyUSB1' });
+	run_for(150);
+
+	let old_off = index(wire, 'c1:0'), new_on = index(wire, 'c2:1');
+
+	ok(old_off >= 0 && new_on > old_off,
+	   'teardown: the old connection-unavailable goes out before the new offer, not after it');
+}
+
+// a power-up still on its way when the modem powers the card down: its ATR
+// must not go to the modem afterwards
+{
+	let t = { now: 1000 };
+	let cm = card_model();
+	let reader = fake_reader(cm);
+	let client = fake_client();
+	let p = mk(reader, (ref, schema, cb) => cb(null, client), t);
+
+	p.tick('m0', EXT);
+	run_for(20);
+	client.fire('CONNECT_IND', { slot: 1 });
+	run_for(20);
+
+	cm.up_delay = 50;
+	let before = length(client.sent);
+
+	client.fire('CARD_POWER_UP_IND', { slot: 1 });
+	client.fire('CARD_POWER_DOWN_IND', { slot: 1, mode: 1 });
+	run_for(120);
+
+	eq(filter(slice(client.sent, before), (x) => x.name == 'EVENT' && x.args.info.event == 5), [],
+	   'stale power-up: no card-reset/ATR after the modem has powered the card down');
+
+	let st;
+
+	p.ops.status('m0', EXT, {}, (e, r) => { st = r; });
+	eq(st.state, 'connected', 'stale power-up: ...and the state stays what the last request left');
+
+	// a disconnect powers the card down too, not only our state
+	cm.up_delay = 0;
+	client.fire('CARD_POWER_UP_IND', { slot: 1 });
+	run_for(20);
+	client.fire('DISCONNECT_IND', { slot: 1 });
+	run_for(20);
+	eq(reader.lines[length(reader.lines) - 1].op, 'power_down', 'disconnect: the card is powered down');
+}
+
+// slots are 1..3
+{
+	eq(rsim.cfg_of({ rsim_reader: 'pcsc:0', rsim_slot: '0' }).slot, 1, 'slot 0 is not a slot the service serves');
+	eq(rsim.cfg_of({ rsim_reader: 'pcsc:0', rsim_slot: '2' }).slot, 2, 'slot 2 is');
+}
+
+// every quote, not only the first (OpenWrt ucode replace() with /g is global;
+// this pins it, since a string pattern would not be)
+{
+	let a = rsim.helper_argv(rsim.cfg_of({ rsim_reader: "ssh:u@h:pcsc:a'b'c;x" }), '/x', { flavor: 'openssh', exists: () => false });
+
+	eq(a[length(a) - 1], "'rsim-card' 'pcsc:a'\\''b'\\''c;x'", 'quoting: two quotes and a metacharacter stay one word');
 }
 
 // no card in the reader: the modem's own SIM is never taken away
