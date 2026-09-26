@@ -524,12 +524,19 @@ function create(deps)
 			return int((t1[0] - t0[0]) * 1000 + (t1[1] - t0[1]) / 1000000);
 		};
 
+		// an answer that comes back after the modem powered the card down or
+		// disconnected belongs to a card session that no longer exists
+		let gen = s.card_gen;
+
 		s.busy = true;
 		s.rpc.call({ op: 'tpdu', data: hexs(a.command) }, (err, res) => {
 			s.busy = false;
 
 			if (s.state == 'failed')
 				return;
+
+			if (s.card_gen != gen)
+				return pump_apdu(s);
 
 			let resp = err ? null : bytes(res?.data);
 			let ms = elapsed_ms();
@@ -636,8 +643,10 @@ function create(deps)
 				// decoder and is refused as malformed (QMI error 1,
 				// HW-observed on the RG650E, 2026-09-26)
 				log('notice', sprintf('rsim %s: card inserted in the reader', ref));
+				let gen = ++s.card_gen;
+
 				s.rpc.call({ op: 'power_up' }, (err, res) => {
-					if (s.state == 'failed' || err || !bytes(res?.atr))
+					if (s.state == 'failed' || s.card_gen != gen || err || !bytes(res?.atr))
 						return;
 
 					s.atr = res.atr;

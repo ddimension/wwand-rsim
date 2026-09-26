@@ -363,6 +363,43 @@ const EXT = { rsim_reader: 'phoenix:/dev/ttyUSB0' };
 	eq(reader.lines[length(reader.lines) - 1].op, 'power_down', 'disconnect: the card is powered down');
 }
 
+// ...nor an APDU answer that comes back after a disconnect, nor a card
+// inserted in the reader whose power-up the modem has overtaken
+{
+	let t = { now: 1000 };
+	let cm = card_model();
+	let reader = fake_reader(cm);
+	let client = fake_client();
+	let p = mk(reader, (ref, schema, cb) => cb(null, client), t);
+
+	p.tick('m0', EXT);
+	run_for(20);
+	client.fire('CONNECT_IND', { slot: 1 });
+	run_for(20);
+
+	let slow = reader.open_helper;
+	let before = length(client.sent);
+
+	cm.hang = true;   // the TPDU is on the card and does not come back yet
+	client.fire('APDU_IND', { slot: 1, apdu_id: 77, command: rsim.bytes('A0B0000002') });
+	run_for(10);
+	client.fire('DISCONNECT_IND', { slot: 1 });
+	cm.hang = false;
+	reader.on_line('{"ok":true,"data":"12349000"}');   // the late answer
+	run_for(20);
+	eq(filter(slice(client.sent, before), (x) => x.name == 'APDU'), [],
+	   'stale apdu: an answer after the disconnect is not sent to the modem');
+
+	cm.up_delay = 50;
+	before = length(client.sent);
+	reader.on_line('{"event":"inserted"}');
+	run_for(10);
+	client.fire('CARD_POWER_DOWN_IND', { slot: 1, mode: 1 });
+	run_for(120);
+	eq(filter(slice(client.sent, before), (x) => x.name == 'EVENT' && x.args.info.event == 2), [],
+	   'stale insert: no card-inserted after the modem has powered the card down');
+}
+
 // slots are 1..3
 {
 	eq(rsim.cfg_of({ rsim_reader: 'pcsc:0', rsim_slot: '0' }).slot, 1, 'slot 0 is not a slot the service serves');
