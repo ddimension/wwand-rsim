@@ -120,6 +120,9 @@ function ssh_key(run)
 	               (!fs.access('/usr/bin/ssh') && fs.access('/usr/bin/dbclient'));
 	let key = sprintf('%s/%s', KEY_DIR, dropbear ? 'id_dropbear' : 'id_ed25519');
 
+	// parents first: fs.mkdir makes one level, and /etc/wwand does not
+	// exist on a box that never needed it
+	fs.mkdir('/etc/wwand', 0o755);
 	fs.mkdir(KEY_DIR, 0o700);
 
 	if (!fs.access(key)) {
