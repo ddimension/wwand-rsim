@@ -79,6 +79,22 @@ uloop.init();
 	eq(rsim.reader_options({ type: 'at', device: '/dev/ttyUSB3', host: 'root@simhost', radio: 'keep' }).rsim_reader,
 	   'ssh:root@simhost:at:/dev/ttyUSB3', 'reader at: a named one on another router');
 	ok(index(rsim.reader_options({ type: 'at' }).error ?? '', 'AT port') >= 0, 'reader at: without its device, refused');
+
+	// a paired phone's SIM over the Bluetooth SIM Access Profile
+	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: 'bt:00:11:22:AA:BB:CC' }), '/x'), [ '/x', 'bt:00:11:22:AA:BB:CC' ],
+	   'cfg bt: the phone\'s address; its channel from SDP by the helper\'s default');
+	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: 'bt:00:11:22:AA:BB:CC', rsim_bt_channel: '8', rsim_bt_security: 'high',
+	                                  rsim_bt_apdu: '7816', rsim_at_radio: 'keep', rsim_clock: '6000' }), '/x'),
+	   [ '/x', 'bt:00:11:22:AA:BB:CC', '--bt-channel', '8', '--bt-security', 'high', '--bt-apdu', '7816' ],
+	   'cfg bt: channel, security and APDU format reach the helper, other readers\' options do not');
+	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: 'bt:00:11:22:AA:BB:CC', rsim_bt_channel: '99', rsim_bt_security: 'x' }), '/x'),
+	   [ '/x', 'bt:00:11:22:AA:BB:CC' ], 'cfg bt: values out of range are left out');
+	eq(rsim.cfg_of({ rsim_reader: 'ssh:u@pc.lan:bt:00:11:22:AA:BB:CC' })?.local_reader, 'bt:00:11:22:AA:BB:CC',
+	   'cfg bt: a phone paired with a SIM host, over SSH');
+	let rbt = rsim.reader_options({ type: 'bt', device: '00:11:22:aa:bb:cc', host: 'u@pc.lan', channel: '8' });
+	eq([ rbt.rsim_reader, rbt.rsim_bt_channel ], [ 'ssh:u@pc.lan:bt:00:11:22:aa:bb:cc', '8' ], 'reader bt: a named phone on a SIM host');
+	ok(index(rsim.reader_options({ type: 'bt', device: 'phone' }).error ?? '', 'Bluetooth address') >= 0,
+	   'reader bt: a device that is no address, refused');
 	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: 'phoenix:/dev/ttyUSB0', rsim_clock: '6000', rsim_reset: 'rts_inv' }), '/x'),
 	   [ '/x', 'phoenix:/dev/ttyUSB0', '--clock', '6000', '--reset', 'rts_inv' ],
 	   'cfg: Phoenix options reach the helper');

@@ -255,7 +255,8 @@ function fake_ctx(start)
 		'{"backend":"wbsm","spec":"wbsm:088888-03","serial":"088888-03"}',
 		'{"backend":"tty","spec":"at:/dev/ttyUSB2","device":"/dev/ttyUSB2","driver":"option1","usb":"2c7c:0122","interface":"02","hint":"at"}',
 		'{"backend":"tty","spec":"at:/dev/ttyUSB6","device":"/dev/ttyUSB6","driver":"option1","usb":"12d1:1506","interface":"02","hint":"at"}',
-		'{"done":true,"backends":"phoenix,at,wbsm,pcsc"}',
+		'{"backend":"bt","spec":"bt:AA:BB:CC:DD:EE:01","device":"AA:BB:CC:DD:EE:01","name":"Pixel","adapter":"00:1A:7D:DA:71:13","phone":true,"sap":true}',
+		'{"done":true,"backends":"phoenix,at,wbsm,pcsc,bt"}',
 	]) + '\n';
 	let sys = {
 		run: (cmd) => { push(ran, cmd); return out; },
@@ -270,7 +271,8 @@ function fake_ctx(start)
 
 	let p = ctl.scan_parse(out, sys.status());
 
-	eq([ length(p.rows), p.done?.backends ], [ 4, 'phoenix,at,wbsm,pcsc' ], 'scan: every reader, and the backends');
+	eq([ length(p.rows), p.done?.backends ], [ 5, 'phoenix,at,wbsm,pcsc,bt' ], 'scan: every reader, and the backends');
+	eq([ p.rows[4].spec, p.rows[4].sap ], [ 'bt:AA:BB:CC:DD:EE:01', true ], 'scan: a paired phone offering SIM Access');
 	eq(p.rows[2].in_use, 'AT port of wwand modem wwmodem0',
 	   'scan: the AT port of wwand\'s own modem is marked — an at: reader there takes its card');
 	eq(p.rows[3].in_use, null, 'scan: another modem\'s port is free to use');

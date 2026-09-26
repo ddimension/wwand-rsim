@@ -191,7 +191,9 @@ function list_readers(ctx)
 
 // `rsim scan [user@host] [--json]`: what a machine offers as a card source —
 // PC/SC readers (with or without a card), Smartmouse USB readers, serial
-// ports that look like a Phoenix adapter or a modem's AT port — from
+// ports that look like a Phoenix adapter or a modem's AT port, paired phones
+// (Bluetooth SIM Access; whether a phone offers it is what BlueZ last read
+// from it — the phone is not called up, that would take its SIM) — from
 // `rsim-card --list`, run here or on a SIM host over SSH exactly as a
 // session would run it. Ports of wwand's own modems here are marked: an at:
 // reader on one of them would take a card from under wwand (a sponsor is
@@ -267,11 +269,15 @@ function scan(ctx, args, sys)
 	}
 
 	if (json_out) {
-		printf('%J\n', { ok: true, host: host, backends: split(done.backends ?? '', ','), readers: rows });
+		printf('%J\n', { ok: true, host: host, backends: split(done.backends ?? '', ','), readers: rows,
+		                 note: done.note ?? null });
 		return 0;
 	}
 
 	printf('backends in this rsim-card%s: %s\n', host ? ' on ' + host : '', done.backends ?? '?');
+
+	if (done.note)
+		printf('note: %s\n', done.note);
 
 	if (!length(rows))
 		printf('no reader or port found\n');
@@ -284,6 +290,10 @@ function scan(ctx, args, sys)
 
 		let what = (r.backend == 'pcsc') ? sprintf('PC/SC reader, %s', r.card ? 'card inserted' : 'no card')
 			: (r.backend == 'wbsm') ? 'Smartmouse USB'
+			: (r.backend == 'bt') ? sprintf('phone "%s" over Bluetooth, %s', r.name ?? '?',
+				(r.sap === true) ? 'offers SIM Access'
+				: (r.sap === false) ? 'SIM Access NOT offered (not supported, or off on the phone)'
+				: 'SIM Access unknown (services not read yet)')
 			: sprintf('serial %s%s%s', r.driver ?? '?', length(r.usb ?? '') ? ' ' + r.usb : '',
 			          (r.hint == 'at') ? ', a modem port' : (r.hint == 'phoenix') ? ', a USB-serial adapter' : '');
 

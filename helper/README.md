@@ -13,6 +13,7 @@ modem's QMI UIM Remote requests to it (`docs/plan.md` §2, §3).
 `-DWITH_PCSC=OFF` builds the Phoenix backend only (no dependency beyond libc);
 `-DWITH_PCSC=ON` fails the configure when libpcsclite is missing.
 `WITH_LIBUSB` (AUTO/ON/OFF, libusb-1.0 via pkg-config) adds `wbsm:`.
+`WITH_BLUETOOTH` (ON/OFF, no dependency) adds `bt:`.
 `-DRSIM_WERROR=OFF` drops `-Werror` for a compiler newer than this was
 written against. The end-to-end test needs `python3` (standard library only).
 
@@ -21,6 +22,8 @@ written against. The end-to-end test needs `python3` (standard library only).
     rsim-card [-v] [-s] [options] phoenix:/dev/ttyUSB0
     rsim-card [-v] [-s] [options] wbsm:[USB serial]
     rsim-card [-v] [-s] pcsc:<reader-name substring | index>
+    rsim-card [-v] [-s] [options] at:<tty>
+    rsim-card [-v] [-s] [options] bt:<phone's Bluetooth address>
 
 | Option | Default | |
 |---|---|---|
@@ -31,6 +34,9 @@ written against. The end-to-end test needs `python3` (standard library only).
 | `--detect LINE` | `none` | `cts`, `dsr`, `cd`: card-detect line (asserted = present), polled every 500 ms while idle |
 | `--atr-timeout-ms N` | 1000 | wait for the first ATR byte (1..7000) |
 | `--wbsm-mode MODE` | `phoenix` | `smartmouse`: the WB reader's wiring, set by software |
+| `--bt-channel N` | SDP | the phone's SAP RFCOMM channel, 1..30 |
+| `--bt-security L` | `medium` | `high`: a link key with MITM protection required |
+| `--bt-apdu F` | `gsm` | `7816`: send CommandAPDU7816 instead of CommandAPDU |
 
 stdin EOF ends the helper: the card is powered down first, exit status 0.
 
@@ -94,6 +100,29 @@ once parity checking is armed — the same as ftdi_sio + `INPCK|IGNPAR`.
 `SCardReconnect` for reset/cold start, `SCardDisconnect(UNPOWER)` for
 power-down, `SCardGetStatusChange(0)` for presence.
 
+**Bluetooth SIM Access** (`bt:`, `src/bt.c`, `src/sap.c`, `WITH_BLUETOOTH`):
+the SAP v1.1 client over kernel sockets only — an SDP
+ServiceSearchAttributeRequest over L2CAP for the SIM Access class (0x112D)
+gives the RFCOMM channel, then the RFCOMM link with `BT_SECURITY` medium (or
+high) set before connecting. CONNECT_REQ asks for 1024-byte messages and
+takes the phone's size instead when it says so (at least 276 are needed for
+a 261-byte command); the first STATUS_IND says the card is ready. power_up
+is POWER_SIM_ON (when off) + TRANSFER_ATR, reset RESET_SIM + TRANSFER_ATR,
+power_down POWER_SIM_OFF, tpdu TRANSFER_APDU with the bytes as they are —
+61xx/6Cxx come back unchanged. STATUS_IND is followed between requests:
+removed/not accessible report the card absent, inserted present again; a
+reset or recovery by the phone after an ATR went out is reported as removed
++ inserted, so the target reads the card anew. DISCONNECT_IND (answered with
+DISCONNECT_REQ when graceful), a link that drops and an answer that does
+not come within 25 s (SAP answers carry no request id: a late one would be
+taken for the next request's) end the helper with status 1; stdin EOF ends it with POWER_SIM_OFF and DISCONNECT_REQ, so the
+phone has its SIM back at once. Pairing and link keys are BlueZ's: the
+helper does no pairing. `--list` reads BlueZ's storage
+(`/var/lib/bluetooth/<adapter>/<device>/info`): paired (a BR/EDR link key)
+phones (device class) or devices whose stored services include SAP, with
+`"sap": true|false|null` (null: services never read); nothing is sent to a
+phone.
+
 ## Test hook
 
 `RSIM_TEST_MCTRL=<path>`: the Phoenix backend writes `RTS=0|1` / `DTR=0|1`
@@ -101,6 +130,11 @@ lines to that file instead of driving the modem-control lines, and tolerates a
 failing `tcsetattr`. A pseudo-terminal has no modem-control lines, and the
 simulated card (`tests/fakecard.py`) must see the reset pulse. Only
 `tests/test_e2e.py` sets it.
+
+`RSIM_TEST_SAP_SOCK=<path>`: the `bt:` backend connects to a unix socket
+instead of the phone (no SDP, no Bluetooth), and
+`RSIM_TEST_SAP_TIMEOUT_MS` shortens the answer timeout there; `tests/test_e2e_sap.py` runs a
+simulated SAP server there.
 
 ## Status
 

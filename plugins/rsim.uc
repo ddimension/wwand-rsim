@@ -39,12 +39,12 @@ function helper_found()
 // changes (docs/plan.md §3.3). The router's key lives here; `wwandctl rsim
 // ssh-key` creates it.
 const SSH_KEY_DIR = '/etc/wwand/rsim';
-const LOCAL_READER = /^((phoenix|pcsc|at):.|wbsm:)/;
+const LOCAL_READER = /^((phoenix|pcsc|at|bt):.|wbsm:)/;
 
 // 'ssh:user@host:reader' -> { dest, reader }, or null
 function ssh_split(r)
 {
-	let m = match(r, /^ssh:([A-Za-z0-9._-]+@[A-Za-z0-9._-]+):((phoenix|pcsc|wbsm|at):.*)$/);
+	let m = match(r, /^ssh:([A-Za-z0-9._-]+@[A-Za-z0-9._-]+):((phoenix|pcsc|wbsm|at|bt):.*)$/);
 
 	return (m && match(m[2], LOCAL_READER)) ? { dest: m[1], reader: m[2] } : null;
 }
@@ -224,6 +224,11 @@ const BACKOFF_MIN = 10, BACKOFF_MAX = 300;
 // a Phoenix reader, a TPDU the card's work waiting time
 const HELPER_TIMEOUT_MS = 15000;
 
+// A phone's SIM over Bluetooth (bt:): the helper looks up the SAP channel,
+// connects and waits for the phone to grant SIM access — which may ask its
+// user — before the first power-up can be answered.
+const BT_FIRST_TIMEOUT_MS = 60000;
+
 // The modem states in which its QMI services are up (modem.uc, the init
 // chain after INIT_SERVICES), so a UIM Remote client can be had.
 const READY_FOR_REMOTE = [ 'SIM_UNLOCK', 'SIM_BLOCKED', 'SET_OPMODE', 'REGISTERING', 'CONFIGURE_NET', 'READY' ];
@@ -266,8 +271,9 @@ function bytes(h)
 // network) as the plugin options a modem would carry, so a modem can say
 // `option rsim '<name>'` instead of spelling the reader out — and the reader
 // is defined once, however often it is moved between modems.
-//   type    wbsm | phoenix | pcsc | modem
-//   device  tty (phoenix), reader name/index (pcsc), USB serial (wbsm)
+//   type    wbsm | phoenix | pcsc | at | bt | modem
+//   device  tty (phoenix, at), reader name/index (pcsc), USB serial (wbsm),
+//           the phone's Bluetooth address (bt)
 //   host    user@host: the reader is on that machine, reached over SSH
 //   donor   (type modem) the modem that lends its card; donor_mode sap|apdu
 // Returns the options, or { error } for a section that cannot work.
@@ -287,7 +293,7 @@ function reader_options(r)
 
 		spec = 'modem:' + r.donor;
 	}
-	else if (t == 'wbsm' || t == 'pcsc' || t == 'phoenix' || t == 'at') {
+	else if (t == 'wbsm' || t == 'pcsc' || t == 'phoenix' || t == 'at' || t == 'bt') {
 		if (t == 'phoenix' && !length(r.device ?? ''))
 			return { error: 'a Phoenix reader needs `option device` (its serial port)' };
 
@@ -295,6 +301,10 @@ function reader_options(r)
 		// managed): its card through its AT port
 		if (t == 'at' && !length(r.device ?? ''))
 			return { error: 'an AT modem needs `option device` (its AT port, e.g. /dev/ttyUSB2)' };
+
+		// a paired phone's SIM over the Bluetooth SIM Access Profile
+		if (t == 'bt' && !match(r.device ?? '', /^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$/))
+			return { error: 'a phone needs `option device` (its Bluetooth address, AA:BB:CC:DD:EE:FF)' };
 
 		spec = t + ':' + ((t == 'pcsc' && !length(r.device ?? '')) ? '0' : (r.device ?? ''));
 
@@ -308,6 +318,7 @@ function reader_options(r)
 		rsim_reader: spec,
 		rsim_clock: r.clock, rsim_mode: r.mode, rsim_reset: r.reset, rsim_detect: r.detect,
 		rsim_at_radio: r.radio, rsim_at_baud: r.baud,
+		rsim_bt_channel: r.channel, rsim_bt_security: r.security, rsim_bt_apdu: r.apdu,
 		rsim_ssh_port: r.port, rsim_ssh_key: r.key, rsim_ssh_helper: r.helper,
 		rsim_donor_mode: r.donor_mode, rsim_donor_slot: r.donor_slot,
 		rsim_donor_cond: r.donor_cond, rsim_donor_apdu: r.donor_apdu,
@@ -359,6 +370,9 @@ function cfg_of(ext)
 		mode: ext.rsim_mode ?? null,
 		at_radio: (index([ 'off', 'keep' ], ext.rsim_at_radio) >= 0) ? ext.rsim_at_radio : null,
 		at_baud: (+ext.rsim_at_baud > 0) ? +ext.rsim_at_baud : null,
+		bt_channel: (+ext.rsim_bt_channel >= 1 && +ext.rsim_bt_channel <= 30) ? +ext.rsim_bt_channel : null,
+		bt_security: (ext.rsim_bt_security == 'high') ? 'high' : null,
+		bt_apdu: (ext.rsim_bt_apdu == '7816') ? '7816' : null,
 		// another wwand modem lending its card (docs/plan.md §3.5)
 		donor: donor ? {
 			ref: donor,
@@ -400,6 +414,17 @@ function helper_argv(cfg, path, sys)
 			push(argv, '--at-radio', cfg.at_radio);
 		if (cfg.at_baud != null)
 			push(argv, '--at-baud', sprintf('%d', +cfg.at_baud));
+	}
+
+	// a phone over Bluetooth SAP: the helper finds its channel over SDP
+	// unless told
+	if (substr(reader, 0, 3) == 'bt:') {
+		if (cfg.bt_channel != null)
+			push(argv, '--bt-channel', sprintf('%d', +cfg.bt_channel));
+		if (cfg.bt_security != null)
+			push(argv, '--bt-security', cfg.bt_security);
+		if (cfg.bt_apdu != null)
+			push(argv, '--bt-apdu', cfg.bt_apdu);
 	}
 
 	if (!cfg.ssh)
@@ -1646,7 +1671,7 @@ function create(deps)
 					// a card-inserted here, without the ATR, is refused.
 				});
 			});
-		});
+		}, (substr(cfg.local_reader ?? '', 0, 3) == 'bt:') ? BT_FIRST_TIMEOUT_MS : null);
 	};
 
 	// polite: tell the modem the card is gone and the connection with it, so
@@ -2099,6 +2124,7 @@ return {
 
 	name: 'rsim',
 	options: [ 'rsim_reader', 'rsim_slot', 'rsim_clock', 'rsim_reset', 'rsim_detect', 'rsim_mode', 'rsim_at_radio', 'rsim_at_baud',
+	           'rsim_bt_channel', 'rsim_bt_security', 'rsim_bt_apdu',
 	           'rsim_ssh_port', 'rsim_ssh_key', 'rsim_ssh_helper', 'rsim_donor_mode', 'rsim_donor_slot', 'rsim_donor_cond', 'rsim_donor_apdu',
 	           // a named SIM reader (config wwand_simreader) instead of the above
 	           'rsim' ],

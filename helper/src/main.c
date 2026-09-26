@@ -15,6 +15,9 @@
 
 #include "atmodem.h"
 #include "atr.h"
+#ifdef WITH_BLUETOOTH
+#include "bt.h"
+#endif
 #include "json.h"
 #include "log.h"
 #include "phoenix.h"
@@ -266,6 +269,8 @@ static int serve(struct state *st)
 		}
 		if (r == 0) {
 			poll_presence(st);
+			if (st->be->ended)
+				return 1;
 			continue;
 		}
 		n = read(STDIN_FILENO, buf + len, LINE_MAX_LEN - len);
@@ -298,13 +303,15 @@ static int serve(struct state *st)
 		/* insert/remove may also happen while requests keep coming */
 		if (st->last_present >= 0)
 			poll_presence(st);
+		if (st->be->ended)
+			return 1;
 	}
 }
 
 static void usage(FILE *f)
 {
 	fputs("usage: rsim-card [-v] [-s] [options] phoenix:<tty> | wbsm:[serial] | pcsc:<reader substring or index>\n"
-	      "                                    | at:<tty of a modem's AT port>\n"
+	      "                                    | at:<tty of a modem's AT port> | bt:<phone's address>\n"
 	      "       rsim-card --list               what this machine offers, JSON lines\n"
 	      "  -v, --verbose          debug logging\n"
 	      "  -s, --syslog           log to syslog as well as stderr\n"
@@ -319,7 +326,11 @@ static void usage(FILE *f)
 	      "at (the SIM of another modem, over AT+CSIM; ATR is the minimal 3B00):\n"
 	      "  --at-baud N            115200 (default); USB ports ignore it\n"
 	      "  --at-radio off|keep    off (default): AT+CFUN=4 while its card is used\n"
-	      "                         elsewhere, the previous mode restored at the end\n", f);
+	      "                         elsewhere, the previous mode restored at the end\n"
+	      "bt (a paired phone's SIM over the Bluetooth SIM Access Profile):\n"
+	      "  --bt-channel N         its RFCOMM channel (default: looked up over SDP)\n"
+	      "  --bt-security LEVEL    medium (default, encrypted) | high (MITM-protected key)\n"
+	      "  --bt-apdu FORMAT       gsm (default, CommandAPDU) | 7816 (CommandAPDU7816)\n", f);
 }
 
 static int parse_enum(const char *arg, const char *const *names, int n)
@@ -346,6 +357,9 @@ int main(int argc, char **argv)
 		{ "wbsm-mode", required_argument, NULL, 'w' },
 		{ "at-baud", required_argument, NULL, 'B' },
 		{ "at-radio", required_argument, NULL, 'R' },
+		{ "bt-channel", required_argument, NULL, 'C' },
+		{ "bt-security", required_argument, NULL, 'S' },
+		{ "bt-apdu", required_argument, NULL, 'P' },
 		{ "list", no_argument, NULL, 'L' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
@@ -360,6 +374,7 @@ int main(int argc, char **argv)
 	const char *spec;
 	int wbsm_smartmouse = 0;
 	struct at_cfg atc = { .baud = 115200, .radio_keep = false };
+	int bt_channel = 0, bt_high = 0, bt_7816 = 0;
 	int verbose = 0, use_syslog = 0, opt, v, ret;
 	char *end;
 
@@ -421,6 +436,27 @@ int main(int argc, char **argv)
 				break;
 			}
 			fprintf(stderr, "rsim-card: --at-radio %s: off or keep\n", optarg);
+			return 2;
+		case 'C':
+			bt_channel = (int)strtol(optarg, &end, 10);
+			if (*end || bt_channel < 1 || bt_channel > 30) {
+				fprintf(stderr, "rsim-card: --bt-channel %s: expected 1..30\n", optarg);
+				return 2;
+			}
+			break;
+		case 'S':
+			if (!strcmp(optarg, "medium") || !strcmp(optarg, "high")) {
+				bt_high = !strcmp(optarg, "high");
+				break;
+			}
+			fprintf(stderr, "rsim-card: --bt-security %s: medium or high\n", optarg);
+			return 2;
+		case 'P':
+			if (!strcmp(optarg, "gsm") || !strcmp(optarg, "7816")) {
+				bt_7816 = !strcmp(optarg, "7816");
+				break;
+			}
+			fprintf(stderr, "rsim-card: --bt-apdu %s: gsm or 7816\n", optarg);
 			return 2;
 		case 'L':
 			/* RSIM_TEST_SYSROOT: a fake /sys for the tests */
@@ -497,6 +533,23 @@ int main(int argc, char **argv)
 	} else if (!strncmp(spec, "at:", 3) && spec[3]) {
 		atc.dev = spec + 3;
 		st.be = atmodem_open(&atc);
+	} else if (!strncmp(spec, "bt:", 3) && spec[3]) {
+#ifdef WITH_BLUETOOTH
+		struct bt_cfg b = {
+			.addr = spec + 3,
+			.channel = bt_channel,
+			.secure_high = bt_high,
+			.apdu7816 = bt_7816,
+		};
+
+		st.be = bt_open(&b);
+#else
+		(void)bt_channel;
+		(void)bt_high;
+		(void)bt_7816;
+		log_err("built without Bluetooth support (WITH_BLUETOOTH=OFF)");
+		return 1;
+#endif
 	} else if (!strncmp(spec, "pcsc:", 5)) {
 #ifdef WITH_PCSC
 		st.be = pcsc_open(spec + 5);
@@ -512,6 +565,8 @@ int main(int argc, char **argv)
 		return 1;
 
 	ret = serve(&st);
+	if (st.be->ended)
+		log_notice("%s: the reader is gone, ending", spec);
 	if (st.powered)
 		st.be->ops->power_down(st.be);
 	st.be->ops->close(st.be);

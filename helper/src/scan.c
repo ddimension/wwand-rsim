@@ -6,7 +6,8 @@
  * backends this build has. Nothing is opened that could be disturbed: PC/SC
  * readers are what pcscd already knows, a Smartmouse USB is only described,
  * serial ports are read from sysfs — never written to, because one of them
- * may be the AT port of a modem in use.
+ * may be the AT port of a modem in use; paired phones are what BlueZ has
+ * stored about them (a phone is not called up: that would take its SIM).
  */
 #include <dirent.h>
 #include <limits.h>
@@ -22,6 +23,9 @@
 #endif
 #ifdef WITH_PCSC
 #include "pcsc.h"
+#endif
+#ifdef WITH_BLUETOOTH
+#include "bt.h"
 #endif
 
 /* the first line of a sysfs attribute, "" when there is none */
@@ -140,7 +144,7 @@ static int tty_list(const char *sysroot)
 int scan_run(const char *sysroot)
 {
 	struct jw w;
-	char backends[64] = "phoenix,at";
+	char backends[64] = "phoenix,at", note[PATH_MAX + 80] = "";
 
 #ifdef WITH_LIBUSB
 	strcat(backends, ",wbsm");
@@ -150,11 +154,17 @@ int scan_run(const char *sysroot)
 	strcat(backends, ",pcsc");
 	pcsc_list();
 #endif
+#ifdef WITH_BLUETOOTH
+	strcat(backends, ",bt");
+	bt_list(sysroot ? sysroot : "", note, sizeof(note));
+#endif
 	tty_list(sysroot ? sysroot : "");
 
 	jw_begin(&w, stdout);
 	jw_bool(&w, "done", true);
 	jw_str(&w, "backends", backends);
+	if (note[0])
+		jw_str(&w, "note", note);
 	jw_end(&w);
 	return 0;
 }

@@ -70,10 +70,34 @@ real UART). The ATR is the minimal T=0 ATR `3B00`: plain AT has no command for t
 card's own. As a named reader: `option type 'at'`, `option device
 '/dev/ttyUSB2'`, optionally `host`, `radio`, `baud`.
 
+**A phone's SIM:** `bt:<address>` — a phone paired with this machine
+over Bluetooth, whose SIM is lent over the SIM Access Profile (SAP, often
+called rSAP in cars). The phone hands its card over and has no network of
+its own while it is lent; it gets it back when the helper ends. Also on a
+SIM host (`ssh:<user>@<host>:bt:AA:BB:CC:DD:EE:FF`), e.g. a PC next to the
+phone. As a named reader: `option type 'bt'`, `option device '<address>'`,
+optionally `host`, `security` (`high`: a pairing confirmed on both sides),
+`channel` (instead of SDP), `apdu` (`7816`: CommandAPDU7816). Plain modem
+options: `rsim_bt_channel`, `rsim_bt_security`, `rsim_bt_apdu`.
+
+What the phone needs: the SIM Access Profile *server*. Stock Android has it,
+but most vendors build it switched off (`profile_supported_sap`); Samsung
+and some other phones sold for cars ship it on. With it, the phone asks once
+whether this device may use its SIM (allow it permanently — the first
+connection gives up after 60 s). What this machine needs: a kernel with
+Bluetooth and RFCOMM, BlueZ (`bluetoothd`) running with the phone paired
+and trusted (`bluetoothctl pair|trust <address>`) — rsim-card itself uses
+only kernel sockets, no BlueZ library. On OpenWrt `/var/lib/bluetooth` is in
+RAM: a pairing is gone after a reboot unless that directory is kept.
+A dropped link (phone out of range, SIM access switched off on the phone)
+ends the helper; the modem gets its own SIM back and the plugin tries again.
+
 **What is there to use:** `wwandctl rsim scan` lists what this router
 offers as a card source — PC/SC readers (with or without a card), Smartmouse
 USB readers, serial ports that look like a Phoenix adapter or a modem's AT
-port — each with the spec to put into a reader; the ports of wwand's own
+port, paired phones (whether each offers SIM Access, as BlueZ last read it
+— the phone is not called up, that would take its SIM; BlueZ's storage is
+readable by root only) — each with the spec to put into a reader; the ports of wwand's own
 modems are marked (an `at:` reader there would take the card from under
 wwand; that is the `modem` kind). `wwandctl rsim scan user@simhost` asks a
 SIM host over SSH the same. Underneath: `rsim-card --list`, JSON lines,
@@ -147,6 +171,10 @@ cmake -S helper -B build-arm -DRSIM_STATIC=ON \
       -DCMAKE_TOOLCHAIN_FILE=/path/to/arm.cmake
 cmake --build build-arm
 ```
+
+`WITH_BLUETOOTH` (default ON) builds the `bt:` backend. It needs no
+library, only the kernel's sockets, and costs about 12 KB (aarch64, -Os);
+`-DWITH_BLUETOOTH=OFF` leaves it out of a minimal build.
 
 `RSIM_STATIC=ON` links with `-static` and takes the **static** link lines from
 pkg-config, so an enabled backend brings its own dependencies along. That is

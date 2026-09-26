@@ -4,6 +4,7 @@
 #ifndef RSIM_BACKEND_H
 #define RSIM_BACKEND_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -33,6 +34,9 @@ struct rsim_backend_ops {
 struct rsim_backend {
 	const struct rsim_backend_ops *ops;
 	const char *reader;	/* what status reports as "reader" */
+	/* set by a backend whose reader is gone for good (a Bluetooth link
+	 * that dropped): the helper ends, as if its SSH link had */
+	bool ended;
 	char detail[RSIM_DETAIL_MAX];
 };
 

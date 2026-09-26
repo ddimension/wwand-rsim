@@ -61,20 +61,22 @@ return view.extend({
 		o.value('phoenix', _('Phoenix/Smartmouse serial reader'));
 		o.value('pcsc', _('PC/SC (CCID) reader'));
 		o.value('at', _('the SIM of a modem with an AT port (not wwand\'s)'));
+		o.value('bt', _('a paired phone over Bluetooth (SIM Access Profile)'));
 		o.value('modem', _('another modem lends its card (SIM sponsor)'));
 		o.default = 'wbsm';
 		/* written even when left at the default: the section must say what
 		   it is (the plugin assumes the same default, but uci should not
 		   depend on that) */
 		o.rmempty = false;
-		o.description = _('Smartmouse USB: clock and mode are set by software, no driver needed. Phoenix: a serial reader whose clock is set with switches. PC/SC: any CCID reader through pcscd. AT modem: the card in a modem that wwand does not manage — on another machine, or here — reached over its AT port (AT+CSIM). SIM sponsor: another wwand modem on this router lends the card in it.');
+		o.description = _('Smartmouse USB: clock and mode are set by software, no driver needed. Phoenix: a serial reader whose clock is set with switches. PC/SC: any CCID reader through pcscd. AT modem: the card in a modem that wwand does not manage — on another machine, or here — reached over its AT port (AT+CSIM). Phone: the SIM of a phone paired over Bluetooth that offers the SIM Access Profile (rSAP) — while it is lent the phone has no network of its own. SIM sponsor: another wwand modem on this router lends the card in it.');
 
 		o = s.option(form.Value, 'device', _('Reader'),
-			_('Phoenix: its serial port, e.g. <code>/dev/ttyUSB0</code>. PC/SC: the reader\'s name or index (empty: the first). Smartmouse USB: its USB serial number (empty: the first one). AT modem: its AT port, e.g. <code>/dev/ttyUSB2</code>.'));
+			_('Phoenix: its serial port, e.g. <code>/dev/ttyUSB0</code>. PC/SC: the reader\'s name or index (empty: the first). Smartmouse USB: its USB serial number (empty: the first one). AT modem: its AT port, e.g. <code>/dev/ttyUSB2</code>. Phone: its Bluetooth address, e.g. <code>AA:BB:CC:DD:EE:FF</code> (<code>wwandctl rsim scan</code> lists the paired phones).'));
 		o.depends('type', 'wbsm');
 		o.depends('type', 'phoenix');
 		o.depends('type', 'pcsc');
 		o.depends('type', 'at');
+		o.depends('type', 'bt');
 		o.optional = true;
 		o.validate = function(sid, v) {
 			var t = this.section.formvalue(sid, 'type');
@@ -83,6 +85,8 @@ return view.extend({
 				return _('A Phoenix reader needs its serial port');
 			if (t == 'at' && !v)
 				return _('An AT modem needs its AT port');
+			if (t == 'bt' && !/^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$/.test(v || ''))
+				return _('A phone needs its Bluetooth address (AA:BB:CC:DD:EE:FF)');
 			return true;
 		};
 
@@ -93,12 +97,26 @@ return view.extend({
 		o.value('keep', _('keep as it is'));
 		o.optional = true;
 
+		o = s.option(form.ListValue, 'security', _('Link security'),
+			_('<strong>Encrypted</strong> works with any pairing. <strong>Authenticated</strong> also requires a pairing that was confirmed on both sides (a PIN or a compared number), as the SIM Access Profile recommends.'));
+		o.depends('type', 'bt');
+		o.value('', _('encrypted (default)'));
+		o.value('high', _('authenticated'));
+		o.optional = true;
+
+		o = s.option(form.Value, 'channel', _('RFCOMM channel'),
+			_('Empty: asked from the phone (SDP). Only for a phone whose service record is wrong.'));
+		o.depends('type', 'bt');
+		o.datatype = 'range(1,30)';
+		o.optional = true;
+
 		o = s.option(form.Value, 'host', _('On another machine'),
 			_('<code>user@host</code> when the reader is attached to another machine: the router runs <code>rsim-card</code> there over SSH. That machine needs rsim-card and access to the reader, and the router\'s SSH key (shown below) in the user\'s <code>~/.ssh/authorized_keys</code>. Leave empty for a reader on this router.'));
 		o.depends('type', 'wbsm');
 		o.depends('type', 'phoenix');
 		o.depends('type', 'pcsc');
 		o.depends('type', 'at');
+		o.depends('type', 'bt');
 		o.optional = true;
 		o.validate = function(sid, v) {
 			return (!v || /^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$/.test(v)) ? true : _('Expecting user@host');
@@ -111,6 +129,7 @@ return view.extend({
 		o.depends({ 'type': 'phoenix', 'host': /./ });
 		o.depends({ 'type': 'pcsc', 'host': /./ });
 		o.depends({ 'type': 'at', 'host': /./ });
+		o.depends({ 'type': 'bt', 'host': /./ });
 		o.optional = true;
 		o.placeholder = 'rsim-card';
 
