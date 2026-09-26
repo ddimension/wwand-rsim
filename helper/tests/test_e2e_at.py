@@ -88,11 +88,16 @@ class FakeModem(threading.Thread):
 
 
 class Rig:
-    def __init__(self, args=(), **modem):
-        self.master, self.slave = os.openpty()
-        tty.setraw(self.slave)
-        self.modem = FakeModem(self.master, **modem)
-        self.modem.start()
+    def __init__(self, args=(), reuse=None, **modem):
+        if reuse:
+            # the same modem on the same port, for a second helper run
+            self.master, self.slave, self.modem = reuse.master, reuse.slave, reuse.modem
+            self.modem.log.clear()
+        else:
+            self.master, self.slave = os.openpty()
+            tty.setraw(self.slave)
+            self.modem = FakeModem(self.master, **modem)
+            self.modem.start()
         self.proc = subprocess.Popen(
             [BIN, "-v"] + list(args) + ["at:" + os.ttyname(self.slave)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -137,6 +142,19 @@ except subprocess.TimeoutExpired:
     exited = False
 check(exited, "SIGHUP: the helper ends")
 check(rig.modem.cfun == 1, "SIGHUP: the radio is switched back on before the helper exits")
+rig.modem.running = False
+
+# --- killed hard: the next run still knows the radio was on -----------------------
+rig = Rig()
+rig.ask({"op": "power_up"})
+rig.proc.kill()
+rig.proc.wait(10)
+check(rig.modem.cfun == 4, "SIGKILL: no cleanup possible, the radio stays off for now")
+rig2 = Rig(reuse=rig)
+up = rig2.ask({"op": "power_up"})
+check(up and up.get("ok"), "after SIGKILL: the next run works")
+rig2.close()
+check(rig2.modem.cfun == 1, "after SIGKILL: the next run switches the radio back on at its end (kept mode 1)")
 rig.modem.running = False
 
 # --- keep: the radio is left alone ------------------------------------------------

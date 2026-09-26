@@ -58,8 +58,10 @@ manage (on a SIM host, or on this router), reached over its AT port with
 AT+CSIM (TS 27.007 §8.17). That modem keeps the card; its radio is switched
 off (`AT+CFUN=4`, the SIM stays reachable) while the card is used elsewhere
 and put back as it was afterwards, also when the helper is stopped or its SSH
-link drops (`rsim_at_radio keep` leaves it alone, `rsim_at_baud` for a real
-UART). The ATR is the minimal T=0 ATR `3B00`: plain AT has no command for the
+link drops. Killed hard (SIGKILL, power loss), it cannot: the mode it had is
+kept in `/tmp/rsim-card-cfun-<port>`, and the next run restores that one at
+its end (`rsim_at_radio keep` leaves the radio alone, `rsim_at_baud` for a
+real UART). The ATR is the minimal T=0 ATR `3B00`: plain AT has no command for the
 card's own. As a named reader: `option type 'at'`, `option device
 '/dev/ttyUSB2'`, optionally `host`, `radio`, `baud`.
 

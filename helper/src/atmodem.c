@@ -38,6 +38,7 @@ struct at_backend {
 	struct rsim_backend be;
 	int fd;
 	int cfun_prev;		/* -1: not changed by us */
+	char mark[300];		/* where the mode before ours is kept */
 	char rbuf[4096];
 	size_t rlen;
 };
@@ -155,6 +156,35 @@ int atmodem_csim_answer(const char *line, unsigned char *resp, int cap)
 	return hex_decode(hex, resp, (size_t)cap);
 }
 
+/* The mode the modem had before we switched its radio off, kept in a file
+ * until it is restored. A helper killed hard (SIGKILL, power loss on the SIM
+ * host) cannot restore it, and the next start would read CFUN=4 as "how it
+ * was" and never switch the radio back on: the file tells it otherwise. In
+ * /tmp — a reboot of the SIM host restarts the modem anyway. */
+static void mark_path(const char *dev, char *out, size_t cap)
+{
+	size_t o;
+	const char *p;
+
+	o = (size_t)snprintf(out, cap, "/tmp/rsim-card-cfun-");
+	for (p = dev; *p && o + 1 < cap; p++)
+		out[o++] = (*p == '/') ? '_' : *p;
+	out[o] = '\0';
+}
+
+static int mark_read(const char *path)
+{
+	FILE *f = fopen(path, "r");
+	int v = -1;
+
+	if (f) {
+		if (fscanf(f, "%d", &v) != 1)
+			v = -1;
+		fclose(f);
+	}
+	return v;
+}
+
 static int at_power_up(struct rsim_backend *be, uint8_t *atr, size_t *atr_len)
 {
 	struct at_backend *a = (struct at_backend *)be;
@@ -226,9 +256,10 @@ static void at_close(struct rsim_backend *be)
 
 	if (a->cfun_prev >= 0) {
 		snprintf(cmd, sizeof(cmd), "AT+CFUN=%d", a->cfun_prev);
-		if (at_cmd(a, cmd, NULL, NULL, 0, 15000, NULL, 0) == RSIM_OK)
+		if (at_cmd(a, cmd, NULL, NULL, 0, 15000, NULL, 0) == RSIM_OK) {
 			log_notice("%s: radio back to CFUN=%d", a->be.reader, a->cfun_prev);
-		else
+			unlink(a->mark);
+		} else
 			log_warn("%s: could not restore CFUN=%d", a->be.reader, a->cfun_prev);
 	}
 	close(a->fd);
@@ -280,14 +311,34 @@ struct rsim_backend *atmodem_open(const struct at_cfg *cfg)
 	}
 	at_cmd(a, "AT+CMEE=1", NULL, NULL, 0, 3000, NULL, 0);
 
+	mark_path(cfg->dev, a->mark, sizeof(a->mark));
 	if (!cfg->radio_keep) {
-		if (at_cmd(a, "AT+CFUN?", "+CFUN:", got, sizeof(got), 5000, NULL, 0) == RSIM_OK &&
-		    sscanf(got, "+CFUN: %d", &prev) == 1 && prev != 4) {
+		int kept = mark_read(a->mark);
+
+		/* a modem that does not say: taken as online, which is what the
+		 * switch-off below is for */
+		if (at_cmd(a, "AT+CFUN?", "+CFUN:", got, sizeof(got), 5000, NULL, 0) != RSIM_OK ||
+		    sscanf(got, "+CFUN: %d", &prev) != 1)
+			prev = 1;
+
+		if (prev == 4 && kept >= 0 && kept != 4) {
+			/* off since a run that could not clean up: that run's
+			 * "before" is the one to go back to */
+			log_notice("%s: radio still off from an earlier run; CFUN=%d is restored at the end", cfg->dev, kept);
+			a->cfun_prev = kept;
+		} else if (prev != 4) {
+			FILE *m = fopen(a->mark, "w");
+
+			if (m) {
+				fprintf(m, "%d\n", prev);
+				fclose(m);
+			}
 			if (at_cmd(a, "AT+CFUN=4", NULL, NULL, 0, 15000, NULL, 0) == RSIM_OK) {
 				a->cfun_prev = prev;
 				log_notice("%s: radio off (CFUN=4) while its card is used elsewhere", cfg->dev);
 			} else {
 				/* two modems must not register with one card */
+				unlink(a->mark);
 				log_err("%s: cannot switch the radio off (AT+CFUN=4); --at-radio keep if that is intended",
 					cfg->dev);
 				close(a->fd);
