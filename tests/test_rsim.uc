@@ -262,6 +262,10 @@ const EXT = { rsim_reader: 'phoenix:/dev/ttyUSB0' };
 
 	let st;
 
+	eq(p.status('m0', EXT), { label: 'remote SIM', text: 'phoenix:/dev/ttyUSB0 · in use by the modem · 2 commands', level: 'ok' },
+	   'status row: in use, with the commands served');
+	eq(p.status('m0', {}), null, 'status row: none for a modem without a reader');
+
 	p.ops.status('m0', EXT, {}, (e, r) => { st = r; });
 	eq(st.state, 'powered', 'status: in use');
 	eq(st.apdus, 2, 'status: two commands served');
@@ -434,6 +438,8 @@ const EXT = { rsim_reader: 'phoenix:/dev/ttyUSB0' };
 
 	p.ops.status('m0', EXT, {}, (e, r) => { st = r; });
 	ok(index(st.last_error ?? '', 'no card') >= 0, 'no card: the status says so');
+	eq(p.status('m0', EXT)?.level, 'error', 'status row: a failure shows as an error...');
+	ok(index(p.status('m0', EXT)?.text ?? '', 'retry in') >= 0, '...with when it tries again');
 
 	cm.present = true;
 	p.tick('m0', EXT);

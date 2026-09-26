@@ -799,6 +799,36 @@ function create(deps)
 			start_session(ref, cfg);
 		},
 
+		// One row for the modem's status page (plugins.uc plugins_status):
+		// polled every second, so built from what is already known — no I/O.
+		status: (ref, ext) => {
+			let cfg = cfg_of(ext);
+
+			if (!cfg)
+				return null;
+
+			let s = sessions[ref];
+			let n = notes[ref] ?? {};
+			let what = {
+				starting: 'starting', waiting: 'offered, waiting for the modem',
+				connected: 'modem connected, card not powered', powered: 'in use by the modem',
+			};
+
+			if (s && s.state != 'failed')
+				return { label: 'remote SIM',
+				         text: sprintf('%s · %s%s', cfg.reader, what[s.state] ?? s.state,
+				                       s.apdus ? sprintf(' · %d commands', s.apdus) : ''),
+				         level: (s.state == 'powered') ? 'ok' : 'warn' };
+
+			if (n.last_error)
+				return { label: 'remote SIM',
+				         text: sprintf('%s · %s%s', cfg.reader, n.last_error,
+				                       (n.retry_at && n.retry_at > now()) ? sprintf(' (retry in %d s)', n.retry_at - now()) : ''),
+				         level: 'error' };
+
+			return { label: 'remote SIM', text: sprintf('%s · waiting to start', cfg.reader), level: 'warn' };
+		},
+
 		ops: {
 			status: (ref, ext, args, cb) => {
 				let s = sessions[ref];
