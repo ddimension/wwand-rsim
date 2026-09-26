@@ -10,6 +10,9 @@ import * as uloop from 'uloop';
 import { eq, ok, done } from './lib/check.uc';
 
 let rsim = require('wwand.plugins.rsim');
+
+let modems_by_ref = {};
+let modem_obj = (ref) => (modems_by_ref[ref ?? '?'] ??= { state: 'READY' });
 let tty = getenv('RSIM_E2E_TTY');
 let helper = getenv('RSIM_E2E_HELPER');
 
@@ -40,7 +43,7 @@ if (tty && helper) {
 	let p = rsim.create({
 		log: (l, m) => push(logs, m),
 		helper_path: helper,
-		modem_of: () => ({ modem: {} }),
+		modem_of: (ref) => ({ modem: modem_obj(ref) }),
 		qmi_client: (ref, schema, cb) => cb(null, c),
 		qmi_release: (ref, cl) => { cl.released = true; },
 	});

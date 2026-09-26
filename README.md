@@ -51,9 +51,16 @@ helper that exited: the modem gets its own SIM back and the plugin retries.
 modem on the router lend its SIM — over the SIM Access Profile
 (`rsim_donor_mode sap`, the donor hands its card over; Quectel needs
 `wwandctl rsim DONOR sap-enable`), or APDU by APDU while the card stays with
-the donor, whose radio must be off (`rsim_donor_mode apdu`, over QMI UIM or
-`AT+CSIM`, `rsim_donor_apdu auto|qmi|at`). `wwandctl rsim MODEM probe` and
-`donor-test` tell whether a modem can lend its card.
+the donor (`rsim_donor_mode apdu`, over QMI UIM or `AT+CSIM`,
+`rsim_donor_apdu auto|qmi|at`). A modem configured as another's donor keeps
+its radio off, link or not — wwand refuses its interfaces (`radio_held`) and
+parks any registration of it — and gets it back when that configuration is
+removed, as its own `option lowpower` allows. `rsim_donor_slot` names the donor's physical slot (default: the
+one it runs on) — only that one can be lent: on a single-standby modem the
+other slot is switched off and cannot be reached, so one modem cannot use one
+card and lend the other (HW-checked on a Quectel RG502Q and RG650E,
+2026-09-26). `wwandctl rsim MODEM probe` and `donor-test` tell whether a modem
+can lend its card.
 
 **LuCI:** `luci-app-wwand-rsim` — Network → Remote SIM sets all of this per
 modem.

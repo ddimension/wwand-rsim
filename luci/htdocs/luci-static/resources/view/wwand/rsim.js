@@ -120,10 +120,18 @@ return view.extend({
 		modems.forEach(function(n) { o.value(n, n); });
 
 		o = s.option(form.ListValue, 'donor_mode', _('How it lends'),
-			_('<strong>SIM Access</strong>: the sponsor hands its card over and stops using it — its own connection goes down, and it gets the card back when the lending ends. Quectel modules need it switched on once: <code>wwandctl rsim SPONSOR sap-enable --reset</code>.<br /><strong>APDU</strong>: the card stays in the sponsor and every command is passed through it. The sponsor\'s <strong>radio must be off</strong> meanwhile, or two modems register with the same card: wwand parks it while lending and wakes it afterwards — so do not give the sponsor an interface that starts on its own. For modems that cannot do SIM Access.'));
+			_('<strong>SIM Access</strong>: the sponsor hands its card over and stops using it — its own connection goes down, and it gets the card back when the lending ends. Quectel modules need it switched on once: <code>wwandctl rsim SPONSOR sap-enable --reset</code>.<br /><strong>APDU</strong>: the card stays in the sponsor and every command is passed through it. For modems that cannot do SIM Access.<br />Either way the sponsor\'s <strong>radio stays off</strong> for as long as it is configured as a sponsor: two modems must never register with the same card. Its interfaces do not come up meanwhile — an attempt is refused with the reason (<em>Radio off: the SIM card is lent to another modem</em>). Remove the sponsor here and its radio comes back.'));
 		o.depends('type', 'modem');
 		o.value('', _('SIM Access (default)'));
 		o.value('apdu', _('APDU'));
+		o.optional = true;
+
+		o = s.option(form.ListValue, 'donor_slot', _('Sponsor\'s slot'),
+			_('Which of the sponsor\'s SIM slots holds the card to lend. Only the slot the sponsor <strong>runs on</strong> can be lent: most modems use one slot at a time and switch the other one off, so a modem cannot use one card and lend the other (checked on a Quectel RG502Q and RG650E). Switch the sponsor to the slot first if needed.'));
+		o.depends('type', 'modem');
+		o.value('', _('the one it runs on (default)'));
+		o.value('1', _('slot 1'));
+		o.value('2', _('slot 2'));
 		o.optional = true;
 
 		o = s.option(form.ListValue, 'donor_apdu', _('APDU channel'),

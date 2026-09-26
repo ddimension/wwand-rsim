@@ -212,6 +212,17 @@ const BACKOFF_MIN = 10, BACKOFF_MAX = 300;
 // a Phoenix reader, a TPDU the card's work waiting time
 const HELPER_TIMEOUT_MS = 15000;
 
+// The modem states in which its QMI services are up (modem.uc, the init
+// chain after INIT_SERVICES), so a UIM Remote client can be had.
+const READY_FOR_REMOTE = [ 'SIM_UNLOCK', 'SIM_BLOCKED', 'SET_OPMODE', 'REGISTERING', 'CONFIGURE_NET', 'READY' ];
+
+// A command's own answer may take long: an eUICC works through a profile
+// download or deletion in single STORE DATA commands that take seconds each,
+// with the card's NULL procedure bytes keeping the line open meanwhile
+// (ISO/IEC 7816-3:2006 §10.3.3), and a remote reader adds the SSH round trip.
+// Giving up early restarts the reader in the middle of such an operation.
+const TPDU_TIMEOUT_MS = 30000;
+
 function hexs(a)
 {
 	let s = '';
@@ -332,7 +343,9 @@ function cfg_of(ext)
 		donor: donor ? {
 			ref: donor,
 			mode: (ext.rsim_donor_mode == 'apdu') ? 'apdu' : 'sap',
-			slot: (+(ext.rsim_donor_slot ?? 1) >= 1 && +(ext.rsim_donor_slot ?? 1) <= 5) ? +(ext.rsim_donor_slot ?? 1) : 1,
+			// the PHYSICAL slot, as the slot list numbers it; null: the one the
+			// donor runs on. donor_card maps it to the logical slot QMI takes.
+			slot: (+ext.rsim_donor_slot >= 1 && +ext.rsim_donor_slot <= 5) ? +ext.rsim_donor_slot : null,
 			cond: ext.rsim_donor_cond ?? null,
 			apdu: (index([ 'qmi', 'at' ], ext.rsim_donor_apdu) >= 0) ? ext.rsim_donor_apdu : 'auto',
 		} : null,
@@ -518,7 +531,10 @@ function spawn_helper(argv, on_line, on_exit)
 function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 {
 	let sap = (dcfg.mode != 'apdu');
-	let slot = dcfg.slot;
+	// the physical slot asked for (null: the active one), and the LOGICAL
+	// slot every QMI UIM request takes, resolved from the slot list first
+	let phys = dcfg.slot;
+	let slot = null;
 	// the APDU path: QMI UIM SEND_APDU, or AT+CSIM; 'auto' starts with QMI
 	// and moves to AT when the donor has no UIM client or refuses the command
 	let via = (dcfg.apdu == 'at') ? 'at' : 'qmi';
@@ -540,8 +556,13 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 	// set once a SAP connect has been SENT: from then on the donor may have
 	// handed its card over whether or not it said so
 	let connect_sent = false;
-	// APDU mode: we parked the sponsor's radio, and wake it at the end
+	// we parked the sponsor's radio, and wake it at the end
 	let parked = false;
+	// set while the SAP disconnect is on its way (busy() on daemon exit)
+	let releasing = false;
+	// up() is entered once: over SIM Access both the state indication and the
+	// status poll can report the link up
+	let upping = false;
 
 	// The SPONSOR's side of a card change. Over SIM Access it hands its card
 	// over and gets it back: both times it runs wwand's card-change process
@@ -574,8 +595,10 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 		poll?.cancel();
 		poll = null;
 
+		// no client — the AT path, or none got — but a parked radio all the
+		// same: it is woken here too, or it stays off for good
 		if (!c)
-			return;
+			return sponsor_back();
 
 		let cl = c;
 
@@ -586,10 +609,12 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 			return sponsor_back();
 		}
 
+		releasing = true;
 		cl.request('SAP_CONNECTION', { conn: { op: 0, slot: slot }, mode: graceful ? 1 : 0 }, () => {
+			releasing = false;
 			deps.qmi_release(donor, cl);
 			sponsor_back();
-		}, { no_recovery: true, timeout: 5000 });
+		}, { no_recovery: true, timeout: 3000 });
 	};
 
 	// the session hears the reason first (and whether to hold off retrying),
@@ -607,6 +632,92 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 
 	let hexb = (a) => hexs(a ?? []);
 	let q_opts = { no_recovery: true, timeout: 10000 };
+
+	// Only the card the donor RUNS ON can be lent. QMI UIM addresses logical
+	// slots, and on a single-standby modem both physical slots map to logical
+	// slot 1 with the inactive one switched off: HW-observed on the RG502Q
+	// (NR7101, 242) and the RG650E (245), 2026-09-26 — SEND_APDU on slot 2 is
+	// refused NOT_SUPPORTED (94), a logical channel "on slot 2" is opened on
+	// the active card, and AT+QUIMSLOT only switches between the two. So a
+	// modem cannot use one slot and lend the other; asking for an inactive
+	// slot is refused with that, once, not retried.
+	let resolve_slot = (then) => {
+		if (!deps.sim_slots) {
+			slot = phys ?? 1;
+			return then();
+		}
+
+		deps.sim_slots(donor, (e, r) => {
+			if (dead)
+				return;
+
+			let list = filter(r?.slots ?? [], (x) => !x.inferred);
+
+			// no slot map (one slot, or a backend that cannot say): the
+			// card the modem runs on, which is all a slot 1 can mean
+			if (e || !length(list)) {
+				if (phys != null && phys != 1)
+					return finish(sprintf('%s does not report its SIM slots, so slot %d cannot be told from the card it runs on',
+						donor, phys), true);
+
+				slot = 1;
+				return then();
+			}
+
+			let cur = filter(list, (x) => x.active)[0];
+			let want = (phys != null) ? filter(list, (x) => x.physical == phys)[0] : cur;
+
+			if (!want)
+				return finish((phys != null) ? sprintf('%s has no SIM slot %d', donor, phys)
+				                             : sprintf('%s reports no active SIM slot', donor), true);
+
+			if (want.card == 'absent')
+				return finish(sprintf('slot %d of %s holds no card', want.physical, donor), true);
+
+			if (!want.active)
+				return finish(sprintf('slot %d of %s is not active%s: an inactive slot is switched off and cannot be reached, so %s cannot use one card and lend the other. Lend the card it runs on, or switch it to slot %d first',
+					want.physical, donor, cur ? sprintf(' (it runs on slot %d)', cur.physical) : '', donor, want.physical), true);
+
+			slot = want.logical_slot ?? 1;
+			phys = want.physical;
+			then();
+		});
+	};
+
+	// The donor as it was when the link began. Its restart ends what this
+	// link rests on — the SAP link, the parked radio, the UIM client — and a
+	// session that goes on regardless serves a card the donor is using again.
+	let m0 = deps.modem_of?.(donor)?.modem;
+	let gen0 = m0?._gen;
+	let reparking = false;
+
+	let check = () => {
+		if (dead)
+			return null;
+
+		let m = deps.modem_of?.(donor)?.modem;
+
+		if (!m || m !== m0 || m._gen != gen0 || (c && c.destroyed)) {
+			let why = sprintf('the lending modem %s restarted', donor);
+
+			finish(why);
+			return why;
+		}
+
+		// woken by something that does not know the card is lent (a
+		// settings change, the recovery ladder's opmode cycle): park again
+		if (parked && !m.lowpower_parked && !reparking && deps.modem_radio) {
+			reparking = true;
+			log('notice', sprintf('rsim: the radio of %s came back on while its card is lent — parking it again', donor));
+			deps.modem_radio(donor, false, (e) => {
+				reparking = false;
+				if (e)
+					log('warn', sprintf('rsim: parking the radio of %s again failed: %J', donor, e));
+			});
+		}
+
+		return null;
+	};
 
 	// Every SAP continuation checks `c`: an answer can arrive after finish()
 	// has released the client, and a member call on null throws inside a
@@ -738,36 +849,131 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 		});
 	};
 
-	let up = () => {
+	let open_for_use = () => {
 		ready = true;
+		log('notice', sprintf('rsim: %s lends its card (%s, slot %d%s)', donor,
+			sap ? 'SIM Access Profile' : sprintf('APDU over %s', (via == 'at') ? 'AT+CSIM' : 'QMI UIM'),
+			phys ?? slot, parked ? ', radio off' : ''));
+		next();
+	};
+
+	// The sponsor's radio goes off in both modes. In APDU mode the card is
+	// used only once that is CONFIRMED: serving first and parking alongside
+	// let two modems register with one IMSI for as long as parking took — or
+	// for good, when it failed; a sponsor whose radio cannot be parked does
+	// not lend. Over SIM Access the card has left the sponsor, so it cannot
+	// register anyway — but a modem that lost its card counts the lost
+	// registration as a fault, and its recovery ladder resets it (rung 16),
+	// which ends the link. Parked, the loss is intended. Failing to park is
+	// therefore only a warning there.
+	// The daemon owns the park (modem_radio): a radio the operator already
+	// parked is left as it is, and the hand-back wakes it only when its
+	// policy (`option lowpower`, the interfaces wanted up) says so.
+	let up = () => {
+		if (upping || dead)
+			return;
+
+		upping = true;
 
 		if (sap)
 			deps.sim_changed?.(donor, 'card lent over SIM Access');
-		else if (deps.modem_radio) {
-			parked = true;
-			deps.modem_radio(donor, false, (e) => e
-				? log('warn', sprintf('rsim: parking the radio of %s failed (%J) — it must not register while its card is used elsewhere', donor, e))
-				: log('notice', sprintf('rsim: radio of %s parked while its card is used elsewhere', donor)));
+
+
+		if (!deps.modem_radio) {
+			if (sap)
+				return open_for_use();
+
+			return finish(sprintf('cannot switch off the radio of %s (this wwand has no modem_radio) — it must not register while its card is used elsewhere', donor), true);
 		}
 
-		log('notice', sprintf('rsim: %s lends its card (%s, slot %d)', donor,
-			sap ? 'SIM Access Profile' : sprintf('APDU over %s, radio off', (via == 'at') ? 'AT+CSIM' : 'QMI UIM'), slot));
-		next();
+		deps.modem_radio(donor, false, (e) => {
+			// the link ended while the radio was being parked: the hand-back
+			// found nothing parked to wake, so the answer does it here
+			if (dead) {
+				if (!e)
+					deps.modem_radio(donor, true, () => null);
+				return;
+			}
+
+			if (e && sap) {
+				log('warn', sprintf('rsim: cannot park the radio of %s (%J) — its recovery may reset it while the card is lent, which ends the link', donor, e));
+				return open_for_use();
+			}
+
+			if (e)
+				return finish(sprintf('cannot switch off the radio of %s (%J) — it must not register while its card is used elsewhere', donor, e), true);
+
+			parked = true;
+			log('notice', sprintf('rsim: radio of %s parked while its card is used elsewhere', donor));
+			open_for_use();
+		});
+	};
+
+
+	// the SAP connect proper, once the client is registered for its news
+	let connect = () => {
+		// cond 3: lend it even while the donor has a call or data session —
+		// taking it over is what was configured
+		let conn = { conn: { op: 1, slot: slot } };
+
+		// TLV 0x12 first appears in the 2013 Gobi drop; older firmware may
+		// not know it, so it can be left out (rsim_donor_cond 'none')
+		if (dcfg.cond != 'none')
+			conn.cond = +(dcfg.cond ?? 3);
+
+		connect_sent = true;
+		c.request('SAP_CONNECTION', conn, (e) => {
+			// No answer at all is the dangerous one: the donor may have
+			// handed its card over anyway (release() ends the link). Not
+			// retried automatically — each retry costs the donor its
+			// registration — until the configuration changes or
+			// `wwandctl rsim restart`.
+			if (e?.error == 'timeout')
+				return finish(sprintf('the donor %s does not answer the SIM Access connect — use rsim_donor_mode apdu', donor), true);
+
+			if (e)
+				return finish(sprintf('the donor %s refused the SIM Access link (%J)', donor, e));
+
+			// the indication may not come (not registered on every
+			// firmware): poll the state as well, bounded
+			let tries = 0;
+			let poll_state;
+
+			poll_state = () => {
+				poll = null;
+				if (dead || ready || !c)
+					return;
+
+				c.request('SAP_CONNECTION', { conn: { op: 2, slot: slot } }, (se, sd) => {
+					if (dead || ready)
+						return;
+					if (!se && sd.state == 2)
+						return up();
+					if (++tries >= 20)
+						return finish(sprintf('the donor %s did not connect the SIM Access link (state %s)',
+							donor, se ? 'unknown' : (SAP_STATES[sd.state] ?? sd.state)));
+					poll = uloop.timer(500, poll_state);
+				}, q_opts);
+			};
+			poll = uloop.timer(300, poll_state);
+		}, q_opts);
 	};
 
 	let schema = { service: 0x0B, messages: sap ? UIM_SAP.messages : UIM_APDU.messages };
 
 	// AT only: no QMI client at all
 	if (!sap && at_only) {
-		uloop.timer(0, () => dead ? null : up());
+		uloop.timer(0, () => dead ? null : resolve_slot(up));
 
 		return {
 			call: (req, cb) => { if (dead) return cb({ error: 'helper_exit' }, null); push(queue, { req: req, cb: cb }); next(); },
 			close: () => { if (!dead) { dead = true; fail_all('closed'); sponsor_back(); } },
+			check: check,
+			busy: () => false,
 		};
 	}
 
-	deps.qmi_client(donor, schema, (err, cl) => {
+	resolve_slot(() => deps.qmi_client(donor, schema, (err, cl) => {
 		if (dead) {
 			if (cl)
 				deps.qmi_release(donor, cl);
@@ -812,53 +1018,22 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 			if (dead || !c)
 				return;
 
-			// cond 3: lend it even while the donor has a call or data
-			// session — taking it over is what was configured
-			let conn = { conn: { op: 1, slot: slot } };
+			// a link left standing by a daemon that died without ending it
+			// (killed, crashed): a connect on top of it is refused or piles
+			// up (the E392 wedge above). End it first, at once.
+			c.request('SAP_CONNECTION', { conn: { op: 2, slot: slot } }, (se, sd) => {
+				if (dead || !c)
+					return;
 
-			// TLV 0x12 first appears in the 2013 Gobi drop; older firmware may
-			// not know it, so it can be left out (rsim_donor_cond 'none')
-			if (dcfg.cond != 'none')
-				conn.cond = +(dcfg.cond ?? 3);
+				if (se || +(sd?.state ?? -1) != 2)
+					return connect();
 
-			connect_sent = true;
-			c.request('SAP_CONNECTION', conn, (e) => {
-				// No answer at all is the dangerous one: the donor may have
-				// handed its card over anyway (release() ends the link). Not
-				// retried automatically — each retry costs the donor its
-				// registration — until the configuration changes or
-				// `wwandctl rsim restart`.
-				if (e?.error == 'timeout')
-					return finish(sprintf('the donor %s does not answer the SIM Access connect — use rsim_donor_mode apdu', donor), true);
-
-				if (e)
-					return finish(sprintf('the donor %s refused the SIM Access link (%J)', donor, e));
-
-				// the indication may not come (not registered on every
-				// firmware): poll the state as well, bounded
-				let tries = 0;
-				let check;
-
-				check = () => {
-					poll = null;
-					if (dead || ready || !c)
-						return;
-
-					c.request('SAP_CONNECTION', { conn: { op: 2, slot: slot } }, (se, sd) => {
-						if (dead || ready)
-							return;
-						if (!se && sd.state == 2)
-							return up();
-						if (++tries >= 20)
-							return finish(sprintf('the donor %s did not connect the SIM Access link (state %s)',
-								donor, se ? 'unknown' : (SAP_STATES[sd.state] ?? sd.state)));
-						poll = uloop.timer(500, check);
-					}, q_opts);
-				};
-				poll = uloop.timer(300, check);
+				log('notice', sprintf('rsim: %s still has a SIM Access link from before — ending it first', donor));
+				c.request('SAP_CONNECTION', { conn: { op: 0, slot: slot }, mode: 0 }, () =>
+					(dead || !c) ? null : connect(), q_opts);
 			}, q_opts);
 		}, q_opts);
-	});
+	}));
 
 	return {
 		call: (req, cb) => {
@@ -878,6 +1053,10 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 
 			release(ready);
 		},
+		// per tick: null while the link stands, else why it ended
+		check: check,
+		// the hand-back still on its way
+		busy: () => releasing,
 	};
 }
 
@@ -916,7 +1095,12 @@ function helper_rpc(open, argv, on_event, on_exit, log)
 	};
 
 	ch = open(argv, (line) => {
-		let msg = json(line);
+		// json() throws on a line that is not JSON (an SSH login banner, a
+		// stray print on the far side), and an exception here, inside a
+		// uloop handle callback, ends the daemon
+		let msg = null;
+
+		try { msg = json(line); } catch (e) { msg = null; }
 
 		if (type(msg) != 'object')
 			return log('debug', sprintf('rsim: helper said: %s', line));
@@ -976,8 +1160,32 @@ function create(deps)
 
 	// The named readers, read at most once a second: status() is what LuCI
 	// polls every second, per modem. Injectable for the tests.
+	// The modems' own rsim options (the wwand_modem sections), for the hold
+	// that must stand before any session does. Injectable for the tests.
+	let read_modems = deps.modem_sections ?? (() => {
+		let out = {};
+		let c = libuci.cursor();
+
+		c.load('network');
+		c.foreach('network', 'wwand_modem', (sec) => { out[sec['.name']] = sec; });
+
+		return out;
+	});
+	let modems_cache = null, modems_at = null;
+	let modem_sections = () => {
+		if (modems_at !== now()) {
+			modems_cache = read_modems();
+			modems_at = now();
+		}
+
+		return modems_cache ?? {};
+	};
+
 	let read_readers = deps.readers ?? (() => {
 		let out = {};
+		// the same view of the config the daemon builds `ext` from
+		// (main.uc): LuCI's staged edits live in rpcd's per-session save
+		// directory, not here, so they are not seen until applied
 		let c = libuci.cursor();
 
 		c.load('network');
@@ -1039,6 +1247,8 @@ function create(deps)
 	let stopping = {};
 	// per modem: what the status shows after a session is gone
 	let notes = {};
+	// donor links whose hand-back is still on its way
+	let draining = [];
 
 	let stop_session;
 
@@ -1060,7 +1270,8 @@ function create(deps)
 
 		// a failure that retrying makes worse: wait for the operator
 		if (hold) {
-			note(s.ref, { retry_at: null, hold: true });
+			// the configuration it failed on: another one is tried afresh
+			note(s.ref, { retry_at: null, hold: true, hold_key: s.key });
 			log('warn', sprintf('rsim %s: %s — not retrying until the configuration changes or `wwandctl rsim restart`', s.ref, why));
 			return stop_session(s, false);
 		}
@@ -1074,6 +1285,25 @@ function create(deps)
 		note(s.ref, { retry_at: now() + ((wait > BACKOFF_MAX) ? BACKOFF_MAX : wait) });
 		log('warn', sprintf('rsim %s: %s — trying again in %d s', s.ref, why,
 			notes[s.ref].retry_at - now()));
+		stop_session(s, false);
+	};
+
+	// a start that could not even begin — the modem is between two lives
+	// (not_ready, no_modem) or tore the request down (cancelled) — is tried
+	// again on the next tick and not counted: counting it would put a
+	// minutes-long backoff on a modem that is ready ten seconds later
+	// Three in a row are not "between two lives" any more: each start
+	// borrows the donor's card (or restarts the reader) first, so an endless
+	// soft loop would take a sponsor's card every ten seconds. From the
+	// fourth on it counts, and backs off.
+	let soft = (s, why) => {
+		let n = +(notes[s.ref]?.soft ?? 0) + 1;
+
+		note(s.ref, { soft: n });
+		if (n > 3)
+			return fail(s, why);
+
+		log('info', sprintf('rsim %s: %s — trying again shortly', s.ref, why));
 		stop_session(s, false);
 	};
 
@@ -1098,6 +1328,9 @@ function create(deps)
 	let card_up = (s, op) => {
 		let gen = ++s.card_gen;
 
+		// commands for the card before the reset belong to the session it ended
+		s.queue = [];
+
 		s.rpc.call({ op: op }, (err, res) => {
 			if (s.state == 'failed' || s.card_gen != gen)
 				return;
@@ -1109,6 +1342,7 @@ function create(deps)
 
 			s.atr = res.atr;
 			s.state = 'powered';
+			s.powered_at ??= now();
 			log('notice', sprintf('rsim %s: card %s, ATR %s', s.ref,
 				(op == 'reset') ? 'reset' : 'powered up', s.atr));
 			event(s, EV_CARD_RESET, { atr: bytes(s.atr) });
@@ -1122,6 +1356,11 @@ function create(deps)
 			return;
 
 		let a = shift(s.queue);
+
+		// queued for a card session that has ended since
+		if (a.gen != s.card_gen)
+			return pump_apdu(s);
+
 		let t0 = clock(true);
 		let elapsed_ms = () => {
 			let t1 = clock(true);
@@ -1131,7 +1370,7 @@ function create(deps)
 
 		// an answer that comes back after the modem powered the card down or
 		// disconnected belongs to a card session that no longer exists
-		let gen = s.card_gen;
+		let gen = a.gen;
 
 		s.busy = true;
 		s.rpc.call({ op: 'tpdu', data: hexs(a.command) }, (err, res) => {
@@ -1166,7 +1405,7 @@ function create(deps)
 					{ no_recovery: true });
 
 			pump_apdu(s);
-		});
+		}, TPDU_TIMEOUT_MS);
 	};
 
 	let wire = (s) => {
@@ -1215,15 +1454,18 @@ function create(deps)
 				return;
 
 			s.card_gen++;
+			s.queue = [];
+			s.powered_at = null;
 			s.rpc.call({ op: 'power_down' }, () => null);
-			s.state = 'connected';
+			if (s.state == 'powered')
+				s.state = 'connected';
 			log('notice', sprintf('rsim %s: the modem powered the card down', s.ref));
 		});
 		c.on('APDU_IND', (d) => {
 			if (!mine(d))
 				return;
 
-			push(s.queue, { apdu_id: d.apdu_id, command: d.command ?? [] });
+			push(s.queue, { apdu_id: d.apdu_id, command: d.command ?? [], gen: s.card_gen });
 			pump_apdu(s);
 		});
 	};
@@ -1233,8 +1475,9 @@ function create(deps)
 
 		sessions[ref] = s;
 
+		// the configuration is wrong, and trying again does not make it right
 		if (cfg.donor?.ref == ref)
-			return fail(s, 'a modem cannot lend its card to itself');
+			return fail(s, 'a modem cannot lend its card to itself', true);
 
 		// defined before the card channel exists: a donor card can report its
 		// end synchronously (no such modem), during its own construction
@@ -1247,6 +1490,13 @@ function create(deps)
 			if (ev.event == 'removed') {
 				log('notice', sprintf('rsim %s: card removed from the reader', ref));
 				s.atr = null;
+				// nothing for that card is answered any more; the modem
+				// stays connected and powers the next card up itself
+				s.card_gen++;
+				s.queue = [];
+				s.powered_at = null;
+				if (s.state == 'powered')
+					s.state = 'connected';
 				event(s, EV_CARD_REMOVED);
 			}
 			else if (ev.event == 'inserted') {
@@ -1255,6 +1505,14 @@ function create(deps)
 				// decoder and is refused as malformed (QMI error 1,
 				// HW-observed on the RG650E, 2026-09-26)
 				log('notice', sprintf('rsim %s: card inserted in the reader', ref));
+
+				// The modem is not on the remote card (offered and not yet
+				// connected, or disconnected): it runs on its own card, and
+				// telling it about ours — or wiping its identity — would be
+				// wrong. It powers the card up itself when it connects.
+				if (s.state != 'connected' && s.state != 'powered')
+					return;
+
 				let gen = ++s.card_gen;
 
 				s.rpc.call({ op: 'power_up' }, (err, res) => {
@@ -1264,6 +1522,10 @@ function create(deps)
 					s.atr = res.atr;
 					s.state = 'powered';
 					event(s, EV_CARD_INSERTED, { atr: bytes(s.atr) });
+
+					// it may be another card than the one taken out: the
+					// modem forgets the old one's identity and reads this one
+					deps.sim_changed?.(ref, 'card inserted in the reader');
 				});
 			}
 		};
@@ -1308,6 +1570,9 @@ function create(deps)
 					return;
 				}
 
+				if (qerr && index([ 'not_ready', 'no_modem', 'cancelled' ], qerr.error) >= 0)
+					return soft(s, sprintf('the modem is not ready for a UIM Remote client (%s)', qerr.error));
+
 				if (qerr)
 					return fail(s, (qerr.error == 'service_unavailable')
 						? 'the modem does not offer UIM Remote — switch it on with `wwandctl rsim enable` and reset the modem'
@@ -1325,11 +1590,24 @@ function create(deps)
 				// cleared when its CID is released, which runs the same
 				// disconnect.
 				event(s, EV_CONN_AVAILABLE, null, (e) => {
+					// stopped while the offer was on its way: its answer
+					// must neither revive the session nor clear its backoff
+					if (s.state == 'failed' || sessions[ref] != s)
+						return;
+
+					if (e?.error == 'cancelled')
+						return soft(s, 'the modem tore the client down during the offer');
+
 					if (e)
 						return fail(s, sprintf('the modem refused the remote card: %J', e));
 
+					delete notes[ref]?.soft;
+
 					s.state = 'waiting';
-					note(ref, { failures: 0, retry_at: null, last_error: null });
+					// the failure count is NOT cleared here: a reader that
+					// offers and then fails every time would never back off.
+					// A session that has worked for a minute clears it (tick).
+					note(ref, { retry_at: null, last_error: null });
 					log('notice', sprintf('rsim %s: remote card offered to the modem (slot %d, reader %s, ATR %s)',
 						ref, cfg.slot, cfg.reader, s.atr));
 
@@ -1357,6 +1635,7 @@ function create(deps)
 		let c = s.client;
 
 		s.client = null;
+
 
 		// the modem goes back to its own card: the same card-change process
 		// as on the way in, once the modem has let go of ours
@@ -1390,8 +1669,16 @@ function create(deps)
 			}
 		}
 
-		s.rpc?.close();
+		let r = s.rpc;
+
 		s.rpc = null;
+		r?.close();
+
+		// a donor link hands its card back asynchronously — the close above
+		// starts it; until it is done the donor is still taken (tick claim
+		// check), its radio still held, and the daemon's exit waits (busy)
+		if (r?.busy?.())
+			push(draining, { ref: s.ref, cfg: s.cfg, rpc: r });
 	};
 
 	return {
@@ -1402,34 +1689,64 @@ function create(deps)
 			let cfg = rs.cfg;
 			let s = sessions[ref];
 
+			draining = filter(draining, (d) => d.rpc.busy());
+
+			// a hold is for the configuration that failed; a changed one
+			// (another slot, another mode) is tried afresh
+			if (!s && notes[ref]?.hold && (!cfg || notes[ref].hold_key != sprintf('%J', cfg)))
+				delete notes[ref];
+
+			// a new configuration starts on a later tick, once the old
+			// session has let go (stopping): its card-removed and
+			// connection-unavailable must not reach the modem after the
+			// new offer
 			if (s && (!cfg || s.key != sprintf('%J', cfg))) {
 				log('notice', sprintf('rsim %s: %s', ref, cfg ? 'reader configuration changed' : 'remote card switched off'));
 				stop_session(s, true);
-				s = null;
 				delete notes[ref];
+				return;
 			}
 
 			// the modem restarted under us: its teardown destroyed the client
 			if (s && s.client && s.client.destroyed) {
 				log('notice', sprintf('rsim %s: the modem restarted — offering the remote card again', ref));
 				stop_session(s, false);
-				s = null;
+				return;
 			}
+
+			// the lending modem restarted (the link ends and is retried), or
+			// its radio came back on (parked again) — donor_card check()
+			if (s && s.rpc?.check && s.rpc.check())
+				return;
+
+			// a session that has worked for a minute is proof enough: the
+			// next failure starts the backoff from the bottom again
+			if (s && s.state == 'powered' && s.powered_at != null && now() - s.powered_at >= 60 && notes[ref]?.failures)
+				note(ref, { failures: 0 });
 
 			if (!cfg || s || stopping[ref])
 				return;
 
-			// one reader, one modem: whoever holds it keeps it
+			// one reader, one modem: whoever holds it keeps it — including a
+			// session still letting go, which holds it until it has
 			let claim = claim_of(cfg);
+			let holders = [];
 
 			for (let other, os in sessions)
-				if (other != ref && os.state != 'failed' && claim_of(os.cfg) == claim) {
-					note(ref, { conflict: sprintf('%s is in use by modem %s', cfg.reader_name ?? cfg.reader, other) });
+				push(holders, [ other, os ]);
+			for (let other, os in stopping)
+				push(holders, [ other, os ]);
+			for (let d in draining)
+				push(holders, [ d.ref, { state: 'draining', cfg: d.cfg } ]);
+
+			for (let h in holders)
+				if ((h[0] != ref || h[1].state == 'draining') && (h[1].state != 'failed' || stopping[h[0]] == h[1])
+				    && claim_of(h[1].cfg) == claim) {
+					note(ref, { conflict: (h[1].state == 'draining')
+						? sprintf('%s: the previous link is still being handed back', cfg.reader_name ?? cfg.reader)
+						: sprintf('%s is in use by modem %s', cfg.reader_name ?? cfg.reader, h[0]) });
 					return;
 				}
-
-			if (notes[ref]?.conflict)
-				delete notes[ref].conflict;
 
 			// a modem cannot use a card it is lending out itself
 			for (let other, os in sessions)
@@ -1438,13 +1755,60 @@ function create(deps)
 					return;
 				}
 
+			// nor lend a card that is not its own: a donor on a remote card
+			// would pass on a card that already has a user
+			if (cfg.donor && sessions[cfg.donor.ref] && sessions[cfg.donor.ref].state != 'failed') {
+				note(ref, { conflict: sprintf('%s uses a remote card itself and cannot lend one', cfg.donor.ref) });
+				return;
+			}
+
+			if (notes[ref]?.conflict)
+				delete notes[ref].conflict;
+
 			if (notes[ref]?.hold || (notes[ref]?.retry_at && now() < notes[ref].retry_at))
 				return;
 
-			if (!deps.modem_of?.(ref)?.modem)
+			// Its QMI services must be up before a UIM Remote client can be
+			// had; before that a start would spawn the reader every ten
+			// seconds for nothing. With a card missing the modem stops in
+			// SIM_BLOCKED — the state a remote card is most wanted in.
+			let m = deps.modem_of?.(ref)?.modem;
+
+			if (!m || index(READY_FOR_REMOTE, m.state) < 0)
 				return;
 
 			start_session(ref, cfg);
+		},
+
+		// Why a modem's radio must stay off (plugins.uc radio_hold): it lends
+		// its card, and an interface bring-up must not switch it back on.
+		radio_hold: (ref, ext) => {
+			for (let other, os in sessions)
+				if (os.state != 'failed' && os.cfg.donor?.ref == ref)
+					return sprintf('its card is lent to %s', other);
+
+			// still on its way back
+			for (let d in draining)
+				if (d.cfg.donor?.ref == ref && d.rpc.busy())
+					return sprintf('its card is being handed back from %s', d.ref);
+
+			// CONFIGURED as a sponsor, whether a link stands right now or not.
+			// The hold has to stand from the daemon's first moment: after a
+			// restart there is no session yet, and a sponsor that registers
+			// meanwhile does so with a card another modem is about to use
+			// (the core parks any registration while this answers). A modem
+			// set up as another's SIM source is that modem's, for good.
+			for (let other, sec in modem_sections()) {
+				if (other == ref)
+					continue;
+
+				let rs = resolve(sec);
+
+				if (rs.cfg?.donor?.ref == ref)
+					return sprintf('it is the SIM sponsor of %s', other);
+			}
+
+			return null;
 		},
 
 		// Where the modem's active card really is (plugins.uc card_source),
@@ -1513,6 +1877,19 @@ function create(deps)
 			// Access link (its own connection drops meanwhile), reads the ATR,
 			// sends SELECT MF, and hands it back. args: { slot, cond, mode }.
 			donor_test: (ref, ext, args, cb) => {
+				// A test on a card that is lent right now would end that
+				// link (it finds it standing and ends it as a leftover) and
+				// hand the card back under the modem using it.
+				for (let other, os in sessions)
+					if (os.state != 'failed' && (other == ref || os.cfg.donor?.ref == ref))
+						return cb({ error: 'busy', detail: (other == ref)
+							? 'this modem uses a remote card right now'
+							: sprintf('this modem lends its card to %s right now', other) });
+
+				for (let d in draining)
+					if (d.cfg.donor?.ref == ref && d.rpc.busy())
+						return cb({ error: 'busy', detail: 'this modem\'s card is still being handed back' });
+
 				let steps = [];
 				let answered = false;
 				let card;
@@ -1524,7 +1901,8 @@ function create(deps)
 					uloop.timer(1500, () => cb(null, { ok: !err, error: err, steps: steps }));
 				};
 
-				card = donor_card(deps, ref, { mode: args?.mode ?? 'sap', slot: +(args?.slot ?? 1), cond: args?.cond, apdu: args?.apdu ?? 'auto' },
+				card = donor_card(deps, ref, { mode: args?.mode ?? 'sap', slot: (args?.slot != null) ? +args.slot : null,
+				                               cond: args?.cond, apdu: args?.apdu ?? 'auto' },
 					() => null, (why) => { push(steps, sprintf('link ended: %s', why)); out(why); },
 					(l, m) => push(steps, m));
 
@@ -1622,10 +2000,26 @@ function create(deps)
 		},
 		read_ops: [ 'status' ],
 
-		// the plugin going away: every modem gets its own card back
+		// plugins.uc plugins_busy: a withdrawal or a hand-back still on its way
+		busy: () => {
+			draining = filter(draining, (d) => d.rpc.busy());
+
+			return length(keys(stopping)) > 0 || length(draining) > 0;
+		},
+
+		// the daemon exits (plugins.uc plugins_stop): every modem gets its
+		// own card back, every lent card goes home. True while requests for
+		// that are on their way — the daemon then runs its loop a moment
+		// longer instead of dropping them.
 		stop: () => {
-			for (let ref, s in sessions)
+			let pending = false;
+
+			for (let ref, s in sessions) {
+				pending = true;
 				stop_session(s, true);
+			}
+
+			return pending;
 		},
 	};
 }

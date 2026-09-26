@@ -183,6 +183,36 @@ the session logic.
   modem_at, so AT over MBIM too); the ATR from UIM GET_ATR, or the minimal
   T=0 ATR `3B00` over plain AT; power and reset are answered with that ATR.
   HW-verified on the RG650E over QMI and AT (SELECT MF -> 6134).
+- **Both modes park the donor's radio** (`modem_radio`) while it lends and
+  hand it back afterwards. Over SIM Access the card is gone from the donor
+  anyway; parked, the lost registration is intended instead of a fault the
+  recovery ladder answers with a modem reset (rung 16), which would end the
+  link. The core owns the park: it records it, wakes the radio on the
+  hand-back only as its own policy says (`option lowpower`), releases a park
+  nothing holds any more, does not dial or cycle a parked radio, and reports
+  the registration after a wake, so interfaces given up while the card was
+  lent come back. The plugin's `radio_hold` answers for every modem
+  CONFIGURED as a sponsor, link or not: the core refuses its ifups and parks
+  any registration of it at once. Each tick ends the link when the donor
+  restarted.
+  - Left open: after an UNCLEAN daemon exit (a crash; `stop` hands the card
+    back first) the modem init of the new daemon switches the sponsor's
+    radio online before its first registration is parked again — a short
+    window in which it may register with the card. An init that stays in
+    low power would stall its registration step instead, which the
+    recovery ladder answers with resets.
+- **Which slot:** `rsim_donor_slot` is the donor's PHYSICAL slot (default:
+  the one it runs on), mapped to the logical slot QMI UIM addresses through
+  the core's `sim_slots`. Only the active slot can be lent. "Use one slot,
+  lend the other" was asked for and does not work on single-standby modems:
+  on the RG502Q (NR7101, 242) and the RG650E (245) both physical slots map
+  to logical slot 1, the inactive one is switched off, SEND_APDU on slot 2
+  is refused NOT_SUPPORTED (94), a logical channel opened "on slot 2" lands
+  on the active card (both read the same EF_ICCID), and the firmware offers
+  AT+QUIMSLOT (switch) but no dual-standby option in AT+QCFG (HW-read,
+  2026-09-26). A dual-standby modem (two logical slots) could in principle
+  lend its second card, but its second subscription would register as well;
+  without such a modem that is not built.
 - Diagnostics: `wwandctl rsim MODEM probe` (read-only: SIM Access present?),
   `wwandctl rsim MODEM donor-test [sap|apdu] [qmi|at]` (lend once, ATR +
   SELECT MF, hand back).
