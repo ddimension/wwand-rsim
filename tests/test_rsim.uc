@@ -65,6 +65,11 @@ uloop.init();
 	   'cfg: Phoenix options reach the helper');
 	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: 'pcsc:0', rsim_clock: '6000' }), '/x'),
 	   [ '/x', 'pcsc:0' ], 'cfg: ...and are not handed to a PC/SC reader');
+	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: 'wbsm:', rsim_clock: '3680', rsim_mode: 'smartmouse' }), '/x'),
+	   [ '/x', 'wbsm:', '--clock', '3680', '--wbsm-mode', 'smartmouse' ],
+	   'cfg: a Smartmouse USB gets its clock and mode, which the helper sets on the reader');
+	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: 'phoenix:/dev/ttyUSB0', rsim_mode: 'smartmouse' }), '/x'),
+	   [ '/x', 'phoenix:/dev/ttyUSB0' ], 'cfg: ...a plain Phoenix reader has no mode to set');
 
 	let seg = rsim.segments([ 1, 2, 3 ]);
 

@@ -100,13 +100,15 @@ function bytes(h)
 	return out;
 }
 
-// The typed plugin options. `reader` is `phoenix:/dev/ttyUSB0` or
-// `pcsc:<name or index>`; null means the modem has no remote card.
+// The typed plugin options. `reader` is `phoenix:/dev/ttyUSB0`, `wbsm:`
+// (WB Electronics Smartmouse USB, optionally `wbsm:<USB serial>`: the helper
+// sets its clock and mode and finds its tty) or `pcsc:<name or index>`; null
+// means the modem has no remote card.
 function cfg_of(ext)
 {
 	let r = ext?.rsim_reader;
 
-	if (type(r) != 'string' || !match(r, /^(phoenix|pcsc):./))
+	if (type(r) != 'string' || !match(r, /^((phoenix|pcsc):.|wbsm:)/))
 		return null;
 
 	let slot = +(ext.rsim_slot ?? 1);
@@ -117,6 +119,7 @@ function cfg_of(ext)
 		clock: ext.rsim_clock ?? null,
 		reset: ext.rsim_reset ?? null,
 		detect: ext.rsim_detect ?? null,
+		mode: ext.rsim_mode ?? null,
 	};
 }
 
@@ -125,7 +128,9 @@ function helper_argv(cfg, path)
 {
 	let argv = [ path ?? HELPER, cfg.reader ];
 
-	if (substr(cfg.reader, 0, 8) == 'phoenix:') {
+	let wbsm = (substr(cfg.reader, 0, 5) == 'wbsm:');
+
+	if (wbsm || substr(cfg.reader, 0, 8) == 'phoenix:') {
 		if (cfg.clock != null)
 			push(argv, '--clock', sprintf('%d', +cfg.clock));
 		if (cfg.reset != null)
@@ -133,6 +138,9 @@ function helper_argv(cfg, path)
 		if (cfg.detect != null)
 			push(argv, '--detect', cfg.detect);
 	}
+
+	if (wbsm && cfg.mode != null)
+		push(argv, '--wbsm-mode', cfg.mode);
 
 	return argv;
 }
@@ -683,6 +691,6 @@ return {
 	bytes: bytes,
 
 	name: 'rsim',
-	options: [ 'rsim_reader', 'rsim_slot', 'rsim_clock', 'rsim_reset', 'rsim_detect' ],
+	options: [ 'rsim_reader', 'rsim_slot', 'rsim_clock', 'rsim_reset', 'rsim_detect', 'rsim_mode' ],
 	create: create,
 };

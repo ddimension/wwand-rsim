@@ -15,6 +15,9 @@
 #include "json.h"
 #include "log.h"
 #include "phoenix.h"
+#ifdef WITH_LIBUSB
+#include "wbsm.h"
+#endif
 #ifdef WITH_PCSC
 #include "pcsc.h"
 #endif
@@ -274,14 +277,17 @@ static int serve(struct state *st)
 
 static void usage(FILE *f)
 {
-	fputs("usage: rsim-card [-v] [-s] [options] phoenix:<tty> | pcsc:<reader substring or index>\n"
+	fputs("usage: rsim-card [-v] [-s] [options] phoenix:<tty> | wbsm:[serial] | pcsc:<reader substring or index>\n"
 	      "  -v, --verbose          debug logging\n"
 	      "  -s, --syslog           log to syslog as well as stderr\n"
 	      "phoenix options:\n"
 	      "  --clock KHZ            card clock of the reader (default 3579)\n"
 	      "  --reset MODE           auto|rts|rts_inv|dtr|dtr_inv (default auto)\n"
 	      "  --detect LINE          none|cts|dsr|cd card-detect line (default none)\n"
-	      "  --atr-timeout-ms N     wait for the first ATR byte (default 1000)\n", f);
+	      "  --atr-timeout-ms N     wait for the first ATR byte (default 1000)\n"
+	      "wbsm (WB Electronics Smartmouse USB, clock and mode set by software):\n"
+	      "  --clock KHZ            3580 (default), 3680 or 6000\n"
+	      "  --wbsm-mode MODE       phoenix (default) | smartmouse\n", f);
 }
 
 static int parse_enum(const char *arg, const char *const *names, int n)
@@ -305,6 +311,7 @@ int main(int argc, char **argv)
 		{ "reset", required_argument, NULL, 'r' },
 		{ "detect", required_argument, NULL, 'd' },
 		{ "atr-timeout-ms", required_argument, NULL, 'a' },
+		{ "wbsm-mode", required_argument, NULL, 'w' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
 	};
@@ -316,6 +323,7 @@ int main(int argc, char **argv)
 	};
 	struct state st;
 	const char *spec;
+	int wbsm_smartmouse = 0;
 	int verbose = 0, use_syslog = 0, opt, v, ret;
 	char *end;
 
@@ -357,6 +365,13 @@ int main(int argc, char **argv)
 				return 2;
 			}
 			break;
+		case 'w':
+			if (!strcmp(optarg, "phoenix") || !strcmp(optarg, "smartmouse")) {
+				wbsm_smartmouse = !strcmp(optarg, "smartmouse");
+				break;
+			}
+			fprintf(stderr, "rsim-card: --wbsm-mode %s: phoenix or smartmouse\n", optarg);
+			return 2;
 		case 'h':
 			usage(stdout);
 			return 0;
@@ -379,6 +394,26 @@ int main(int argc, char **argv)
 	if (!strncmp(spec, "phoenix:", 8) && spec[8]) {
 		cfg.dev = spec + 8;
 		st.be = phoenix_open(&cfg);
+	} else if (!strncmp(spec, "wbsm:", 5)) {
+#ifdef WITH_LIBUSB
+		/* the reader's clock is set to what --clock says, so the baud
+		 * rate phoenix.c derives from it is right by construction */
+		static char tty[64];
+		struct wbsm_cfg w = {
+			.serial = spec[5] ? spec + 5 : NULL,
+			.clock_khz = cfg.clock_khz == 3579 ? 3580 : cfg.clock_khz,
+			.smartmouse = wbsm_smartmouse,
+		};
+
+		if (wbsm_prepare(&w, tty, sizeof(tty)))
+			return 1;
+		cfg.dev = tty;
+		cfg.clock_khz = w.clock_khz;
+		st.be = phoenix_open(&cfg);
+#else
+		log_err("built without libusb: the Smartmouse USB cannot be configured");
+		return 1;
+#endif
 	} else if (!strncmp(spec, "pcsc:", 5)) {
 #ifdef WITH_PCSC
 		st.be = pcsc_open(spec + 5);
