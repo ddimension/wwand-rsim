@@ -145,4 +145,47 @@ function fake_ctx(start)
 	eq(c.resets, 1, 'sap-enable --reset: the modem is reset');
 }
 
+// --- use <reader|off> --wait: done when the modem RUNS on the card -----------------
+{
+	let uci = { network: { sm: { '.type': 'wwand_simreader' }, m0: { '.type': 'wwand_modem' } } };
+	let cur = () => ({
+		load: () => true,
+		get: (cf, sec, opt) => opt ? uci[cf][sec]?.[opt] : uci[cf][sec]?.['.type'],
+		set: (cf, sec, opt, v) => { uci[cf][sec][opt] = v; },
+		delete: (cf, sec, opt) => { delete uci[cf][sec][opt]; },
+		save: () => true, commit: () => true,
+	});
+	let t = 0, reloads = 0;
+	// the plugin's view over time: offered, then powered; the modem re-reads
+	let timeline = [
+		{ st: { state: 'waiting' },  m: { state: 'READY', iccid: '8949' } },
+		{ st: { state: 'powered' },  m: { state: 'READY', iccid: '8949' } },   // old identity still shown
+		// a test card without service: the modem keeps searching — still done
+		{ st: { state: 'powered' },  m: { state: 'REGISTERING', iccid: '8988' } },
+	];
+	let step = 0;
+	let ctx = {
+		status: () => ({ modems: { m0: timeline[min(step, length(timeline) - 1)].m } }),
+		call: (method, a) => timeline[min(step, length(timeline) - 1)].st,
+		call_ok: (method) => { if (method == 'reload') reloads++; return {}; },
+	};
+	let sys = { cursor: cur, sleep: (s) => { t += s; step++; }, now: () => t };
+	let rc = ctl.use_reader(ctx, 'm0', [ 'sm', '--wait', '60', '--json' ], sys);
+
+	eq([ rc, uci.network.m0.rsim, reloads ], [ 0, 'sm', 1 ], 'use: configured, reloaded, and done');
+	eq(step, 2, 'use: ...only once the card is powered AND the modem has read the NEW identity');
+
+	step = 0; t = 0;
+	timeline = [ { st: { state: 'failed', last_error: 'no card in wbsm:', retry_at: null }, m: { state: 'READY', iccid: '8949' } } ];
+	eq(ctl.use_reader(ctx, 'm0', [ 'sm', '--wait', '60', '--json' ], sys), 1, 'use: a held failure ends the wait at once, exit 1');
+	eq(step, 1, 'use: ...without sitting out the timeout');
+
+	eq(ctl.use_reader(ctx, 'm0', [ 'nope', '--json' ], sys), 1, 'use: an undefined reader is refused');
+
+	step = 0; t = 0;
+	timeline = [ { st: { state: 'off' }, m: { state: 'READY', iccid: '8949' } } ];
+	eq([ ctl.use_reader(ctx, 'm0', [ 'off', '--wait', '30' ], sys), uci.network.m0.rsim ], [ 0, null ],
+	   'use off: the option goes, done once the modem runs on its own card');
+}
+
 done('test_ctl_rsim');

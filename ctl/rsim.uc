@@ -227,8 +227,106 @@ function set_switch(ctx, modem, on, reset)
 	}
 }
 
+// `rsim <modem> use <reader|off> [--wait N] [--json]`: put a named SIM reader
+// (config wwand_simreader) in the modem's `option rsim`, or take it out, and
+// reload — a plugin option, so the modem is not restarted. With --wait, wait
+// until the modem RUNS on it: the remote card powered and its identity read
+// again (the card-change process) — registered or not — or, for off, its own
+// card back and read and the modem READY again.
+// That is what a caller scripting a test needs — "configured" says nothing
+// about whether the card is in use yet. The result is one JSON line with
+// --json; exit 0 only when the state was reached.
+// sys: { cursor(), sleep(s), now() } — injectable for the tests.
+function use_reader(ctx, modem, args, sys)
+{
+	sys = sys ?? {};
+
+	let cursor = sys.cursor ?? (() => libuci.cursor());
+	let sleep = sys.sleep ?? ((s) => system(sprintf('sleep %d', s)));
+	let now = sys.now ?? (() => time());
+	let target = args[0];
+	let json_out = index(args, '--json') >= 0;
+	let wi = index(args, '--wait');
+	let wait = (wi >= 0) ? +(args[wi + 1] ?? 120) : 0;
+	let res = { ok: false, modem: modem, reader: (target == 'off') ? null : target };
+
+	let finish = (ok, extra) => {
+		res = { ...res, ...(extra ?? {}), ok: ok };
+
+		if (json_out)
+			printf('%J\n', res);
+		else
+			printf('%s\n', ok ? sprintf('%s: %s', modem, res.reader ? sprintf('runs on the card in %s', res.reader) : 'runs on its own card')
+			                   : sprintf('%s: %s', modem, res.error ?? 'failed'));
+
+		return ok ? 0 : 1;
+	};
+
+	if (!length(target ?? ''))
+		die('usage: wwandctl rsim [modem] use <reader|off> [--wait SECONDS] [--json]');
+
+	let c = cursor();
+
+	c.load('network');
+
+	if (target == 'off')
+		c.delete('network', modem, 'rsim');
+	else {
+		if (c.get('network', target) != 'wwand_simreader')
+			return finish(false, { error: sprintf('no SIM reader %s (config wwand_simreader)', target) });
+
+		c.set('network', modem, 'rsim', target);
+	}
+
+	// the identity before the change: "read again" means a different one
+	let before = ctx.status()?.modems?.[modem]?.iccid ?? null;
+
+	c.save('network');
+	c.commit('network');
+	ctx.call_ok('reload', {});
+
+	if (!wait)
+		return finish(true, { state: 'configured' });
+
+	let until = now() + wait;
+	let st = null, iccid = null;
+
+	// the plugin ticks every 10 s: the first look is a few seconds away at best
+	while (now() < until) {
+		sleep(2);
+
+		st = ctx.call('modem_plugin', { modem: modem, plugin: 'rsim', op: 'status' });
+		st = st?.ok === false ? null : st;
+
+		let m = ctx.status()?.modems?.[modem];
+
+		iccid = m?.iccid ?? null;
+
+		if (target != 'off') {
+			// a failure that is not retried on its own ends the wait at once
+			if (st?.config_error || (st?.last_error && st?.retry_at == null && st?.state != 'powered'))
+				return finish(false, { state: st?.state, error: st?.config_error ?? st?.last_error });
+
+			// Registration is not part of it: it depends on the network (a
+			// test card often has no service at all — HW-observed on 245,
+			// 2026-09-26: powered, new identity read, modem REGISTERING),
+			// and what a caller of `use` needs is the card in use. The
+			// modem's state goes into the result for whoever cares.
+			if (st?.state == 'powered' && iccid != null && iccid != before)
+				return finish(true, { state: st.state, iccid: iccid, modem_state: m?.state, atr: st?.atr });
+		}
+		else if ((st?.state ?? 'off') == 'off' && iccid != null && m?.state == 'READY')
+			return finish(true, { state: 'off', iccid: iccid, modem_state: m.state });
+	}
+
+	return finish(false, { state: st?.state, iccid: iccid,
+		error: sprintf('not reached within %d s (remote SIM %s%s)', wait, st?.state ?? '?',
+		               st?.last_error ? sprintf(': %s', st.last_error) : '') });
+}
+
 return {
 	qnvfr_value: qnvfr_value,
+	use_reader: use_reader,
 	ssh_key: ssh_key,
 	status_lines: status_lines,
 	EFS_ENABLE: EFS_ENABLE,
@@ -241,6 +339,7 @@ return {
 		'rsim [modem] restart                  give the modem its own SIM back, then offer the remote one again',
 		'rsim ssh-key                          the router\'s key for a reader on another machine (ssh:user@host:reader)',
 		'rsim readers                          the SIM readers defined (config wwand_simreader) and who uses them',
+		'rsim [modem] use <reader|off> [--wait S] [--json]  run the modem on that reader\'s card (or its own again); --wait until it does',
 		'rsim [modem] probe                    what this modem\'s UIM offers for lending its card (read-only)',
 		'rsim [modem] donor-test [sap|apdu] [qmi|at]  lend its card once: ATR + SELECT MF, then hand it back',
 		'rsim [modem] sap-switch               the firmware switch for lending the card over SIM Access',
@@ -282,6 +381,9 @@ return {
 			printf('%-13s%s\n', 'resp timer', t.error ? 'not set (firmware default)' : t.value);
 			break;
 		}
+
+		case 'use':
+			exit(use_reader(ctx, r.modem, slice(rest, 1)));
 
 		case 'enable':
 		case 'disable':

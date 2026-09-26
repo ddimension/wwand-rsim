@@ -29,6 +29,22 @@ uci commit network; ubus call wwand reload
 wwandctl rsim                        # reader, card, state
 ```
 
+With a named reader (`config wwand_simreader`, e.g. from LuCI):
+
+```sh
+wwandctl rsim wwmodem0 use smartmouse --wait 120 --json   # run on its card
+wwandctl rsim wwmodem0 use off --wait 60 --json           # own SIM again
+```
+
+`use` sets `option rsim` and reloads (the modem is not restarted). With
+`--wait` it returns once the modem RUNS on the card — the remote card
+powered and a new identity read (whether it registers depends on the
+network; `modem_state` in the result says), or its own card back and the
+modem READY — and exits 0; a
+failure that is not retried on its own (no card, reader missing) ends the
+wait at once with exit 1. `--json` prints the result as one JSON line
+(`ok`, `state`, `iccid`, `error`), for scripts such as a lab test driver.
+
 Options on the `wwand_modem` section: `rsim_reader` (`phoenix:<tty>` or
 `pcsc:<reader name or index>`), `rsim_slot` (1), and for Phoenix readers
 `rsim_clock` (kHz, 3579), `rsim_reset` (`auto|rts|rts_inv|dtr|dtr_inv`),
