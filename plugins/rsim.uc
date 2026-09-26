@@ -1969,6 +1969,15 @@ function create(deps)
 						deps.qmi_release(ref, c);
 						if (e)
 							return cb(e, r);
+
+						// a remote card in use says the rest; a second
+						// client given back could run the service's
+						// disconnect under the live session
+						let live = sessions[ref] && sessions[ref].state != 'failed';
+
+						if (live)
+							return cb(null, { ...r, uim_remote: 'available' });
+
 						deps.qmi_client(ref, UIMRMT, (re, rc) => {
 							if (rc)
 								deps.qmi_release(ref, rc);

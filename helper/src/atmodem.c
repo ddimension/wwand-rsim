@@ -148,6 +148,16 @@ static int write_all(int fd, const char *buf, size_t len, long deadline)
 	return 0;
 }
 
+/* the number of a +CME ERROR line, -1 for anything else: "ERROR: 10" as a
+ * substring is also CME 100..109 — 100, "unknown", is a common AT+CSIM
+ * refusal and not a card that left */
+static int cme_of(const char *line)
+{
+	int c;
+
+	return (sscanf(line, "+CME ERROR: %d", &c) == 1) ? c : -1;
+}
+
 /* After a timeout the modem may still answer that command: its late OK or
  * +CSIM would be taken for the next command's. A plain AT with its OK read
  * shows the line is quiet again; everything before that OK is discarded. */
@@ -162,9 +172,17 @@ static void resync(struct at_backend *a)
 	a->rlen = 0;
 	if (write_all(a->fd, "AT\r", 3, deadline) < 0)
 		return;
-	while ((r = read_line(a, line, sizeof(line), deadline)) == 1)
-		if (!strcmp(line, "OK"))
+	/* The first OK may be the late one of the command that timed out: after
+	 * an OK the line has to stay quiet for a moment, or it was not ours */
+	while ((r = read_line(a, line, sizeof(line), deadline)) == 1) {
+		if (strcmp(line, "OK"))
+			continue;
+		if (read_line(a, line, sizeof(line), now_ms() + 300) == 0)
 			return;
+		if (!strcmp(line, "OK"))	/* ours, after the late one */
+			if (read_line(a, line, sizeof(line), now_ms() + 300) == 0)
+				return;
+	}
 	a->dirty = true;	/* still not quiet: again before the next one */
 }
 
@@ -272,7 +290,7 @@ static int at_power_up(struct rsim_backend *be, uint8_t *atr, size_t *atr_len)
 	 * (CME 14) is a card that is there — tried again, not reported gone */
 	if (r == AT_REFUSED) {
 		snprintf(be->detail, RSIM_DETAIL_MAX, "the modem reports no usable card (%s)", err);
-		return strstr(err, "ERROR: 14") ? RSIM_E_IO : RSIM_E_NO_CARD;
+		return (cme_of(err) == 14) ? RSIM_E_IO : RSIM_E_NO_CARD;
 	}
 	if (r) {
 		snprintf(be->detail, RSIM_DETAIL_MAX, "the modem's AT port: %s", err);
@@ -289,7 +307,16 @@ static int at_power_up(struct rsim_backend *be, uint8_t *atr, size_t *atr_len)
 		if (at_cmd(a, "AT+CFUN?", "+CFUN:", c, sizeof(c), 5000, NULL, 0) == RSIM_OK &&
 		    sscanf(c, "+CFUN: %d", &mode) == 1 && mode != 4 && mode != 0) {
 			log_warn("%s: radio is on again (CFUN=%d) while its card is lent — switching it off", be->reader, mode);
-			at_cmd(a, "AT+CFUN=4", NULL, NULL, 0, 15000, NULL, 0);
+			/* a reboot also reset its echo and error format */
+			at_cmd(a, "ATE0", NULL, NULL, 0, 3000, NULL, 0);
+			at_cmd(a, "AT+CMEE=1", NULL, NULL, 0, 3000, NULL, 0);
+			/* refused or unanswered: the card is not lent — two modems
+			 * must not register with it — until a later power-up gets
+			 * the radio off */
+			if (at_cmd(a, "AT+CFUN=4", NULL, NULL, 0, 15000, NULL, 0) != RSIM_OK) {
+				snprintf(be->detail, RSIM_DETAIL_MAX, "cannot switch the radio of this modem off again (CFUN=%d)", mode);
+				return RSIM_E_IO;
+			}
 		}
 	}
 	memcpy(atr, ATR_T0_MINIMAL, sizeof(ATR_T0_MINIMAL));
@@ -325,7 +352,7 @@ static int at_transmit(struct rsim_backend *be, const uint8_t *tpdu, size_t len,
 		snprintf(be->detail, RSIM_DETAIL_MAX, "AT+CSIM refused (%s)", err);
 		/* CME 10, SIM not inserted: the card left — the powered state
 		 * has to go, not only this command */
-		return strstr(err, "ERROR: 10") ? RSIM_E_NO_CARD : RSIM_E_IO;
+		return (cme_of(err) == 10) ? RSIM_E_NO_CARD : RSIM_E_IO;
 	}
 	if (r) {
 		snprintf(be->detail, RSIM_DETAIL_MAX, "the modem's AT port: %s", err);
@@ -390,12 +417,6 @@ struct rsim_backend *atmodem_open(const struct at_cfg *cfg)
 		free(a);
 		return NULL;
 	}
-	if (tcgetattr(a->fd, &t) == 0) {
-		cfmakeraw(&t);
-		t.c_cflag |= CLOCAL | CREAD;
-		cfsetspeed(&t, (speed_t)atmodem_speed(cfg->baud ? cfg->baud : 115200));
-		tcsetattr(a->fd, TCSANOW, &t);
-	}
 	/* One helper per port. Two would read each other's answers, and the
 	 * first to end would switch the radio back on under the other, which
 	 * still lends the card. flock, not TIOCEXCL: the lock ends with its
@@ -416,6 +437,12 @@ struct rsim_backend *atmodem_open(const struct at_cfg *cfg)
 			}
 			usleep(200000);
 		}
+	}
+	if (tcgetattr(a->fd, &t) == 0) {
+		cfmakeraw(&t);
+		t.c_cflag |= CLOCAL | CREAD;
+		cfsetspeed(&t, (speed_t)atmodem_speed(cfg->baud ? cfg->baud : 115200));
+		tcsetattr(a->fd, TCSANOW, &t);
 	}
 	a->be.ops = &AT_OPS;
 	a->be.reader = cfg->dev;

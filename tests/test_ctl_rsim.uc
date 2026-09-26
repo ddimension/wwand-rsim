@@ -197,6 +197,24 @@ function fake_ctx(start)
 
 	eq(ctl.use_reader(ctx, 'nomodem', [ 'sm', '--json' ], sys), 1, 'use: a modem without a wwand_modem section is refused');
 
+	// the same card through another reader definition: its identity does not
+	// change — a session of this attempt, the identity cleared and read again
+	step = 0; t = 0;
+	uci.network.sm2 = { '.type': 'wwand_simreader' };
+	timeline = [ { st: { state: 'waiting', since: 1 },  m: { state: 'READY', iccid: '8988' } },
+	             { st: { state: 'powered', since: 1 },  m: { state: 'READY', iccid: null } },
+	             { st: { state: 'powered', since: 1 },  m: { state: 'REGISTERING', iccid: '8988' } } ];
+	eq([ ctl.use_reader(ctx, 'm0', [ 'sm2', '--wait', '30', '--json' ], sys), step ], [ 0, 2 ],
+	   'use: the same card from another reader is done once its identity was read again');
+
+	// ...and without seeing the identity cleared: after 20 s of the session
+	step = 0; t = 0;
+	uci.network.m0.rsim = 'sm';
+	timeline = [ { st: { state: 'powered', since: 1 }, m: { state: 'READY', iccid: '8988' } } ];
+	let rc2 = ctl.use_reader(ctx, 'm0', [ 'sm2', '--wait', '60', '--json' ], sys);
+	eq([ rc2, step >= 10 && step <= 12 ], [ 0, true ],
+	   'use: the same card, identity never seen cleared: done after 20 s of a fresh session');
+
 	eq(ctl.use_reader(ctx, 'm0', [ 'nope', '--json' ], sys), 1, 'use: an undefined reader is refused');
 
 	// already on that reader: done at once, although the identity does not change
@@ -235,8 +253,8 @@ function fake_ctx(start)
 	let out = join('\n', [
 		'{"backend":"pcsc","spec":"pcsc:ACS ACR38U 00 00","name":"ACS ACR38U 00 00","card":true}',
 		'{"backend":"wbsm","spec":"wbsm:088888-03","serial":"088888-03"}',
-		'{"backend":"tty","spec":"at:/dev/ttyUSB2","device":"/dev/ttyUSB2","driver":"option","usb":"2c7c:0122","interface":"02","hint":"at"}',
-		'{"backend":"tty","spec":"at:/dev/ttyUSB6","device":"/dev/ttyUSB6","driver":"option","usb":"12d1:1506","interface":"02","hint":"at"}',
+		'{"backend":"tty","spec":"at:/dev/ttyUSB2","device":"/dev/ttyUSB2","driver":"option1","usb":"2c7c:0122","interface":"02","hint":"at"}',
+		'{"backend":"tty","spec":"at:/dev/ttyUSB6","device":"/dev/ttyUSB6","driver":"option1","usb":"12d1:1506","interface":"02","hint":"at"}',
 		'{"done":true,"backends":"phoenix,at,wbsm,pcsc"}',
 	]) + '\n';
 	let sys = {

@@ -45,7 +45,11 @@ static void attr(const char *dir, const char *name, char *out, size_t cap)
 static const char *hint_of(const char *driver)
 {
 	static const char *const serial[] = { "ftdi_sio", "pl2303", "cp210x", "ch341", "ch341-uart", NULL };
-	static const char *const modem[] = { "option", "qcserial", "cdc_acm", "sierra", "usb_wwan", "qcaux", NULL };
+	/* the names in sysfs, which are not always the module's: the option
+	 * driver registers as "option1" (drivers/usb/serial/option.c:2575,
+	 * linux 6.18.41; HW-read on 245, 2026-09-27). usb_wwan is a library
+	 * those drivers use, not a driver of its own. */
+	static const char *const modem[] = { "option1", "option", "qcserial", "cdc_acm", "sierra", "qcaux", NULL };
 	int i;
 
 	for (i = 0; serial[i]; i++)

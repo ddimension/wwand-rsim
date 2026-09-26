@@ -269,6 +269,14 @@ int pcsc_list(void)
 
 	rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &ctx);
 	if (rv != SCARD_S_SUCCESS) {
+		struct jw w;
+
+		/* said in the list, not only logged: "no reader" and "pcscd is
+		 * not running" need different fixes */
+		jw_begin(&w, stdout);
+		jw_str(&w, "backend", "pcsc");
+		jw_str(&w, "error", "pcscd not reachable");
+		jw_end(&w);
 		log_notice("pcsc: %s (is pcscd running?)", pcsc_stringify_error(rv));
 		return -1;
 	}

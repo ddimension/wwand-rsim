@@ -34,7 +34,7 @@ def check(cond, what):
 class FakeModem(threading.Thread):
     """Answers AT on the master side: CFUN, CPIN, CSIM, like a Quectel."""
 
-    def __init__(self, fd, card=True, cfun=1, urc=False, cpin_err=None, csim_err=None):
+    def __init__(self, fd, card=True, cfun=1, urc=False, cpin_err=None, csim_err=None, cfun_refuse=False):
         super().__init__(daemon=True)
         self.fd = fd
         self.card = card
@@ -45,6 +45,7 @@ class FakeModem(threading.Thread):
         self.urc = urc          # an unsolicited result before every answer
         self.cpin_err = cpin_err
         self.csim_err = csim_err
+        self.cfun_refuse = cfun_refuse
 
     def say(self, *lines):
         os.write(self.fd, b"".join(b"\r\n" + l.encode() + b"\r\n" for l in lines))
@@ -63,6 +64,8 @@ class FakeModem(threading.Thread):
         if cmd == "AT+CFUN?":
             return self.say("+CFUN: %d" % self.cfun, "OK")
         if cmd.startswith("AT+CFUN="):
+            if self.cfun_refuse and cmd == "AT+CFUN=4":
+                return self.say("+CME ERROR: 3")
             self.cfun = int(cmd[8:])
             return self.say("OK")
         if cmd == "AT+CPIN?":
@@ -219,10 +222,26 @@ check(rig.modem.cfun == 4, "reboot: the next reset from the target switches its 
 rig.close()
 check(rig.modem.cfun == 1, "reboot: ...and it is still restored at the end")
 
+# ...and when it cannot be switched off again, the card is not lent
+rig = Rig()
+rig.ask({"op": "power_up"})
+rig.modem.cfun = 1
+rig.modem.cfun_refuse = True
+r = rig.ask({"op": "reset"})
+check(r and not r.get("ok") and r.get("error") == "io",
+      "reboot: a radio that cannot be switched off again fails the reset, no ATR (%r)" % r)
+rig.modem.cfun_refuse = False
+rig.close()
+
 # --- what the modem says, classified ---------------------------------------------------
 rig = Rig(cpin_err="+CME ERROR: 14")
 up = rig.ask({"op": "power_up"})
 check(up and up.get("error") == "io", "CME 14 (SIM busy): a card that is there, not no_card (%r)" % up)
+rig.close()
+rig = Rig(csim_err="+CME ERROR: 100")
+rig.ask({"op": "power_up"})
+r = rig.ask({"op": "tpdu", "data": "00A40004023F00"})
+check(r and r.get("error") == "io", "CME 100 (unknown) is a refused command, not CME 10 (%r)" % r)
 rig.close()
 rig = Rig(csim_err="+CME ERROR: 10")
 rig.ask({"op": "power_up"})

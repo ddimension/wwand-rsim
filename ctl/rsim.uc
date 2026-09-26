@@ -277,6 +277,11 @@ function scan(ctx, args, sys)
 		printf('no reader or port found\n');
 
 	for (let r in rows) {
+		if (r.error) {
+			printf('%-34s %s\n', r.backend, r.error);
+			continue;
+		}
+
 		let what = (r.backend == 'pcsc') ? sprintf('PC/SC reader, %s', r.card ? 'card inserted' : 'no card')
 			: (r.backend == 'wbsm') ? 'Smartmouse USB'
 			: sprintf('serial %s%s%s', r.driver ?? '?', length(r.usb ?? '') ? ' ' + r.usb : '',
@@ -406,6 +411,10 @@ function use_reader(ctx, modem, args, sys)
 
 	let until = start + wait;
 	let st = null, iccid = null;
+	// a session of THIS attempt, and its card read: the identity is
+	// cleared by the card change and read again — or it is the same card
+	// (another reader definition, the card moved), which stays the same
+	let cleared = false, fresh_since = null;
 
 	// the plugin ticks every 10 s: the first look is a few seconds away at best
 	while (now() < until) {
@@ -438,7 +447,15 @@ function use_reader(ctx, modem, args, sys)
 			// 2026-09-26: powered, new identity read, modem REGISTERING),
 			// and what a caller of `use` needs is the card in use. The
 			// modem's state goes into the result for whoever cares.
-			if (st?.state == 'powered' && iccid != null && (same || iccid != before))
+			let session_new = (st?.state == 'powered' && st?.since != null && st.since >= start);
+
+			if (session_new && iccid == null)
+				cleared = true;
+			if (session_new && fresh_since == null)
+				fresh_since = now();
+
+			if (st?.state == 'powered' && iccid != null &&
+			    (same || iccid != before || (session_new && (cleared || now() - fresh_since >= 20))))
 				return finish(true, { state: st.state, iccid: iccid, modem_state: m?.state, atr: st?.atr });
 		}
 		// its own card READ AGAIN: right after the switch-off the status still

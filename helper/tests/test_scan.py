@@ -44,7 +44,8 @@ def port(root, name, driver, vid, pid, ifnum, below_interface):
 
 
 with tempfile.TemporaryDirectory() as root:
-    port(root, "ttyUSB2", "option", "2c7c", "0125", "02", True)       # a modem's AT port
+    # the option driver's name in sysfs is "option1" (option.c:2575, 6.18.41)
+    port(root, "ttyUSB2", "option1", "2c7c", "0125", "02", True)      # a modem's AT port
     port(root, "ttyUSB0", "cp210x", "10c4", "ea60", "00", True)       # a USB-serial adapter
     port(root, "ttyACM0", "cdc_acm", "1199", "9071", "03", False)     # a CDC-ACM modem port
     port(root, "ttyUSB9", "ftdi_sio", "104f", "0002", "00", True)     # a Smartmouse via ftdi_sio
