@@ -6,14 +6,18 @@
 
 #include <stddef.h>
 
+#include "phoenix.h"
+
 struct wbsm_cfg {
 	const char *serial;     /* the USB serial number, NULL = the first one */
 	unsigned clock_khz;     /* 3580, 3680 or 6000 */
 	int smartmouse;         /* 1 = Smartmouse wiring, 0 = Phoenix */
 };
 
-/* Set the reader's clock and mode, and find the serial port it has once the
- * kernel's ftdi_sio driver owns it. 0 with `tty` filled, or -1 (logged). */
-int wbsm_prepare(const struct wbsm_cfg *cfg, char *tty, size_t ttylen);
+/* Sets the reader's clock and mode and returns its serial side as a Phoenix
+ * transport over libusb (ftdi_usb.c) -- no kernel serial driver involved.
+ * name is for logs and must outlive the transport. NULL on failure
+ * (logged). */
+struct phx_io *wbsm_open(const struct wbsm_cfg *cfg, const char *name);
 
 #endif

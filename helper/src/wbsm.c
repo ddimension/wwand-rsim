@@ -4,7 +4,9 @@
  * WB Electronics "Smartmouse USB" (USB 104f:0002): an FTDI FT232BM behind
  * WB's own USB ids, with the card clock and the Phoenix/Smartmouse wiring
  * selected by software instead of switches. After that it is a plain
- * Phoenix reader on the FTDI serial port, which phoenix.c drives.
+ * Phoenix reader on the FTDI serial port, which phoenix.c drives through
+ * ftdi_usb.c on the same libusb handle: the target kernels have no
+ * ftdi_sio, and none is needed.
  *
  * The selection is latched from the FT232's data pins in bitbang mode
  * (WB's own Linux tool smusbutil 1.1, 2005, written with the vendor's
@@ -21,14 +23,13 @@
  * kernel's ftdi_sio.h use them): SET_BITMODE = request 0x0B, value
  * (mode << 8) | pin mask, mode 0x01 = asynchronous bitbang, 0x00 = off.
  */
-#include <dirent.h>
-#include <errno.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 
 #include <libusb.h>
 
+#include "ftdi_usb.h"
 #include "log.h"
 #include "wbsm.h"
 
@@ -65,58 +66,6 @@ static int matches(libusb_device *dev, libusb_device_handle *h, const char *seri
 	return !strcmp((const char *)buf, serial);
 }
 
-/* /sys/bus/usb/devices/<bus>-<port.port...>:1.0/ttyUSBn -> /dev/ttyUSBn */
-static int find_tty(libusb_device *dev, char *tty, size_t len)
-{
-	uint8_t ports[8];
-	char path[128];
-	int n, i, off;
-	DIR *d;
-	struct dirent *e;
-
-	n = libusb_get_port_numbers(dev, ports, sizeof(ports));
-	if (n <= 0)
-		return -1;
-	off = snprintf(path, sizeof(path), "/sys/bus/usb/devices/%u-", libusb_get_bus_number(dev));
-	for (i = 0; i < n; i++)
-		off += snprintf(path + off, sizeof(path) - off, i ? ".%u" : "%u", ports[i]);
-	snprintf(path + off, sizeof(path) - off, ":1.0");
-	if (!(d = opendir(path)))
-		return -1;
-	while ((e = readdir(d))) {
-		if (!strncmp(e->d_name, "ttyUSB", 6)) {
-			snprintf(tty, len, "/dev/%s", e->d_name);
-			closedir(d);
-			return 0;
-		}
-	}
-	closedir(d);
-	return -1;
-}
-
-#define FTDI_NEW_ID "/sys/bus/usb-serial/drivers/ftdi_sio/new_id"
-
-static int bind_ftdi_sio(void)
-{
-	FILE *f = fopen(FTDI_NEW_ID, "w");
-	int bad;
-
-	if (!f) {
-		log_err("Smartmouse USB: cannot hand it to ftdi_sio (%s: %s)%s", FTDI_NEW_ID, strerror(errno),
-		        errno == ENOENT ? " — load the ftdi_sio module" :
-		        errno == EACCES ? " — needs root: echo 104f 0002 > " FTDI_NEW_ID : "");
-		return -1;
-	}
-	bad = fprintf(f, "%04x %04x\n", WBSM_VID, WBSM_PID) < 0;
-	/* EEXIST: the ids are known already, the driver just was not bound */
-	if ((fclose(f) || bad) && errno != EEXIST) {
-		log_err("Smartmouse USB: writing %s failed: %s", FTDI_NEW_ID, strerror(errno));
-		return -1;
-	}
-	log_notice("Smartmouse USB: ftdi_sio told about 104f:0002");
-	return 0;
-}
-
 static int bitbang(libusb_device_handle *h, unsigned char mode, unsigned char mask)
 {
 	return libusb_control_transfer(h, LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE |
@@ -132,91 +81,77 @@ static int put(libusb_device_handle *h, unsigned char b)
 	return (r || done != 1) ? -1 : 0;
 }
 
-int wbsm_prepare(const struct wbsm_cfg *cfg, char *tty, size_t ttylen)
+struct phx_io *wbsm_open(const struct wbsm_cfg *cfg, const char *name)
 {
 	libusb_context *ctx = NULL;
 	libusb_device **list = NULL;
-	libusb_device *dev = NULL;
 	libusb_device_handle *h = NULL;
 	int code = clock_code(cfg->clock_khz);
-	int detached = 0, claimed = 0, ret = -1, i, r;
+	bool detached = false;
 	ssize_t n;
 	unsigned char b;
+	int i, r;
 
 	if (code < 0) {
 		log_err("Smartmouse USB: %u kHz is not a clock it has (3580, 3680 or 6000)", cfg->clock_khz);
-		return -1;
+		return NULL;
 	}
 	if (libusb_init(&ctx)) {
 		log_err("Smartmouse USB: libusb_init failed");
-		return -1;
+		return NULL;
 	}
 	n = libusb_get_device_list(ctx, &list);
 	for (i = 0; i < n && !h; i++) {
 		if (libusb_open(list[i], &h))
 			continue;
-		if (matches(list[i], h, cfg->serial)) {
-			dev = list[i];
-			break;
+		if (!matches(list[i], h, cfg->serial)) {
+			libusb_close(h);
+			h = NULL;
 		}
-		libusb_close(h);
-		h = NULL;
 	}
+	if (list)
+		libusb_free_device_list(list, 1);
 	if (!h) {
 		log_err("Smartmouse USB (%04x:%04x%s%s) not found, or no permission to open it",
 		        WBSM_VID, WBSM_PID, cfg->serial ? ", serial " : "", cfg->serial ? cfg->serial : "");
-		goto out;
+		goto fail;
 	}
 
-	/* the serial driver has to let go of the interface while the pins
-	 * are driven directly; it is given the device back afterwards */
+	/* A kernel serial driver that holds the interface (ftdi_sio, where
+	 * one exists and was told WB's ids) is detached for as long as we own
+	 * the reader and gets it back on close, so the two never drive the
+	 * chip at once. */
 	if (libusb_kernel_driver_active(h, 0) == 1) {
 		if ((r = libusb_detach_kernel_driver(h, 0))) {
-			log_err("Smartmouse USB: cannot detach the serial driver: %s", libusb_strerror(r));
-			goto out;
+			log_err("Smartmouse USB: cannot detach the kernel driver: %s", libusb_strerror(r));
+			goto fail;
 		}
-		detached = 1;
+		detached = true;
 	}
 	if ((r = libusb_claim_interface(h, 0))) {
 		log_err("Smartmouse USB: cannot claim it: %s", libusb_strerror(r));
-		goto out;
+		goto fail;
 	}
-	claimed = 1;
 
 	b = (unsigned char)(code << 4 | (cfg->smartmouse ? 1 << 6 : 0));
 	if (bitbang(h, FTDI_BITMODE_BITBANG, 0xFF) < 0 || put(h, b) || put(h, b) ||
 	    put(h, b | 0x80) || bitbang(h, 0, 0) < 0) {
 		log_err("Smartmouse USB: setting clock and mode failed");
-		goto out;
+		libusb_release_interface(h, 0);
+		goto fail;
 	}
 	log_notice("Smartmouse USB: %s mode, %s MHz", cfg->smartmouse ? "Smartmouse" : "Phoenix",
 	         code == 1 ? "6.00" : code == 2 ? "3.58" : "3.68");
-	ret = 0;
+	/* bitbang off leaves the chip a UART again; the handle, claim and
+	 * detach state go to the transport, which releases them on close */
+	return ftdi_io_open(ctx, h, detached, name);
 
-out:
-	if (claimed)
-		libusb_release_interface(h, 0);
-	if (detached)
-		libusb_attach_kernel_driver(h, 0);
-	/* No serial driver had it: ftdi_sio does not list WB's ids, so it is
-	 * told about them (new_id also binds the device already present). As
-	 * root, which the wwand daemon is; anywhere else the error says what
-	 * to run. */
-	if (!ret && !detached && bind_ftdi_sio())
-		ret = -1;
-	if (!ret) {
-		/* ftdi_sio needs a moment to register the tty */
-		for (i = 0; i < 30 && find_tty(dev, tty, ttylen); i++)
-			usleep(100000);
-		if (i == 30) {
-			log_err("Smartmouse USB: no serial port appeared for it (is ftdi_sio loaded?)");
-			ret = -1;
-		}
-	}
-	if (h)
+fail:
+	if (h) {
+		if (detached)
+			libusb_attach_kernel_driver(h, 0);
 		libusb_close(h);
-	if (list)
-		libusb_free_device_list(list, 1);
+	}
 	libusb_exit(ctx);
-	return ret;
+	return NULL;
 }

@@ -2,17 +2,12 @@
  * Copyright (C) 2026 André Valentin <avalentin@marcant.net>
  */
 #include <errno.h>
-#include <fcntl.h>
-#include <poll.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
-#include <termios.h>
 #include <time.h>
-#include <unistd.h>
 
 #include "atr.h"
 #include "log.h"
@@ -23,12 +18,7 @@
  * Phoenix / Smartmouse: a USB-serial bridge whose RX and TX both sit on the
  * card's single I/O line, with the card reset on RTS or DTR and a fixed card
  * clock from the reader. There is no VCC control: "power" is the reset line.
- *
- * Test hook: RSIM_TEST_MCTRL=<path> makes the backend write "RTS=0|1" /
- * "DTR=0|1" lines to that file instead of driving the modem-control lines,
- * because a pseudo-terminal has none and the simulated card needs to see the
- * reset pulse. It is read only here and set only by tests/test_e2e.py; a
- * real reader is never opened with it.
+ * The serial side is a struct phx_io (a kernel tty, or FTDI over libusb).
  */
 
 #define RESET_HOLD_MS	50
@@ -42,12 +32,10 @@
 struct phoenix {
 	struct rsim_backend be;
 	struct phoenix_cfg cfg;
-	int fd;
-	int mctrl_fd;		/* test hook, -1 on real hardware */
-	struct termios tio;
+	struct phx_io *io;
 	unsigned baud;
 
-	int reset_bit;		/* TIOCM_RTS or TIOCM_DTR */
+	bool reset_dtr;		/* reset on DTR, else on RTS */
 	bool reset_inv;		/* line cleared = reset asserted */
 	bool polarity_known;
 
@@ -81,21 +69,21 @@ static void sleep_ms(unsigned ms)
 		;
 }
 
-static int set_line(struct phoenix *p, int bit, bool level)
+static int io_err(struct phoenix *p, int err, const char *what)
 {
-	if (p->mctrl_fd >= 0) {
-		dprintf(p->mctrl_fd, "%s=%d\n", bit == TIOCM_RTS ? "RTS" : "DTR",
-			level ? 1 : 0);
-		return RSIM_OK;
-	}
-	if (ioctl(p->fd, level ? TIOCMBIS : TIOCMBIC, &bit) < 0)
-		return set_detail(p, RSIM_E_IO, "modem control: %s", strerror(errno));
-	return RSIM_OK;
+	return set_detail(p, RSIM_E_IO, "%s: %s", what, strerror(-err));
+}
+
+static int set_line(struct phoenix *p, bool dtr, bool level)
+{
+	int r = p->io->ops->set_modem(p->io, dtr ? -1 : level, dtr ? level : -1);
+
+	return r ? io_err(p, r, "modem control") : RSIM_OK;
 }
 
 static int reset_line(struct phoenix *p, bool assert)
 {
-	return set_line(p, p->reset_bit, assert != p->reset_inv);
+	return set_line(p, p->reset_dtr, assert != p->reset_inv);
 }
 
 /* Parity checking is armed only once TS has told the convention: an
@@ -105,52 +93,19 @@ static int reset_line(struct phoenix *p, bool assert)
  * inverse card would be dropped before it could be recognised. */
 static int apply_line(struct phoenix *p, bool check_parity, bool odd)
 {
-	struct termios *t = &p->tio;
-	int r;
+	/* A byte that fails parity is dropped rather than handed on once
+	 * checking is armed: the exchange then fails as a timeout, where a
+	 * corrupted byte would have been read as data or a procedure byte. */
+	int r = p->io->ops->set_line(p->io, p->baud,
+				     odd ? PHX_PARITY_ODD : PHX_PARITY_EVEN,
+				     check_parity);
 
-	t->c_iflag &= ~(tcflag_t)(INPCK | PARMRK | IGNPAR);
-	if (check_parity)
-		/* a byte that fails parity is dropped rather than handed on:
-		 * the exchange then fails as a timeout, where a corrupted
-		 * byte would have been read as data or a procedure byte */
-		t->c_iflag |= INPCK | IGNPAR;
-	t->c_cflag &= ~(tcflag_t)PARODD;
-	if (odd)
-		t->c_cflag |= PARODD;
-	if (tcsetattr(p->fd, TCSANOW, t) < 0 && p->mctrl_fd < 0)
-		return set_detail(p, RSIM_E_IO, "tcsetattr: %s", strerror(errno));
-	/* re-applied every time: whether a libc tcsetattr keeps a BOTHER
-	 * rate or rewrites it from its own speed fields is not something to
-	 * depend on */
-	r = phoenix_set_baud(p->fd, p->baud);
-	if (r < 0) {
-		static bool warned;
-
-		if (!warned)
-			log_warn("%s: exact %u baud not settable (%s), using nearest standard rate",
-				 p->cfg.dev, p->baud, strerror(-r));
-		warned = true;
-	}
-	return RSIM_OK;
-}
-
-static speed_t nearest_speed(unsigned baud)
-{
-	static const struct { unsigned rate; speed_t code; } tab[] = {
-		{ 4800, B4800 }, { 9600, B9600 }, { 19200, B19200 },
-		{ 38400, B38400 }, { 57600, B57600 }, { 115200, B115200 },
-	};
-	size_t i, best = 0;
-
-	for (i = 1; i < sizeof(tab) / sizeof(tab[0]); i++)
-		if (abs((int)tab[i].rate - (int)baud) < abs((int)tab[best].rate - (int)baud))
-			best = i;
-	return tab[best].code;
+	return r ? io_err(p, r, "line setup") : RSIM_OK;
 }
 
 static void rx_drop(struct phoenix *p)
 {
-	tcflush(p->fd, TCIFLUSH);
+	p->io->ops->flush_input(p->io);
 	p->rx_pos = p->rx_len = 0;
 	p->pushback = -1;
 }
@@ -159,25 +114,12 @@ static void rx_drop(struct phoenix *p)
 static int recv_raw(struct phoenix *p, uint8_t *b, unsigned timeout_ms)
 {
 	if (p->rx_pos == p->rx_len) {
-		struct pollfd pfd = { .fd = p->fd, .events = POLLIN };
-		ssize_t n;
-		int r;
+		int n = p->io->ops->read(p->io, p->rx, sizeof(p->rx), timeout_ms);
 
-		do
-			r = poll(&pfd, 1, (int)timeout_ms);
-		while (r < 0 && errno == EINTR);
-		if (r < 0)
-			return set_detail(p, RSIM_E_IO, "poll: %s", strerror(errno));
-		if (r == 0)
+		if (n == 0)
 			return RSIM_E_TIMEOUT;
-		if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
-			return set_detail(p, RSIM_E_IO, "reader gone");
-		n = read(p->fd, p->rx, sizeof(p->rx));
-		if (n < 0 && (errno == EAGAIN || errno == EINTR))
-			return RSIM_E_TIMEOUT;
-		if (n <= 0)
-			return set_detail(p, RSIM_E_IO, "read: %s",
-					  n ? strerror(errno) : "end of file");
+		if (n < 0)
+			return io_err(p, n, "read");
 		p->rx_pos = 0;
 		p->rx_len = (size_t)n;
 	}
@@ -224,7 +166,7 @@ static int chan_send(void *ctx, const uint8_t *buf, size_t len)
 {
 	struct phoenix *p = ctx;
 	uint8_t wire[RSIM_TPDU_MAX];
-	size_t i, off = 0;
+	size_t i;
 	uint8_t b;
 	int r;
 
@@ -232,15 +174,9 @@ static int chan_send(void *ctx, const uint8_t *buf, size_t len)
 		return set_detail(p, RSIM_E_IO, "write of %zu bytes", len);
 	for (i = 0; i < len; i++)
 		wire[i] = p->inverse ? atr_inverse(buf[i]) : buf[i];
-	while (off < len) {
-		ssize_t n = write(p->fd, wire + off, len - off);
-
-		if (n < 0 && errno == EINTR)
-			continue;
-		if (n <= 0)
-			return set_detail(p, RSIM_E_IO, "write: %s", strerror(errno));
-		off += (size_t)n;
-	}
+	r = p->io->ops->write(p->io, wire, len);
+	if (r)
+		return io_err(p, r, "write");
 	if (p->echo == 0)
 		return RSIM_OK;
 	if (p->echo == 1)
@@ -354,8 +290,7 @@ static int pulse_reset(struct phoenix *p, uint8_t *atr, size_t *atr_len)
 
 static void set_polarity(struct phoenix *p, enum phoenix_reset mode)
 {
-	p->reset_bit = mode == PHX_RESET_DTR || mode == PHX_RESET_DTR_INV ?
-		       TIOCM_DTR : TIOCM_RTS;
+	p->reset_dtr = mode == PHX_RESET_DTR || mode == PHX_RESET_DTR_INV;
 	p->reset_inv = mode == PHX_RESET_RTS_INV || mode == PHX_RESET_DTR_INV;
 }
 
@@ -418,26 +353,23 @@ static int ph_transmit(struct rsim_backend *be, const uint8_t *tpdu, size_t len,
 static int ph_present(struct rsim_backend *be)
 {
 	struct phoenix *p = (struct phoenix *)be;
-	int bits, want;
+	int cts, dsr, cd;
 
-	switch (p->cfg.detect) {
-	case PHX_DETECT_CTS:	want = TIOCM_CTS; break;
-	case PHX_DETECT_DSR:	want = TIOCM_DSR; break;
-	case PHX_DETECT_CD:	want = TIOCM_CD; break;
-	default:		return -1;
-	}
-	if (ioctl(p->fd, TIOCMGET, &bits) < 0)
+	if (p->cfg.detect == PHX_DETECT_NONE || !p->io->ops->get_modem ||
+	    p->io->ops->get_modem(p->io, &cts, &dsr, &cd))
 		return -1;
-	return !!(bits & want);
+	switch (p->cfg.detect) {
+	case PHX_DETECT_CTS:	return cts;
+	case PHX_DETECT_DSR:	return dsr;
+	default:		return cd;
+	}
 }
 
 static void ph_close(struct rsim_backend *be)
 {
 	struct phoenix *p = (struct phoenix *)be;
 
-	close(p->fd);
-	if (p->mctrl_fd >= 0)
-		close(p->mctrl_fd);
+	p->io->ops->close(p->io);
 	free(p);
 }
 
@@ -451,59 +383,31 @@ static const struct rsim_backend_ops phoenix_ops = {
 	.close = ph_close,
 };
 
-struct rsim_backend *phoenix_open(const struct phoenix_cfg *cfg)
+struct rsim_backend *phoenix_open(const struct phoenix_cfg *cfg, struct phx_io *io)
 {
-	struct phoenix *p = calloc(1, sizeof(*p));
-	const char *mctrl = getenv("RSIM_TEST_MCTRL");
-	int fl;
+	struct phoenix *p;
 
-	if (!p)
+	if (!io)
+		io = phx_tty_open(cfg->dev);
+	if (!io)
 		return NULL;
+	p = calloc(1, sizeof(*p));
+	if (!p) {
+		io->ops->close(io);
+		return NULL;
+	}
 	p->be.ops = &phoenix_ops;
 	p->be.reader = cfg->dev;
 	p->cfg = *cfg;
-	p->mctrl_fd = -1;
+	p->io = io;
 	p->echo = -1;
 	p->pushback = -1;
 	p->baud = (cfg->clock_khz * 1000u + 186u) / 372u;
 	p->wwt_ms = t0_wwt_ms(cfg->clock_khz, 10) + USB_MARGIN_MS;
-
-	/* O_NONBLOCK only so that open does not wait for carrier; the
-	 * descriptor is used blocking with poll() and VMIN=VTIME=0 */
-	p->fd = open(cfg->dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
-	if (p->fd < 0) {
-		log_err("%s: %s", cfg->dev, strerror(errno));
-		free(p);
-		return NULL;
-	}
-	fl = fcntl(p->fd, F_GETFL);
-	if (fl >= 0)
-		fcntl(p->fd, F_SETFL, fl & ~O_NONBLOCK);
-	if (mctrl) {
-		p->mctrl_fd = open(mctrl, O_WRONLY | O_CLOEXEC);
-		if (p->mctrl_fd < 0) {
-			log_err("%s: %s", mctrl, strerror(errno));
-			goto fail;
-		}
-		log_warn("test mode: modem-control lines go to %s", mctrl);
-	}
-
-	if (tcgetattr(p->fd, &p->tio) < 0) {
-		log_err("%s: not a tty: %s", cfg->dev, strerror(errno));
+	if (apply_line(p, false, false)) {
+		log_err("%s: %s", cfg->dev, p->be.detail);
 		goto fail;
 	}
-	cfmakeraw(&p->tio);
-	/* §7.1/§7.2: one start bit, 8 data bits, even parity, and a guard
-	 * time of 2 etu, which two stop bits provide */
-	p->tio.c_cflag &= ~(tcflag_t)(CSIZE | CRTSCTS | HUPCL);
-	p->tio.c_cflag |= CS8 | PARENB | CSTOPB | CREAD | CLOCAL;
-	p->tio.c_iflag &= ~(tcflag_t)(IXON | IXOFF | IXANY);
-	p->tio.c_cc[VMIN] = 0;
-	p->tio.c_cc[VTIME] = 0;
-	cfsetispeed(&p->tio, nearest_speed(p->baud));
-	cfsetospeed(&p->tio, nearest_speed(p->baud));
-	if (apply_line(p, false, false))
-		goto fail;
 
 	if (cfg->reset != PHX_RESET_AUTO) {
 		set_polarity(p, cfg->reset);
@@ -513,7 +417,7 @@ struct rsim_backend *phoenix_open(const struct phoenix_cfg *cfg)
 	}
 	/* some readers take their supply from DTR, so it stays high unless
 	 * it is the reset line itself */
-	if (p->reset_bit != TIOCM_DTR && set_line(p, TIOCM_DTR, true)) {
+	if (!p->reset_dtr && set_line(p, true, true)) {
 		log_err("%s: %s", cfg->dev, p->be.detail);
 		goto fail;
 	}
@@ -522,9 +426,7 @@ struct rsim_backend *phoenix_open(const struct phoenix_cfg *cfg)
 	return &p->be;
 
 fail:
-	if (p->mctrl_fd >= 0)
-		close(p->mctrl_fd);
-	close(p->fd);
+	io->ops->close(io);
 	free(p);
 	return NULL;
 }

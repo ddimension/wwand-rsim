@@ -33,8 +33,9 @@ if(NOT WITH_PCSC STREQUAL "OFF")
 endif()
 message(STATUS "rsim-card: PC/SC backend ${RSIM_PCSC}")
 
-# libusb only for the WB Electronics Smartmouse USB, whose clock and mode are
-# set over USB before its serial port is used (src/wbsm.c)
+# libusb only for the WB Electronics Smartmouse USB: its clock and mode are
+# set over USB (src/wbsm.c), and its FTDI UART is then driven over libusb as
+# well (src/ftdi_usb.c), because the target kernels have no ftdi_sio
 set(WITH_LIBUSB AUTO CACHE STRING "Smartmouse USB support (libusb-1.0): AUTO, ON or OFF")
 set_property(CACHE WITH_LIBUSB PROPERTY STRINGS AUTO ON OFF)
 set(RSIM_LIBUSB OFF)
@@ -51,15 +52,15 @@ if(NOT WITH_LIBUSB STREQUAL "OFF")
 endif()
 message(STATUS "rsim-card: Smartmouse USB (libusb) ${RSIM_LIBUSB}")
 
-add_library(rsimcore STATIC src/atr.c src/t0.c src/json.c src/log.c)
+add_library(rsimcore STATIC src/atr.c src/t0.c src/json.c src/log.c src/ftdi_proto.c)
 target_include_directories(rsimcore PUBLIC src)
 
-set(RSIM_SOURCES src/main.c src/phoenix.c src/phoenix_baud.c)
+set(RSIM_SOURCES src/main.c src/phoenix.c src/phx_tty.c src/phoenix_baud.c)
 if(RSIM_PCSC)
 	list(APPEND RSIM_SOURCES src/pcsc.c)
 endif()
 if(RSIM_LIBUSB)
-	list(APPEND RSIM_SOURCES src/wbsm.c)
+	list(APPEND RSIM_SOURCES src/wbsm.c src/ftdi_usb.c)
 endif()
 add_executable(rsim-card ${RSIM_SOURCES})
 target_link_libraries(rsim-card rsimcore)
@@ -77,7 +78,7 @@ install(TARGETS rsim-card RUNTIME DESTINATION bin)
 
 include(CTest)
 if(BUILD_TESTING)
-	foreach(t atr t0 json)
+	foreach(t atr t0 json ftdi)
 		add_executable(test_${t} tests/test_${t}.c)
 		target_link_libraries(test_${t} rsimcore)
 		add_test(NAME ${t} COMMAND test_${t})

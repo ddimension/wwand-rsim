@@ -393,25 +393,26 @@ int main(int argc, char **argv)
 	memset(&st, 0, sizeof(st));
 	if (!strncmp(spec, "phoenix:", 8) && spec[8]) {
 		cfg.dev = spec + 8;
-		st.be = phoenix_open(&cfg);
+		st.be = phoenix_open(&cfg, NULL);
 	} else if (!strncmp(spec, "wbsm:", 5)) {
 #ifdef WITH_LIBUSB
 		/* the reader's clock is set to what --clock says, so the baud
 		 * rate phoenix.c derives from it is right by construction */
-		static char tty[64];
 		struct wbsm_cfg w = {
 			.serial = spec[5] ? spec + 5 : NULL,
 			.clock_khz = cfg.clock_khz == 3579 ? 3580 : cfg.clock_khz,
 			.smartmouse = wbsm_smartmouse,
 		};
+		struct phx_io *io = wbsm_open(&w, spec);
 
-		if (wbsm_prepare(&w, tty, sizeof(tty)))
+		if (!io)
 			return 1;
-		cfg.dev = tty;
+		cfg.dev = spec;
 		cfg.clock_khz = w.clock_khz;
-		st.be = phoenix_open(&cfg);
+		st.be = phoenix_open(&cfg, io);
 #else
-		log_err("built without libusb: the Smartmouse USB cannot be configured");
+		(void)wbsm_smartmouse;
+		log_err("built without libusb: the Smartmouse USB cannot be driven");
 		return 1;
 #endif
 	} else if (!strncmp(spec, "pcsc:", 5)) {
