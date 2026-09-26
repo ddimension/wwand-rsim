@@ -215,6 +215,14 @@ function fake_ctx(start)
 	eq([ ctl.use_reader(ctx, 'm0', [ 'off', '--wait', '30' ], sys), uci.network.m0.rsim, step ], [ 0, null, 2 ],
 	   'use off: the option goes, done once the modem has read its own card again');
 
+	// its own card without service: back all the same
+	step = 0; t = 0;
+	uci.network.m0.rsim = 'sm';
+	timeline = [ { st: { state: 'powered' }, m: { state: 'REGISTERING', iccid: '8988' } },
+	             { st: { state: 'off' },     m: { state: 'REGISTERING', iccid: '8949' } } ];
+	eq([ ctl.use_reader(ctx, 'm0', [ 'off', '--wait', '30' ], sys), step ], [ 0, 1 ],
+	   'use off: its own card read again counts, registered or not');
+
 	step = 0; t = 0;
 	timeline = [ { st: { state: 'off' }, m: { state: 'READY', iccid: '8949' } } ];
 	eq([ ctl.use_reader(ctx, 'm0', [ 'off', '--wait', '30' ], sys), step ], [ 0, 1 ],

@@ -332,7 +332,7 @@ function set_switch(ctx, modem, on, reset)
 // reload — a plugin option, so the modem is not restarted. With --wait, wait
 // until the modem RUNS on it: the remote card powered and its identity read
 // again (the card-change process) — registered or not — or, for off, its own
-// card back and read and the modem READY again.
+// card back and read, registered or searching.
 // That is what a caller scripting a test needs — "configured" says nothing
 // about whether the card is in use yet. The result is one JSON line with
 // --json; exit 0 only when the state was reached.
@@ -444,7 +444,11 @@ function use_reader(ctx, modem, args, sys)
 		// its own card READ AGAIN: right after the switch-off the status still
 		// shows the remote card's identity, and READY, until the modem has
 		// re-read — unless it never was on a remote card
-		else if ((st?.state ?? 'off') == 'off' && iccid != null && m?.state == 'READY' && (same || iccid != before))
+		// registered or still searching, as for a remote card: whether its
+		// own card has service is the network's business (HW-observed on 93,
+		// 2026-09-27: own card back and read, modem REGISTERING on a test APN)
+		else if ((st?.state ?? 'off') == 'off' && iccid != null && index([ 'READY', 'REGISTERING' ], m?.state) >= 0 &&
+		         (same || iccid != before))
 			return finish(true, { state: 'off', iccid: iccid, modem_state: m.state });
 	}
 

@@ -39,8 +39,8 @@ wwandctl rsim wwmodem0 use off --wait 60 --json           # own SIM again
 `use` sets `option rsim` and reloads (the modem is not restarted). With
 `--wait` it returns once the modem RUNS on the card — the remote card
 powered and a new identity read (whether it registers depends on the
-network; `modem_state` in the result says), or its own card read again and
-the modem READY — and exits 0 (at once when nothing changes: the reader is
+network; `modem_state` in the result says), or its own card read again
+(registered or still searching) — and exits 0 (at once when nothing changes: the reader is
 already the one in use, or the modem already on its own card). A failure of
 this attempt that is not retried on its own (no card, reader missing) ends
 the wait at once with exit 1, so does another modem holding the reader;
