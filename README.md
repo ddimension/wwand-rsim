@@ -32,6 +32,19 @@ Options on the `wwand_modem` section: `rsim_reader` (`phoenix:<tty>` or
 `rsim_clock` (kHz, 3579), `rsim_reset` (`auto|rts|rts_inv|dtr|dtr_inv`),
 `rsim_detect` (`none|cts|dsr|cd`).
 
+Readers: `phoenix:<tty>` (a Phoenix/Smartmouse serial reader with switches),
+`wbsm:[USB serial]` (WB Electronics Smartmouse USB: clock and mode set by
+software, `rsim_clock` 3580/3680/6000, `rsim_mode` phoenix/smartmouse),
+`pcsc:<name or index>`.
+
+**A reader on another machine:** `rsim_reader 'ssh:<user>@<host>:<reader>'`
+runs the helper there over SSH, e.g. `ssh:rsim@pc.lan:wbsm:`. On the router,
+`wwandctl rsim ssh-key` creates its key and prints the public half for the
+other machine's `~/.ssh/authorized_keys`; that machine needs `rsim-card` in
+its PATH (or `rsim_ssh_helper`) and access to the reader. Optional:
+`rsim_ssh_port`, `rsim_ssh_key`. A dropped connection is handled like a
+helper that exited: the modem gets its own SIM back and the plugin retries.
+
 Removing `rsim_reader` gives the modem its own SIM back.
 
 ## Tests

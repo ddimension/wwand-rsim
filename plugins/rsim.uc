@@ -21,6 +21,41 @@ import * as fs from 'fs';
 
 const HELPER = '/usr/lib/wwand/rsim-card';
 
+// A reader on another machine: `ssh:<user>@<host>:<reader>`. The helper runs
+// there and its lines travel over SSH, so nothing but the command line
+// changes (docs/plan.md §3.3). The router's key lives here; `wwandctl rsim
+// ssh-key` creates it.
+const SSH_KEY_DIR = '/etc/wwand/rsim';
+const LOCAL_READER = /^((phoenix|pcsc):.|wbsm:)/;
+
+// 'ssh:user@host:reader' -> { dest, reader }, or null
+function ssh_split(r)
+{
+	let m = match(r, /^ssh:([A-Za-z0-9._-]+@[A-Za-z0-9._-]+):((phoenix|pcsc|wbsm):.*)$/);
+
+	return (m && match(m[2], LOCAL_READER)) ? { dest: m[1], reader: m[2] } : null;
+}
+
+// one word for the remote shell, whatever it contains (a PC/SC reader name
+// has spaces)
+function shq(s)
+{
+	return "'" + replace(s, /'/g, "'\\''") + "'";
+}
+
+// which ssh this box has: OpenWrt's /usr/bin/ssh is usually dropbear's
+// dbclient, whose options differ from OpenSSH's (no -o; -y instead of
+// StrictHostKeyChecking, -K for keepalives)
+function ssh_flavor()
+{
+	let l = fs.readlink('/usr/bin/ssh');
+
+	if ((l && index(l, 'dbclient') >= 0) || (l && index(l, 'dropbear') >= 0))
+		return 'dropbear';
+
+	return fs.access('/usr/bin/ssh') ? 'openssh' : (fs.access('/usr/bin/dbclient') ? 'dropbear' : null);
+}
+
 // QMI UIM Remote, IDL 1.x. Message and TLV ids are interface facts, checked
 // against the one public client implementation that runs on real modems
 // (SIMComHub softsim, src/qmi_remotesim.c) and against the service's IDL
@@ -108,13 +143,31 @@ function cfg_of(ext)
 {
 	let r = ext?.rsim_reader;
 
-	if (type(r) != 'string' || !match(r, /^((phoenix|pcsc):.|wbsm:)/))
+	if (type(r) != 'string')
+		return null;
+
+	let remote = null;
+
+	if (substr(r, 0, 4) == 'ssh:') {
+		remote = ssh_split(r);
+
+		if (!remote)
+			return null;
+	}
+	else if (!match(r, LOCAL_READER))
 		return null;
 
 	let slot = +(ext.rsim_slot ?? 1);
 
 	return {
 		reader: r,
+		local_reader: remote?.reader ?? r,
+		ssh: remote ? {
+			dest: remote.dest,
+			port: ext.rsim_ssh_port ?? null,
+			key: ext.rsim_ssh_key ?? null,
+			helper: ext.rsim_ssh_helper ?? 'rsim-card',
+		} : null,
 		slot: (slot >= 0 && slot <= 3) ? slot : 1,
 		clock: ext.rsim_clock ?? null,
 		reset: ext.rsim_reset ?? null,
@@ -123,14 +176,16 @@ function cfg_of(ext)
 	};
 }
 
-// the helper's argv for a configuration
-function helper_argv(cfg, path)
+// the helper's argv for a configuration; `sys` (tests) overrides the ssh
+// flavour and which key files exist
+function helper_argv(cfg, path, sys)
 {
-	let argv = [ path ?? HELPER, cfg.reader ];
+	let reader = cfg.local_reader ?? cfg.reader;
+	let argv = [ cfg.ssh ? (cfg.ssh.helper ?? 'rsim-card') : (path ?? HELPER), reader ];
 
-	let wbsm = (substr(cfg.reader, 0, 5) == 'wbsm:');
+	let wbsm = (substr(reader, 0, 5) == 'wbsm:');
 
-	if (wbsm || substr(cfg.reader, 0, 8) == 'phoenix:') {
+	if (wbsm || substr(reader, 0, 8) == 'phoenix:') {
 		if (cfg.clock != null)
 			push(argv, '--clock', sprintf('%d', +cfg.clock));
 		if (cfg.reset != null)
@@ -142,7 +197,32 @@ function helper_argv(cfg, path)
 	if (wbsm && cfg.mode != null)
 		push(argv, '--wbsm-mode', cfg.mode);
 
-	return argv;
+	if (!cfg.ssh)
+		return argv;
+
+	let flavor = sys?.flavor ?? ssh_flavor();
+	let exists = sys?.exists ?? ((p) => fs.access(p));
+	let key = cfg.ssh.key ?? sprintf('%s/%s', SSH_KEY_DIR, (flavor == 'dropbear') ? 'id_dropbear' : 'id_ed25519');
+	let cmd = join(' ', map(argv, shq));
+
+	// -T: no terminal, the lines must pass unchanged. Host keys are
+	// accepted on first use and checked after that. Keepalives, so a dead
+	// link ends the session (a helper exit to the plugin) instead of
+	// leaving the modem waiting on a card that is gone.
+	let ssh = (flavor == 'dropbear')
+		? [ '/usr/bin/ssh', '-T', '-y', '-K', '15' ]
+		: [ '/usr/bin/ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new',
+		    '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3' ];
+
+	if (cfg.ssh.port != null)
+		push(ssh, '-p', sprintf('%d', +cfg.ssh.port));
+
+	if (cfg.ssh.key != null || exists(key))
+		push(ssh, '-i', key);
+
+	push(ssh, cfg.ssh.dest, cmd);
+
+	return ssh;
 }
 
 // Split a card response into APDU requests' segment fields.
@@ -507,7 +587,7 @@ function create(deps)
 
 		sessions[ref] = s;
 
-		s.rpc = helper_rpc(open, helper_argv(cfg, helper_path), (ev) => {
+		s.rpc = helper_rpc(open, helper_argv(cfg, helper_path, deps.ssh_sys), (ev) => {
 			if (s.state == 'failed')
 				return;
 
@@ -686,11 +766,14 @@ return {
 	UIMRMT: UIMRMT,
 	cfg_of: cfg_of,
 	helper_argv: helper_argv,
+	ssh_split: ssh_split,
+	SSH_KEY_DIR: SSH_KEY_DIR,
 	segments: segments,
 	hexs: hexs,
 	bytes: bytes,
 
 	name: 'rsim',
-	options: [ 'rsim_reader', 'rsim_slot', 'rsim_clock', 'rsim_reset', 'rsim_detect', 'rsim_mode' ],
+	options: [ 'rsim_reader', 'rsim_slot', 'rsim_clock', 'rsim_reset', 'rsim_detect', 'rsim_mode',
+	           'rsim_ssh_port', 'rsim_ssh_key', 'rsim_ssh_helper' ],
 	create: create,
 };

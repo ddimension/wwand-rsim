@@ -71,6 +71,28 @@ uloop.init();
 	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: 'phoenix:/dev/ttyUSB0', rsim_mode: 'smartmouse' }), '/x'),
 	   [ '/x', 'phoenix:/dev/ttyUSB0' ], 'cfg: ...a plain Phoenix reader has no mode to set');
 
+	// a reader on another machine
+	eq(rsim.cfg_of({ rsim_reader: 'ssh:rsim@pc.lan:wbsm:' })?.local_reader, 'wbsm:', 'ssh: the remote reader');
+	eq(rsim.cfg_of({ rsim_reader: 'ssh:rsim@pc.lan:/dev/ttyUSB0' }), null, 'ssh: the remote reader needs its backend too');
+	eq(rsim.cfg_of({ rsim_reader: 'ssh:pc.lan:wbsm:' }), null, 'ssh: a user is required');
+	eq(rsim.cfg_of({ rsim_reader: 'ssh:u@h;rm -rf /:wbsm:' }), null, 'ssh: a host is a host name, nothing else');
+
+	let db = { flavor: 'dropbear', exists: (p) => true };
+	let os = { flavor: 'openssh', exists: (p) => false };
+
+	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: 'ssh:rsim@pc.lan:wbsm:', rsim_mode: 'phoenix' }), '/x', db),
+	   [ '/usr/bin/ssh', '-T', '-y', '-K', '15', '-i', '/etc/wwand/rsim/id_dropbear',
+	     'rsim@pc.lan', "'rsim-card' 'wbsm:' '--wbsm-mode' 'phoenix'" ],
+	   'ssh: dropbear runs the helper over there, with the router\'s key and keepalives');
+	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: "ssh:rsim@pc.lan:pcsc:ACS ACR38U 00 'x'",
+	                                  rsim_ssh_port: '2222', rsim_ssh_helper: '/opt/rsim-card' }), '/x', os),
+	   [ '/usr/bin/ssh', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new',
+	     '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3', '-p', '2222',
+	     'rsim@pc.lan', "'/opt/rsim-card' 'pcsc:ACS ACR38U 00 '\\''x'\\'''" ],
+	   'ssh: OpenSSH options, a port, a helper path, and a reader name with spaces and quotes kept one word');
+	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: 'ssh:rsim@pc.lan:wbsm:', rsim_ssh_key: '/root/k' }), '/x', os)[10],
+	   '-i', 'ssh: a configured key is used even when the default does not exist');
+
 	let seg = rsim.segments([ 1, 2, 3 ]);
 
 	eq(seg, [ { info: { total: 3, offset: 0 }, response: [ 1, 2, 3 ] } ], 'segments: a card answer is one segment');

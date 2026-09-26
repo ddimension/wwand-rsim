@@ -19,6 +19,8 @@
 
 'use strict';
 
+import * as fs from 'fs';
+
 const EFS_ENABLE = '/nv/item_files/modem/uim/remote/uim_remote_service_enable';
 // how long the modem waits for a remote card's answer; shown, not set —
 // absent on most firmware, where the modem uses its built-in default
@@ -96,6 +98,51 @@ function status_lines(st)
 	return out;
 }
 
+// The router's own SSH key for a reader on another machine (rsim_reader
+// 'ssh:user@host:reader'): created once, the public half printed for the
+// other machine's authorized_keys. Dropbear and OpenSSH keep keys in
+// different formats, so it is made with the tool of the ssh the plugin will
+// run. `run` is injectable for the tests.
+const KEY_DIR = '/etc/wwand/rsim';
+
+function ssh_key(run)
+{
+	run = run ?? ((cmd) => {
+		let p = fs.popen(cmd, 'r');
+		let out = p ? p.read('all') : null;
+		let rc = p ? p.close() : -1;
+
+		return { rc: rc, out: out ?? '' };
+	});
+
+	let l = fs.readlink('/usr/bin/ssh');
+	let dropbear = (l && (index(l, 'dbclient') >= 0 || index(l, 'dropbear') >= 0)) ||
+	               (!fs.access('/usr/bin/ssh') && fs.access('/usr/bin/dbclient'));
+	let key = sprintf('%s/%s', KEY_DIR, dropbear ? 'id_dropbear' : 'id_ed25519');
+
+	fs.mkdir(KEY_DIR, 0o700);
+
+	if (!fs.access(key)) {
+		let r = run(dropbear
+			? sprintf("dropbearkey -t ed25519 -f '%s' >/dev/null 2>&1", key)
+			: sprintf("ssh-keygen -q -t ed25519 -N '' -C wwand-rsim -f '%s' >/dev/null 2>&1", key));
+
+		if (r.rc != 0 || !fs.access(key))
+			die(sprintf('creating %s failed (%s)', key, dropbear ? 'dropbearkey' : 'ssh-keygen'));
+
+		printf('created %s\n', key);
+	}
+
+	let pub = run(dropbear ? sprintf("dropbearkey -y -f '%s' 2>/dev/null | grep '^ssh-'", key)
+	                       : sprintf("cat '%s.pub'", key));
+
+	if (pub.rc != 0 || !length(trim(pub.out)))
+		die(sprintf('cannot read the public key of %s', key));
+
+	printf('%s\n', trim(pub.out));
+	printf('add this line to ~/.ssh/authorized_keys of the user on the machine with the reader\n');
+}
+
 function set_switch(ctx, modem, on, reset)
 {
 	let want = on ? '01' : '00';
@@ -136,6 +183,7 @@ function set_switch(ctx, modem, on, reset)
 
 return {
 	qnvfr_value: qnvfr_value,
+	ssh_key: ssh_key,
 	status_lines: status_lines,
 	EFS_ENABLE: EFS_ENABLE,
 
@@ -144,9 +192,14 @@ return {
 		'rsim [modem] switch                   the modem firmware switch for UIM Remote',
 		'rsim [modem] enable|disable [--reset] set it (a modem reset applies it)',
 		'rsim [modem] restart                  give the modem its own SIM back, then offer the remote one again',
+		'rsim ssh-key                          the router\'s key for a reader on another machine (ssh:user@host:reader)',
 	],
 
 	run: function(ctx, args) {
+		// not about a modem: must not require one
+		if (args[0] == 'ssh-key')
+			return ssh_key();
+
 		let r = ctx.resolve_modem(ctx.status(), args[0]);
 		let rest = r.consumed ? slice(args, 1) : args;
 		let op = rest[0] ?? 'status';
