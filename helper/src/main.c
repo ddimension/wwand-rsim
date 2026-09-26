@@ -410,6 +410,13 @@ int main(int argc, char **argv)
 			return 1;
 		cfg.dev = spec;
 		cfg.clock_khz = w.clock_khz;
+		/* In Phoenix mode this reader resets on inverted RTS
+		 * (HW-observed on 104f:0002, 2026-09-26, twice). Known, so not
+		 * probed: auto would try plain RTS first, which releases a card
+		 * held in reset. Smartmouse mode is the other wiring, unmeasured,
+		 * so it stays auto. */
+		if (cfg.reset == PHX_RESET_AUTO && !wbsm_smartmouse)
+			cfg.reset = PHX_RESET_RTS_INV;
 		st.be = phoenix_open(&cfg, io);
 #else
 		(void)wbsm_smartmouse;

@@ -22,6 +22,10 @@
  */
 
 #define RESET_HOLD_MS	50
+/* how long a card held in reset must stay silent: longer than the reader's
+ * USB latency (2 ms) plus a few characters at 9600 baud */
+#define RESET_QUIET_MS	20
+#define DRAIN_MAX_MS	300
 /* per-byte wait for the echo of a byte just written: one character is ~1.3
  * ms at 9600 baud, the rest is USB latency (FTDI's latency timer alone is
  * 16 ms by default) */
@@ -269,19 +273,64 @@ static int read_atr(struct phoenix *p, uint8_t *atr, size_t *atr_len)
 	return RSIM_OK;
 }
 
+/* read and drop until nothing has come for RESET_QUIET_MS, at most
+ * DRAIN_MAX_MS: an ATR is at most 33 characters, 35 ms at 9600 baud */
+static void drain_quiet(struct phoenix *p)
+{
+	struct timespec t0, t1;
+
+	rx_drop(p);
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (;;) {
+		if (p->io->ops->read(p->io, p->rx, sizeof(p->rx), RESET_QUIET_MS) <= 0)
+			break;
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		if ((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 > DRAIN_MAX_MS)
+			break;
+	}
+	p->rx_pos = p->rx_len = 0;
+}
+
 static int pulse_reset(struct phoenix *p, uint8_t *atr, size_t *atr_len)
 {
 	int r;
 
 	/* parity unchecked until TS has decided the convention */
 	r = apply_line(p, false, false);
+	/* whatever the card sent before the reset is from the old session —
+	 * including an ATR still on its way: opening the reader leaves the
+	 * line released, the card answers that, and over USB those bytes
+	 * arrive tens of milliseconds late. A flush alone catches only what is
+	 * already in the host buffer; wait for the line to go quiet, or the
+	 * silence check below reads that ATR as a card talking in reset
+	 * (HW-observed with the Smartmouse USB, 2026-09-26). */
+	drain_quiet(p);
 	if (!r)
 		r = reset_line(p, true);
 	if (r)
 		return r;
 	sleep_ms(RESET_HOLD_MS);
-	/* whatever the card sent before the reset is from the old session */
-	rx_drop(p);
+	/* A card held in reset is silent. One that talks now was RELEASED by
+	 * what we meant as the reset: the polarity is the wrong one, and the
+	 * "release" that follows would put it into reset for good. Dropping
+	 * these bytes is not enough — over USB part of such an ATR arrives
+	 * after the flush and passes for an answer to the release, and the
+	 * first command then times out on a card held in reset (HW-observed
+	 * with the Smartmouse USB on the RG650E, 2026-09-26). */
+	int quiet = p->io->ops->read(p->io, p->rx, sizeof(p->rx), RESET_QUIET_MS);
+
+	if (quiet > 0) {
+		char hex[3 * 16 + 1];
+		int i;
+
+		for (i = 0; i < quiet && i < 16; i++)
+			snprintf(hex + 2 * i, sizeof(hex) - 2 * i, "%02X", p->rx[i]);
+		log_dbg("%s: %d bytes while held in reset: %s%s", p->cfg.dev, quiet, hex,
+			quiet > 16 ? "..." : "");
+		rx_drop(p);
+		reset_line(p, false);
+		return set_detail(p, RSIM_E_NO_CARD, "the card talks while held in reset: wrong reset polarity");
+	}
 	r = reset_line(p, false);
 	if (r)
 		return r;

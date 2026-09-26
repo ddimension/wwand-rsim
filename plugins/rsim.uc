@@ -500,7 +500,7 @@ function create(deps)
 	// APDUs go to the card one at a time, in the order the modem sent them
 	let pump_apdu;
 	pump_apdu = (s) => {
-		if (s.busy || !length(s.queue) || s.state == 'failed')
+		if (s.busy || !length(s.queue) || s.state == 'failed' || !s.rpc)
 			return;
 
 		let a = shift(s.queue);
@@ -546,7 +546,12 @@ function create(deps)
 
 	let wire = (s) => {
 		let c = s.client;
-		let mine = (d) => (+(d?.slot ?? -1) == s.cfg.slot);
+		// A session that has ended ignores its client: the modem still
+		// indicates on it until the release completes (a power-down answers
+		// our connection-unavailable), and the helper is already gone. An
+		// exception in an indication handler ends the whole daemon
+		// (HW-observed on 245, 2026-09-26: `rsim restart` killed wwand).
+		let mine = (d) => (s.state != 'failed' && s.rpc != null && +(d?.slot ?? -1) == s.cfg.slot);
 
 		c.on('CONNECT_IND', (d) => {
 			if (!mine(d))

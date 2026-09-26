@@ -266,6 +266,17 @@ const EXT = { rsim_reader: 'phoenix:/dev/ttyUSB0' };
 	let tail = map(slice(client.sent, before), (s) => s.args?.info?.event);
 
 	eq(tail, [ 3, 0 ], 'leave: card removed, then connection unavailable — the modem goes back to its own SIM');
+
+	// ...and the modem answers that on the old client before it is released
+	let died = null;
+
+	try {
+		client.fire('CARD_POWER_DOWN_IND', { slot: 1, mode: 1 });
+		client.fire('CARD_POWER_UP_IND', { slot: 1 });
+		client.fire('APDU_IND', { slot: 1, apdu_id: 99, command: rsim.bytes('A0A40000023F00') });
+		run_for(20);
+	} catch (e) { died = e.message; }
+	eq(died, null, 'leave: indications for an ended session are ignored, not a crash of the daemon');
 	ok(client.released, 'leave: the client is given back to the modem');
 	eq(reader.closed, 1, 'leave: the helper is closed');
 }
