@@ -53,7 +53,15 @@ Options on the `wwand_modem` section: `rsim_reader` (`phoenix:<tty>` or
 Readers: `phoenix:<tty>` (a Phoenix/Smartmouse serial reader with switches),
 `wbsm:[USB serial]` (WB Electronics Smartmouse USB: clock and mode set by
 software, `rsim_clock` 3580/3680/6000, `rsim_mode` phoenix/smartmouse),
-`pcsc:<name or index>`.
+`pcsc:<name or index>`, `at:<tty>` — the SIM of a modem that wwand does not
+manage (on a SIM host, or on this router), reached over its AT port with
+AT+CSIM (TS 27.007 §8.17). That modem keeps the card; its radio is switched
+off (`AT+CFUN=4`, the SIM stays reachable) while the card is used elsewhere
+and put back as it was afterwards, also when the helper is stopped or its SSH
+link drops (`rsim_at_radio keep` leaves it alone, `rsim_at_baud` for a real
+UART). The ATR is the minimal T=0 ATR `3B00`: plain AT has no command for the
+card's own. As a named reader: `option type 'at'`, `option device
+'/dev/ttyUSB2'`, optionally `host`, `radio`, `baud`.
 
 **A reader on another machine:** `rsim_reader 'ssh:<user>@<host>:<reader>'`
 runs the helper there over SSH, e.g. `ssh:rsim@pc.lan:wbsm:`. On the router,

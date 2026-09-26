@@ -217,6 +217,18 @@ the session logic.
   `wwandctl rsim MODEM donor-test [sap|apdu] [qmi|at]` (lend once, ATR +
   SELECT MF, hand back).
 
+### 3.5b A modem wwand does not manage (`at:<tty>`) — implemented 2026-09-26
+
+The helper's `at:` backend (helper/src/atmodem.c): the card of any modem
+with an AT port — typically one on a SIM host, reached over SSH like a
+reader — as APDUs over AT+CSIM, the same path as the plugin's AT donor
+inside the router. The modem keeps the card; power and reset answer the
+minimal ATR 3B00. It is put into CFUN=4 while the card is lent (the SIM
+stays reachable, the radio off: one card, one registration) and back to its
+previous mode at the end; SIGTERM/SIGHUP/SIGINT end the helper through the
+same cleanup, so a dropped SSH link does not leave it off. Tested against a
+simulated AT port (tests/test_e2e_at.py), not yet on hardware.
+
 ### 3.6 LuCI — implemented 2026-09-26
 
 `luci-app-wwand-rsim`, Network → Remote SIM: per wwand_modem the SIM source

@@ -66,6 +66,19 @@ uloop.init();
 	eq(rsim.cfg_of({}), null, 'cfg: no reader, no remote card');
 	eq(rsim.cfg_of({ rsim_reader: '/dev/ttyUSB0' }), null, 'cfg: a reader needs its backend named');
 	eq(rsim.cfg_of({ rsim_reader: 'phoenix:/dev/ttyUSB0' })?.slot, 1, 'cfg: slot 1 by default');
+
+	// the SIM of a modem that is not wwand's, over its AT port
+	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: 'at:/dev/ttyUSB2' }), '/x'), [ '/x', 'at:/dev/ttyUSB2' ],
+	   'cfg at: the modem\'s AT port; its radio goes off by the helper\'s default');
+	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: 'at:/dev/ttyUSB2', rsim_at_radio: 'keep', rsim_at_baud: '9600',
+	                                  rsim_clock: '6000' }), '/x'),
+	   [ '/x', 'at:/dev/ttyUSB2', '--at-radio', 'keep', '--at-baud', '9600' ],
+	   'cfg at: radio and baud reach the helper, the reader\'s clock does not');
+	eq(rsim.cfg_of({ rsim_reader: 'ssh:root@simhost:at:/dev/ttyUSB2' })?.local_reader, 'at:/dev/ttyUSB2',
+	   'cfg at: on a SIM host over SSH too');
+	eq(rsim.reader_options({ type: 'at', device: '/dev/ttyUSB3', host: 'root@simhost', radio: 'keep' }).rsim_reader,
+	   'ssh:root@simhost:at:/dev/ttyUSB3', 'reader at: a named one on another router');
+	ok(index(rsim.reader_options({ type: 'at' }).error ?? '', 'AT port') >= 0, 'reader at: without its device, refused');
 	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: 'phoenix:/dev/ttyUSB0', rsim_clock: '6000', rsim_reset: 'rts_inv' }), '/x'),
 	   [ '/x', 'phoenix:/dev/ttyUSB0', '--clock', '6000', '--reset', 'rts_inv' ],
 	   'cfg: Phoenix options reach the helper');

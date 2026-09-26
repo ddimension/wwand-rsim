@@ -60,30 +60,45 @@ return view.extend({
 		o.value('wbsm', _('WB Electronics Smartmouse USB'));
 		o.value('phoenix', _('Phoenix/Smartmouse serial reader'));
 		o.value('pcsc', _('PC/SC (CCID) reader'));
+		o.value('at', _('the SIM of a modem with an AT port (not wwand\'s)'));
 		o.value('modem', _('another modem lends its card (SIM sponsor)'));
 		o.default = 'wbsm';
 		/* written even when left at the default: the section must say what
 		   it is (the plugin assumes the same default, but uci should not
 		   depend on that) */
 		o.rmempty = false;
-		o.description = _('Smartmouse USB: clock and mode are set by software, no driver needed. Phoenix: a serial reader whose clock is set with switches. PC/SC: any CCID reader through pcscd. SIM sponsor: another wwand modem on this router lends the card in it.');
+		o.description = _('Smartmouse USB: clock and mode are set by software, no driver needed. Phoenix: a serial reader whose clock is set with switches. PC/SC: any CCID reader through pcscd. AT modem: the card in a modem that wwand does not manage — on another machine, or here — reached over its AT port (AT+CSIM). SIM sponsor: another wwand modem on this router lends the card in it.');
 
 		o = s.option(form.Value, 'device', _('Reader'),
-			_('Phoenix: its serial port, e.g. <code>/dev/ttyUSB0</code>. PC/SC: the reader\'s name or index (empty: the first). Smartmouse USB: its USB serial number (empty: the first one).'));
+			_('Phoenix: its serial port, e.g. <code>/dev/ttyUSB0</code>. PC/SC: the reader\'s name or index (empty: the first). Smartmouse USB: its USB serial number (empty: the first one). AT modem: its AT port, e.g. <code>/dev/ttyUSB2</code>.'));
 		o.depends('type', 'wbsm');
 		o.depends('type', 'phoenix');
 		o.depends('type', 'pcsc');
+		o.depends('type', 'at');
 		o.optional = true;
 		o.validate = function(sid, v) {
-			return (this.section.formvalue(sid, 'type') == 'phoenix' && !v)
-				? _('A Phoenix reader needs its serial port') : true;
+			var t = this.section.formvalue(sid, 'type');
+
+			if (t == 'phoenix' && !v)
+				return _('A Phoenix reader needs its serial port');
+			if (t == 'at' && !v)
+				return _('An AT modem needs its AT port');
+			return true;
 		};
+
+		o = s.option(form.ListValue, 'radio', _('That modem\'s radio'),
+			_('<strong>Off</strong> while its card is used elsewhere (<code>AT+CFUN=4</code>; the SIM stays reachable), back to what it was afterwards — two modems must never register with the same card. <strong>Keep</strong> only when that modem is off the network anyway.'));
+		o.depends('type', 'at');
+		o.value('', _('off while lent (default)'));
+		o.value('keep', _('keep as it is'));
+		o.optional = true;
 
 		o = s.option(form.Value, 'host', _('On another machine'),
 			_('<code>user@host</code> when the reader is attached to another machine: the router runs <code>rsim-card</code> there over SSH. That machine needs rsim-card and access to the reader, and the router\'s SSH key (shown below) in the user\'s <code>~/.ssh/authorized_keys</code>. Leave empty for a reader on this router.'));
 		o.depends('type', 'wbsm');
 		o.depends('type', 'phoenix');
 		o.depends('type', 'pcsc');
+		o.depends('type', 'at');
 		o.optional = true;
 		o.validate = function(sid, v) {
 			return (!v || /^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$/.test(v)) ? true : _('Expecting user@host');
@@ -95,6 +110,7 @@ return view.extend({
 		o.depends({ 'type': 'wbsm', 'host': /./ });
 		o.depends({ 'type': 'phoenix', 'host': /./ });
 		o.depends({ 'type': 'pcsc', 'host': /./ });
+		o.depends({ 'type': 'at', 'host': /./ });
 		o.optional = true;
 		o.placeholder = 'rsim-card';
 

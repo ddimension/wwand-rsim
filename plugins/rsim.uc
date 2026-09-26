@@ -33,12 +33,12 @@ const HELPER = filter(HELPER_PATHS, (p) => fs.access(p))[0] ?? HELPER_PATHS[0];
 // changes (docs/plan.md §3.3). The router's key lives here; `wwandctl rsim
 // ssh-key` creates it.
 const SSH_KEY_DIR = '/etc/wwand/rsim';
-const LOCAL_READER = /^((phoenix|pcsc):.|wbsm:)/;
+const LOCAL_READER = /^((phoenix|pcsc|at):.|wbsm:)/;
 
 // 'ssh:user@host:reader' -> { dest, reader }, or null
 function ssh_split(r)
 {
-	let m = match(r, /^ssh:([A-Za-z0-9._-]+@[A-Za-z0-9._-]+):((phoenix|pcsc|wbsm):.*)$/);
+	let m = match(r, /^ssh:([A-Za-z0-9._-]+@[A-Za-z0-9._-]+):((phoenix|pcsc|wbsm|at):.*)$/);
 
 	return (m && match(m[2], LOCAL_READER)) ? { dest: m[1], reader: m[2] } : null;
 }
@@ -281,9 +281,14 @@ function reader_options(r)
 
 		spec = 'modem:' + r.donor;
 	}
-	else if (t == 'wbsm' || t == 'pcsc' || t == 'phoenix') {
+	else if (t == 'wbsm' || t == 'pcsc' || t == 'phoenix' || t == 'at') {
 		if (t == 'phoenix' && !length(r.device ?? ''))
 			return { error: 'a Phoenix reader needs `option device` (its serial port)' };
+
+		// a modem that is not wwand's (on a SIM host, or here but not
+		// managed): its card through its AT port
+		if (t == 'at' && !length(r.device ?? ''))
+			return { error: 'an AT modem needs `option device` (its AT port, e.g. /dev/ttyUSB2)' };
 
 		spec = t + ':' + ((t == 'pcsc' && !length(r.device ?? '')) ? '0' : (r.device ?? ''));
 
@@ -296,6 +301,7 @@ function reader_options(r)
 	return {
 		rsim_reader: spec,
 		rsim_clock: r.clock, rsim_mode: r.mode, rsim_reset: r.reset, rsim_detect: r.detect,
+		rsim_at_radio: r.radio, rsim_at_baud: r.baud,
 		rsim_ssh_port: r.port, rsim_ssh_key: r.key, rsim_ssh_helper: r.helper,
 		rsim_donor_mode: r.donor_mode, rsim_donor_slot: r.donor_slot,
 		rsim_donor_cond: r.donor_cond, rsim_donor_apdu: r.donor_apdu,
@@ -345,6 +351,8 @@ function cfg_of(ext)
 		reset: ext.rsim_reset ?? null,
 		detect: ext.rsim_detect ?? null,
 		mode: ext.rsim_mode ?? null,
+		at_radio: (index([ 'off', 'keep' ], ext.rsim_at_radio) >= 0) ? ext.rsim_at_radio : null,
+		at_baud: (+ext.rsim_at_baud > 0) ? +ext.rsim_at_baud : null,
 		// another wwand modem lending its card (docs/plan.md §3.5)
 		donor: donor ? {
 			ref: donor,
@@ -378,6 +386,15 @@ function helper_argv(cfg, path, sys)
 
 	if (wbsm && cfg.mode != null)
 		push(argv, '--wbsm-mode', cfg.mode);
+
+	// another modem's card over its AT port: the helper switches that
+	// modem's radio off unless told to keep it (one card, one registration)
+	if (substr(reader, 0, 3) == 'at:') {
+		if (cfg.at_radio != null)
+			push(argv, '--at-radio', cfg.at_radio);
+		if (cfg.at_baud != null)
+			push(argv, '--at-baud', sprintf('%d', +cfg.at_baud));
+	}
 
 	if (!cfg.ssh)
 		return argv;
@@ -2047,7 +2064,7 @@ return {
 	bytes: bytes,
 
 	name: 'rsim',
-	options: [ 'rsim_reader', 'rsim_slot', 'rsim_clock', 'rsim_reset', 'rsim_detect', 'rsim_mode',
+	options: [ 'rsim_reader', 'rsim_slot', 'rsim_clock', 'rsim_reset', 'rsim_detect', 'rsim_mode', 'rsim_at_radio', 'rsim_at_baud',
 	           'rsim_ssh_port', 'rsim_ssh_key', 'rsim_ssh_helper', 'rsim_donor_mode', 'rsim_donor_slot', 'rsim_donor_cond', 'rsim_donor_apdu',
 	           // a named SIM reader (config wwand_simreader) instead of the above
 	           'rsim' ],

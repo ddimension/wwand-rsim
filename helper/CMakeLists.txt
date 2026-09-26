@@ -68,7 +68,7 @@ message(STATUS "rsim-card: Smartmouse USB (libusb) ${RSIM_LIBUSB}")
 add_library(rsimcore STATIC src/atr.c src/t0.c src/json.c src/log.c src/ftdi_proto.c)
 target_include_directories(rsimcore PUBLIC src)
 
-set(RSIM_SOURCES src/main.c src/phoenix.c src/phx_tty.c src/phoenix_baud.c)
+set(RSIM_SOURCES src/main.c src/phoenix.c src/phx_tty.c src/phoenix_baud.c src/atmodem.c)
 if(RSIM_PCSC)
 	list(APPEND RSIM_SOURCES src/pcsc.c)
 endif()
@@ -111,6 +111,8 @@ if(BUILD_TESTING)
 	if(Python3_FOUND)
 		add_test(NAME e2e_phoenix
 			COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_e2e.py $<TARGET_FILE:rsim-card>)
+		add_test(NAME e2e_at
+			COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_e2e_at.py $<TARGET_FILE:rsim-card>)
 		set_tests_properties(e2e_phoenix PROPERTIES TIMEOUT 120)
 	endif()
 endif()

@@ -11,6 +11,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "atmodem.h"
 #include "atr.h"
 #include "json.h"
 #include "log.h"
@@ -33,6 +34,17 @@
  * the keys; anything past this is not a request we could honour */
 #define LINE_MAX_LEN	2048
 #define EVENT_POLL_MS	500
+
+/* SIGTERM, SIGHUP (an SSH link that dropped), SIGINT: leave serve() and
+ * clean up like at the end of stdin — the card is powered down, a modem's
+ * radio switched back on. Killed instead, the AT backend would leave a modem
+ * with its radio off for good. */
+static volatile sig_atomic_t stop_sig;
+
+static void on_stop(int sig)
+{
+	stop_sig = sig;
+}
 
 struct state {
 	struct rsim_backend *be;
@@ -232,10 +244,12 @@ static int serve(struct state *st)
 		char *nl;
 		int r;
 
+		if (stop_sig)
+			return 0;
 		r = poll(&pfd, 1, st->last_present >= 0 ? EVENT_POLL_MS : -1);
 		if (r < 0) {
 			if (errno == EINTR)
-				continue;
+				continue;	/* the loop head sees a stop signal */
 			log_err("poll: %s", strerror(errno));
 			return 1;
 		}
@@ -279,6 +293,7 @@ static int serve(struct state *st)
 static void usage(FILE *f)
 {
 	fputs("usage: rsim-card [-v] [-s] [options] phoenix:<tty> | wbsm:[serial] | pcsc:<reader substring or index>\n"
+	      "                                    | at:<tty of a modem's AT port>\n"
 	      "  -v, --verbose          debug logging\n"
 	      "  -s, --syslog           log to syslog as well as stderr\n"
 	      "phoenix options:\n"
@@ -288,7 +303,11 @@ static void usage(FILE *f)
 	      "  --atr-timeout-ms N     wait for the first ATR byte (default 1000)\n"
 	      "wbsm (WB Electronics Smartmouse USB, clock and mode set by software):\n"
 	      "  --clock KHZ            3580 (default), 3680 or 6000\n"
-	      "  --wbsm-mode MODE       phoenix (default) | smartmouse\n", f);
+	      "  --wbsm-mode MODE       phoenix (default) | smartmouse\n"
+	      "at (the SIM of another modem, over AT+CSIM; ATR is the minimal 3B00):\n"
+	      "  --at-baud N            115200 (default); USB ports ignore it\n"
+	      "  --at-radio off|keep    off (default): AT+CFUN=4 while its card is used\n"
+	      "                         elsewhere, the previous mode restored at the end\n", f);
 }
 
 static int parse_enum(const char *arg, const char *const *names, int n)
@@ -313,6 +332,8 @@ int main(int argc, char **argv)
 		{ "detect", required_argument, NULL, 'd' },
 		{ "atr-timeout-ms", required_argument, NULL, 'a' },
 		{ "wbsm-mode", required_argument, NULL, 'w' },
+		{ "at-baud", required_argument, NULL, 'B' },
+		{ "at-radio", required_argument, NULL, 'R' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
 	};
@@ -325,6 +346,7 @@ int main(int argc, char **argv)
 	struct state st;
 	const char *spec;
 	int wbsm_smartmouse = 0;
+	struct at_cfg atc = { .baud = 115200, .radio_keep = false };
 	int verbose = 0, use_syslog = 0, opt, v, ret;
 	char *end;
 
@@ -373,6 +395,20 @@ int main(int argc, char **argv)
 			}
 			fprintf(stderr, "rsim-card: --wbsm-mode %s: phoenix or smartmouse\n", optarg);
 			return 2;
+		case 'B':
+			atc.baud = (unsigned)strtoul(optarg, &end, 10);
+			if (*end || atc.baud < 1200) {
+				fprintf(stderr, "rsim-card: --at-baud %s: expected a baud rate\n", optarg);
+				return 2;
+			}
+			break;
+		case 'R':
+			if (!strcmp(optarg, "off") || !strcmp(optarg, "keep")) {
+				atc.radio_keep = !strcmp(optarg, "keep");
+				break;
+			}
+			fprintf(stderr, "rsim-card: --at-radio %s: off or keep\n", optarg);
+			return 2;
 		case 'h':
 			usage(stdout);
 			return 0;
@@ -390,6 +426,15 @@ int main(int argc, char **argv)
 	/* a plugin that went away mid-answer must not kill us before the
 	 * card is powered down; the write error is enough */
 	signal(SIGPIPE, SIG_IGN);
+	{
+		struct sigaction sa;
+
+		memset(&sa, 0, sizeof(sa));
+		sa.sa_handler = on_stop;	/* no SA_RESTART: poll returns EINTR */
+		sigaction(SIGTERM, &sa, NULL);
+		sigaction(SIGHUP, &sa, NULL);
+		sigaction(SIGINT, &sa, NULL);
+	}
 
 	memset(&st, 0, sizeof(st));
 	if (!strncmp(spec, "phoenix:", 8) && spec[8]) {
@@ -423,6 +468,9 @@ int main(int argc, char **argv)
 		log_err("built without libusb: the Smartmouse USB cannot be driven");
 		return 1;
 #endif
+	} else if (!strncmp(spec, "at:", 3) && spec[3]) {
+		atc.dev = spec + 3;
+		st.be = atmodem_open(&atc);
 	} else if (!strncmp(spec, "pcsc:", 5)) {
 #ifdef WITH_PCSC
 		st.be = pcsc_open(spec + 5);
