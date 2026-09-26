@@ -20,6 +20,7 @@
 'use strict';
 
 import * as fs from 'fs';
+import * as libuci from 'uci';
 
 const EFS_ENABLE = '/nv/item_files/modem/uim/remote/uim_remote_service_enable';
 // how long the modem waits for a remote card's answer; shown, not set —
@@ -78,8 +79,11 @@ function status_lines(st)
 	if (type(st) != 'object')
 		return [];
 
+	if (st.config_error)
+		return [ [ 'remote SIM', st.config_error ] ];
+
 	if (!st.enabled)
-		return [ [ 'remote SIM', 'not configured on this modem (option rsim_reader)' ] ];
+		return [ [ 'remote SIM', 'not configured on this modem (option rsim, or rsim_reader)' ] ];
 
 	let out = [];
 	let what = {
@@ -90,7 +94,9 @@ function status_lines(st)
 		failed: 'stopped',
 	};
 
-	push(out, [ 'remote SIM', sprintf('%s · slot %d · %s', st.reader, st.slot ?? 1, what[st.state] ?? st.state) ]);
+	push(out, [ 'remote SIM', sprintf('%s · slot %d · %s',
+		st.reader_name ? sprintf('%s (%s)', st.reader_name, st.reader) : st.reader,
+		st.slot ?? 1, st.conflict ? sprintf('not used: %s', st.conflict) : (what[st.state] ?? st.state)) ]);
 
 	if (st.atr)
 		push(out, [ 'card', sprintf('ATR %s', st.atr) ]);
@@ -154,6 +160,35 @@ function ssh_key(run)
 	printf('add this line to ~/.ssh/authorized_keys of the user on the machine with the reader\n');
 }
 
+// The named readers and which modem names each (option rsim). A reader is
+// used by one modem at a time; a second one naming it waits.
+function list_readers(ctx)
+{
+	let c = libuci.cursor();
+	let rows = [], users = {};
+
+	c.load('network');
+	c.foreach('network', 'wwand_modem', (m) => {
+		if (m.rsim)
+			push(users[m.rsim] ??= [], m['.name']);
+	});
+	c.foreach('network', 'wwand_simreader', (r) => {
+		let where = (r.type == 'modem')
+			? sprintf('modem %s lends its card (%s)', r.donor ?? '?', r.donor_mode ?? 'sap')
+			: sprintf('%s%s%s', r.type ?? '?', length(r.device ?? '') ? ' ' + r.device : '',
+			          length(r.host ?? '') ? ' on ' + r.host : '');
+
+		push(rows, sprintf('%-14s%s · %s', r['.name'], where,
+			users[r['.name']] ? 'used by ' + join(', ', users[r['.name']]) : 'not assigned'));
+	});
+
+	if (!length(rows))
+		printf('no SIM readers defined — add one: uci add network wwand_simreader (or LuCI: Network → Remote SIM)\n');
+
+	for (let l in rows)
+		printf('%s\n', l);
+}
+
 function set_switch(ctx, modem, on, reset)
 {
 	let want = on ? '01' : '00';
@@ -205,6 +240,7 @@ return {
 		'rsim [modem] enable|disable [--reset] set it (a modem reset applies it)',
 		'rsim [modem] restart                  give the modem its own SIM back, then offer the remote one again',
 		'rsim ssh-key                          the router\'s key for a reader on another machine (ssh:user@host:reader)',
+		'rsim readers                          the SIM readers defined (config wwand_simreader) and who uses them',
 		'rsim [modem] probe                    what this modem\'s UIM offers for lending its card (read-only)',
 		'rsim [modem] donor-test [sap|apdu] [qmi|at]  lend its card once: ATR + SELECT MF, then hand it back',
 		'rsim [modem] sap-switch               the firmware switch for lending the card over SIM Access',
@@ -215,6 +251,9 @@ return {
 		// not about a modem: must not require one
 		if (args[0] == 'ssh-key')
 			return ssh_key();
+
+		if (args[0] == 'readers')
+			return list_readers(ctx);
 
 		let r = ctx.resolve_modem(ctx.status(), args[0]);
 		let rest = r.consumed ? slice(args, 1) : args;

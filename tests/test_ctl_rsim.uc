@@ -16,7 +16,7 @@ let ctl = require('wwand.ctl.rsim');
 
 // --- status lines ----------------------------------------------------------------
 {
-	eq(ctl.status_lines({ enabled: false }), [ [ 'remote SIM', 'not configured on this modem (option rsim_reader)' ] ],
+	eq(ctl.status_lines({ enabled: false }), [ [ 'remote SIM', 'not configured on this modem (option rsim, or rsim_reader)' ] ],
 	   'status: off');
 	eq(ctl.status_lines({ enabled: true, reader: 'phoenix:/dev/ttyUSB0', slot: 1, state: 'powered',
 	                      atr: '3B9F', apdus: 12, last_sw: '9000' }), [

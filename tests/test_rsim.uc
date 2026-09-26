@@ -680,6 +680,101 @@ function sap_donor(log)
 	}
 }
 
+// --- named SIM readers (config wwand_simreader) -----------------------------------
+{
+	eq(rsim.reader_options({ type: 'wbsm', mode: 'phoenix' }).rsim_reader, 'wbsm:', 'reader: Smartmouse USB, the first one');
+	eq(rsim.reader_options({ type: 'wbsm', host: 'rsim@pc.lan' }).rsim_reader, 'ssh:rsim@pc.lan:wbsm:', 'reader: ...on another machine');
+	eq(rsim.reader_options({ type: 'pcsc' }).rsim_reader, 'pcsc:0', 'reader: PC/SC reader 0 by default');
+	eq(rsim.reader_options({ type: 'modem', donor: 'wwmodem1', donor_mode: 'apdu' }).rsim_donor_mode, 'apdu', 'reader: a lending modem');
+	ok(index(rsim.reader_options({ type: 'phoenix' }).error ?? '', 'serial port') >= 0, 'reader: a Phoenix reader without its port says why');
+	ok(index(rsim.reader_options({ type: 'modem' }).error ?? '', 'donor') >= 0, 'reader: a lending modem without a donor says why');
+	ok(rsim.reader_options(null).error, 'reader: a missing section is an error');
+	eq(rsim.reader_options({ host: 'u@h' }).rsim_reader, 'ssh:u@h:wbsm:',
+	   'reader: no type is the page\'s default, the Smartmouse USB');
+
+	let t = { now: 1000 };
+	let reader = fake_reader(card_model());
+	let targets = { m0: fake_client(), m2: fake_client() };
+	let p = rsim.create({
+		log: (l, m) => null, sim_changed: () => null,
+		open_helper: reader.open_helper,
+		readers: () => ({ sm: { type: 'phoenix', device: '/dev/ttyUSB9' } }),
+		modem_of: () => ({ modem: {} }),
+		qmi_client: (ref, schema, cb) => cb(null, targets[ref]),
+		qmi_release: () => null,
+		now: () => t.now,
+	});
+
+	p.tick('m0', { rsim: 'sm' });
+	run_for(30);
+	eq(reader.argv?.[1], 'phoenix:/dev/ttyUSB9', 'named reader: the modem uses the reader the section defines');
+	ok(index(p.status('m0', { rsim: 'sm' }).text, 'sm (phoenix:/dev/ttyUSB9)') == 0, 'named reader: the status names it');
+
+	p.tick('m2', { rsim: 'sm' });
+	run_for(30);
+	eq(targets.m2.sent, [], 'one reader, one modem: the second modem does not take it');
+	ok(index(p.status('m2', { rsim: 'sm' }).text, 'in use by modem m0') >= 0, '...and the status says who has it');
+
+	eq(p.status('m0', { rsim: 'nope' }).level, 'error', 'named reader: an undefined reader is an error row');
+	ok(index(p.status('m0', { rsim: 'nope' }).text, 'nope') >= 0, '...naming it');
+}
+
+// the sponsor: its radio parked while its card is used elsewhere (APDU), its
+// identity re-read when it lends and gets back its card (SIM Access)
+{
+	let t = { now: 1000 };
+	let target = fake_client();
+	let radio = [], changed = [];
+	let donor = fake_client({ answer: (name) =>
+		(name == 'GET_ATR') ? { atr: rsim.bytes(ATR) } : (name == 'SEND_APDU') ? { response: rsim.bytes('9000') } : {} });
+	let mods = { m1: { state: 'READY', lowpower_parked: false } };
+	let p = rsim.create({
+		log: (l, m) => null,
+		sim_changed: (ref, why) => push(changed, [ ref, why ]),
+		modem_radio: (ref, on, cb) => { push(radio, [ ref, on ]); cb?.(null); },
+		modem_of: (ref) => ({ modem: mods[ref] ?? {} }),
+		qmi_client: (ref, schema, cb) => cb(null, (ref == 'm1') ? donor : target),
+		qmi_release: () => null,
+		now: () => t.now,
+	});
+	let ext = { rsim_reader: 'modem:m1', rsim_donor_mode: 'apdu' };
+
+	p.tick('m0', ext);
+	run_for(50);
+	eq(radio, [ [ 'm1', false ] ], 'sponsor (APDU): its radio is parked while its card is used elsewhere');
+	ok(index(p.status('m1', {}).text, 'must stay off') >= 0 && p.status('m1', {}).level == 'warn',
+	   'sponsor (APDU): still registered -> the status warns that its radio must stay off');
+
+	mods.m1.lowpower_parked = true;
+	eq(p.status('m1', {}).level, 'ok', 'sponsor (APDU): parked -> no warning');
+
+	p.tick('m0', {});
+	run_for(50);
+	eq(radio[length(radio) - 1], [ 'm1', true ], 'sponsor (APDU): woken again when the lending ends');
+
+	// SIM Access: the sponsor loses and regains its card
+	changed = [];
+	let sap = sap_donor([]);
+	let p2 = rsim.create({
+		log: (l, m) => null,
+		sim_changed: (ref, why) => push(changed, [ ref, why ]),
+		modem_of: () => ({ modem: {} }),
+		qmi_client: (ref, schema, cb) => cb(null, (ref == 'm1') ? sap : fake_client()),
+		qmi_release: () => null,
+		now: () => t.now,
+	});
+
+	p2.tick('m0', { rsim_reader: 'modem:m1' });
+	run_for(1200);
+	ok(length(filter(changed, (c) => c[0] == 'm1' && index(c[1], 'lent') >= 0)) == 1,
+	   'sponsor (SIM Access): lending its card runs its card-change process');
+
+	p2.tick('m0', {});
+	run_for(50);
+	ok(length(filter(changed, (c) => c[0] == 'm1' && index(c[1], 'back') >= 0)) == 1,
+	   'sponsor (SIM Access): ...and so does getting it back');
+}
+
 // slots are 1..3
 {
 	eq(rsim.cfg_of({ rsim_reader: 'pcsc:0', rsim_slot: '0' }).slot, 1, 'slot 0 is not a slot the service serves');

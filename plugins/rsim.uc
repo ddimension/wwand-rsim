@@ -18,6 +18,7 @@
 
 import * as uloop from 'uloop';
 import * as fs from 'fs';
+import * as libuci from 'uci';
 
 const HELPER = '/usr/lib/wwand/rsim-card';
 
@@ -238,6 +239,52 @@ function bytes(h)
 // (WB Electronics Smartmouse USB, optionally `wbsm:<USB serial>`: the helper
 // sets its clock and mode and finds its tty) or `pcsc:<name or index>`; null
 // means the modem has no remote card.
+// A named SIM reader (`config wwand_simreader '<name>'` in /etc/config/
+// network) as the plugin options a modem would carry, so a modem can say
+// `option rsim '<name>'` instead of spelling the reader out — and the reader
+// is defined once, however often it is moved between modems.
+//   type    wbsm | phoenix | pcsc | modem
+//   device  tty (phoenix), reader name/index (pcsc), USB serial (wbsm)
+//   host    user@host: the reader is on that machine, reached over SSH
+//   donor   (type modem) the modem that lends its card; donor_mode sap|apdu
+// Returns the options, or { error } for a section that cannot work.
+function reader_options(r)
+{
+	if (type(r) != 'object')
+		return { error: 'not defined' };
+
+	// absent means the default the LuCI page offers (Smartmouse USB): a
+	// ListValue left at its default is not written
+	let t = r.type ?? 'wbsm';
+	let spec;
+
+	if (t == 'modem') {
+		if (!r.donor)
+			return { error: 'type modem needs `option donor`' };
+
+		spec = 'modem:' + r.donor;
+	}
+	else if (t == 'wbsm' || t == 'pcsc' || t == 'phoenix') {
+		if (t == 'phoenix' && !length(r.device ?? ''))
+			return { error: 'a Phoenix reader needs `option device` (its serial port)' };
+
+		spec = t + ':' + ((t == 'pcsc' && !length(r.device ?? '')) ? '0' : (r.device ?? ''));
+
+		if (length(r.host ?? ''))
+			spec = sprintf('ssh:%s:%s', r.host, spec);
+	}
+	else
+		return { error: sprintf('unknown type %s', t ?? '(none)') };
+
+	return {
+		rsim_reader: spec,
+		rsim_clock: r.clock, rsim_mode: r.mode, rsim_reset: r.reset, rsim_detect: r.detect,
+		rsim_ssh_port: r.port, rsim_ssh_key: r.key, rsim_ssh_helper: r.helper,
+		rsim_donor_mode: r.donor_mode, rsim_donor_slot: r.donor_slot,
+		rsim_donor_cond: r.donor_cond, rsim_donor_apdu: r.donor_apdu,
+	};
+}
+
 function cfg_of(ext)
 {
 	let r = ext?.rsim_reader;
@@ -493,6 +540,25 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 	// set once a SAP connect has been SENT: from then on the donor may have
 	// handed its card over whether or not it said so
 	let connect_sent = false;
+	// APDU mode: we parked the sponsor's radio, and wake it at the end
+	let parked = false;
+
+	// The SPONSOR's side of a card change. Over SIM Access it hands its card
+	// over and gets it back: both times it runs wwand's card-change process
+	// (forget the identity and the per-SIM override, re-read the card when it
+	// is back) — the same one the target runs. In APDU mode the card never
+	// leaves it; instead its radio has to be off while another modem uses
+	// the card, or two modems register with one IMSI.
+	let sponsor_back = () => {
+		if (sap && connect_sent)
+			deps.sim_changed?.(donor, 'card back from SIM Access');
+
+		if (parked) {
+			parked = false;
+			deps.modem_radio?.(donor, true, (e) =>
+				e ? log('warn', sprintf('rsim: waking the radio of %s failed: %J', donor, e)) : null);
+		}
+	};
 
 	// Give the client back — and, if a SAP connect went out, end the link
 	// first, on EVERY path. A connect that timed out may still have been
@@ -515,11 +581,15 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 
 		c = null;
 
-		if (!sap || !connect_sent)
-			return deps.qmi_release(donor, cl);
+		if (!sap || !connect_sent) {
+			deps.qmi_release(donor, cl);
+			return sponsor_back();
+		}
 
-		cl.request('SAP_CONNECTION', { conn: { op: 0, slot: slot }, mode: graceful ? 1 : 0 }, () =>
-			deps.qmi_release(donor, cl), { no_recovery: true, timeout: 5000 });
+		cl.request('SAP_CONNECTION', { conn: { op: 0, slot: slot }, mode: graceful ? 1 : 0 }, () => {
+			deps.qmi_release(donor, cl);
+			sponsor_back();
+		}, { no_recovery: true, timeout: 5000 });
 	};
 
 	// the session hears the reason first (and whether to hold off retrying),
@@ -670,6 +740,16 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 
 	let up = () => {
 		ready = true;
+
+		if (sap)
+			deps.sim_changed?.(donor, 'card lent over SIM Access');
+		else if (deps.modem_radio) {
+			parked = true;
+			deps.modem_radio(donor, false, (e) => e
+				? log('warn', sprintf('rsim: parking the radio of %s failed (%J) — it must not register while its card is used elsewhere', donor, e))
+				: log('notice', sprintf('rsim: radio of %s parked while its card is used elsewhere', donor)));
+		}
+
 		log('notice', sprintf('rsim: %s lends its card (%s, slot %d)', donor,
 			sap ? 'SIM Access Profile' : sprintf('APDU over %s, radio off', (via == 'at') ? 'AT+CSIM' : 'QMI UIM'), slot));
 		next();
@@ -683,7 +763,7 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 
 		return {
 			call: (req, cb) => { if (dead) return cb({ error: 'helper_exit' }, null); push(queue, { req: req, cb: cb }); next(); },
-			close: () => { if (!dead) { dead = true; fail_all('closed'); } },
+			close: () => { if (!dead) { dead = true; fail_all('closed'); sponsor_back(); } },
 		};
 	}
 
@@ -893,6 +973,62 @@ function create(deps)
 	let open = deps.open_helper ?? spawn_helper;
 	let now = deps.now ?? (() => time());
 	let helper_path = deps.helper_path ?? HELPER;
+
+	// The named readers, read at most once a second: status() is what LuCI
+	// polls every second, per modem. Injectable for the tests.
+	let read_readers = deps.readers ?? (() => {
+		let out = {};
+		let c = libuci.cursor();
+
+		c.load('network');
+		c.foreach('network', 'wwand_simreader', (sec) => { out[sec['.name']] = sec; });
+
+		return out;
+	});
+	let readers_cache = null, readers_at = null;
+	let readers = () => {
+		if (readers_at !== now()) {
+			readers_cache = read_readers();
+			readers_at = now();
+		}
+
+		return readers_cache ?? {};
+	};
+
+	// ext -> { cfg } (null cfg: no remote SIM) or { error } for a modem that
+	// names a reader which is not there or cannot work
+	let resolve = (ext) => {
+		let name = ext?.rsim;
+
+		if (type(name) != 'string' || !length(name))
+			return { cfg: cfg_of(ext) };
+
+		let o = reader_options(readers()[name]);
+
+		if (o.error)
+			return { error: sprintf('SIM reader %s: %s', name, o.error) };
+
+		// the slot is the modem's own business; the rest comes from the reader
+		let cfg = cfg_of({ ...o, rsim_slot: ext.rsim_slot });
+
+		if (!cfg)
+			return { error: sprintf('SIM reader %s: cannot use %s', name, o.rsim_reader) };
+
+		cfg.reader_name = name;
+		return { cfg: cfg };
+	};
+
+	// registered on the network, i.e. its radio is on and using its card
+	let registered = (ref) => {
+		let m = deps.modem_of?.(ref)?.modem;
+
+		return !!(m && m.state == 'READY' && !m.lowpower_parked);
+	};
+
+	// what two modems must not share: a named reader, a lending modem, or a
+	// directly spelled reader
+	let claim_of = (cfg) => cfg.reader_name ? 'reader:' + cfg.reader_name
+		: cfg.donor ? 'donor:' + cfg.donor.ref : 'spec:' + cfg.reader;
 
 	// per modem: the session with the modem and the card
 	let sessions = {};
@@ -1262,7 +1398,8 @@ function create(deps)
 		// every 10 s per modem (plugins.uc): bring the session in line with
 		// the configuration and the modem's life
 		tick: (ref, ext) => {
-			let cfg = cfg_of(ext);
+			let rs = resolve(ext);
+			let cfg = rs.cfg;
 			let s = sessions[ref];
 
 			if (s && (!cfg || s.key != sprintf('%J', cfg))) {
@@ -1282,6 +1419,25 @@ function create(deps)
 			if (!cfg || s || stopping[ref])
 				return;
 
+			// one reader, one modem: whoever holds it keeps it
+			let claim = claim_of(cfg);
+
+			for (let other, os in sessions)
+				if (other != ref && os.state != 'failed' && claim_of(os.cfg) == claim) {
+					note(ref, { conflict: sprintf('%s is in use by modem %s', cfg.reader_name ?? cfg.reader, other) });
+					return;
+				}
+
+			if (notes[ref]?.conflict)
+				delete notes[ref].conflict;
+
+			// a modem cannot use a card it is lending out itself
+			for (let other, os in sessions)
+				if (os.state != 'failed' && os.cfg.donor?.ref == ref) {
+					note(ref, { conflict: sprintf('this modem lends its card to %s', other) });
+					return;
+				}
+
 			if (notes[ref]?.hold || (notes[ref]?.retry_at && now() < notes[ref].retry_at))
 				return;
 
@@ -1294,13 +1450,31 @@ function create(deps)
 		// One row for the modem's status page (plugins.uc plugins_status):
 		// polled every second, so built from what is already known — no I/O.
 		status: (ref, ext) => {
-			let cfg = cfg_of(ext);
+			let rs = resolve(ext);
+			let cfg = rs.cfg;
+
+			if (rs.error)
+				return { label: 'remote SIM', text: rs.error, level: 'error' };
+
+			// a modem lending its card to another one says so, whatever it
+			// is configured to use itself
+			for (let other, os in sessions)
+				if (os.state != 'failed' && os.cfg.donor?.ref == ref)
+					return { label: 'SIM sponsor', level: (os.cfg.donor.mode == 'apdu' && registered(ref)) ? 'warn' : 'ok',
+					         text: sprintf('lends its card to %s (%s)%s', other,
+					                       (os.cfg.donor.mode == 'apdu') ? 'APDU, radio off' : 'SIM Access',
+					                       (os.cfg.donor.mode == 'apdu' && registered(ref))
+					                           ? ' — but it is registered on the network: its radio must stay off (take its interfaces down)' : '') };
 
 			if (!cfg)
 				return null;
 
 			let s = sessions[ref];
 			let n = notes[ref] ?? {};
+			let name = cfg.reader_name ? sprintf('%s (%s)', cfg.reader_name, cfg.reader) : cfg.reader;
+
+			if (n.conflict)
+				return { label: 'remote SIM', text: sprintf('%s · not used: %s', name, n.conflict), level: 'error' };
 			let what = {
 				starting: 'starting', waiting: 'offered, waiting for the modem',
 				connected: 'modem connected, card not powered', powered: 'in use by the modem',
@@ -1308,17 +1482,17 @@ function create(deps)
 
 			if (s && s.state != 'failed')
 				return { label: 'remote SIM',
-				         text: sprintf('%s · %s%s', cfg.reader, what[s.state] ?? s.state,
+				         text: sprintf('%s · %s%s', name, what[s.state] ?? s.state,
 				                       s.apdus ? sprintf(' · %d commands', s.apdus) : ''),
 				         level: (s.state == 'powered') ? 'ok' : 'warn' };
 
 			if (n.last_error)
 				return { label: 'remote SIM',
-				         text: sprintf('%s · %s%s', cfg.reader, n.last_error,
+				         text: sprintf('%s · %s%s', name, n.last_error,
 				                       (n.retry_at && n.retry_at > now()) ? sprintf(' (retry in %d s)', n.retry_at - now()) : ''),
 				         level: 'error' };
 
-			return { label: 'remote SIM', text: sprintf('%s · waiting to start', cfg.reader), level: 'warn' };
+			return { label: 'remote SIM', text: sprintf('%s · waiting to start', name), level: 'warn' };
 		},
 
 		ops: {
@@ -1404,12 +1578,16 @@ function create(deps)
 
 			status: (ref, ext, args, cb) => {
 				let s = sessions[ref];
-				let cfg = cfg_of(ext);
+				let rs = resolve(ext);
+				let cfg = rs.cfg;
 				let n = notes[ref] ?? {};
 
 				cb(null, {
 					enabled: !!cfg,
+					reader_name: cfg?.reader_name ?? ext?.rsim ?? null,
 					reader: cfg?.reader ?? null,
+					conflict: n.conflict ?? null,
+					config_error: rs.error ?? null,
 					slot: cfg?.slot ?? null,
 					state: s?.state ?? (cfg ? 'idle' : 'off'),
 					atr: s?.atr ?? null,
@@ -1446,6 +1624,7 @@ return {
 	bits_of: bits_of,
 	UIM_SAP: UIM_SAP,
 	UIM_APDU: UIM_APDU,
+	reader_options: reader_options,
 	csim_cmd: csim_cmd,
 	csim_answer: csim_answer,
 	ssh_split: ssh_split,
@@ -1456,6 +1635,8 @@ return {
 
 	name: 'rsim',
 	options: [ 'rsim_reader', 'rsim_slot', 'rsim_clock', 'rsim_reset', 'rsim_detect', 'rsim_mode',
-	           'rsim_ssh_port', 'rsim_ssh_key', 'rsim_ssh_helper', 'rsim_donor_mode', 'rsim_donor_slot', 'rsim_donor_cond', 'rsim_donor_apdu' ],
+	           'rsim_ssh_port', 'rsim_ssh_key', 'rsim_ssh_helper', 'rsim_donor_mode', 'rsim_donor_slot', 'rsim_donor_cond', 'rsim_donor_apdu',
+	           // a named SIM reader (config wwand_simreader) instead of the above
+	           'rsim' ],
 	create: create,
 };

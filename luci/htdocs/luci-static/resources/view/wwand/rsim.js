@@ -6,53 +6,23 @@
 'require fs';
 'require uci';
 
-/* Remote SIM (wwand-rsim): per modem, where its SIM comes from — a reader on
-   the router, a reader on another machine over SSH, or another wwand modem
-   lending its card — kept in /etc/config/network on the wwand_modem section
-   like every other rsim_* option. The source is ONE option, rsim_reader
-   ("phoenix:/dev/ttyUSB0", "wbsm:", "pcsc:0", "ssh:user@host:wbsm:",
-   "modem:wwmodem1"); this page splits it into fields and puts it back
-   together, so what `uci show` says and what the page shows are the same
-   thing. Status and restart go through the plugin (modem_plugin_status /
-   modem_plugin). */
+/* Remote SIM (wwand-rsim). Two lists, both in /etc/config/network:
+
+   - SIM readers (`config wwand_simreader`): where a card can come from — a
+     reader on this router, a reader on another machine over SSH, or another
+     wwand modem lending its card (the "SIM sponsor"). Defined once.
+   - Modems (`config wwand_modem`, `option rsim '<reader>'`): which reader a
+     modem uses instead of its own SIM. A reader serves one modem at a time.
+
+   A modem may also carry a reader spelled out directly (`option rsim_reader`,
+   e.g. set with uci); the page shows it and leaves it alone. Status and
+   restart go through the plugin (modem_plugin_status / modem_plugin). */
 
 var callStatus = rpc.declare({ object: 'wwand', method: 'status', expect: { modems: {} } });
 var callRsimStatus = rpc.declare({ object: 'wwand', method: 'modem_plugin_status',
 	params: [ 'modem', 'plugin', 'op' ], expect: {} });
 var callRsim = rpc.declare({ object: 'wwand', method: 'modem_plugin',
 	params: [ 'modem', 'plugin', 'op' ], expect: {} });
-
-/* rsim_reader -> { src, value, remote } ; the inverse of compose() */
-function parse(r) {
-	var m;
-
-	if (!r)
-		return { src: '' };
-	if ((m = r.match(/^modem:(.+)$/)))
-		return { src: 'modem', donor: m[1] };
-	if ((m = r.match(/^ssh:([^@:]+@[^:]+):(.+)$/)))
-		return Object.assign(parse(m[2]), { ssh: m[1] });
-	if ((m = r.match(/^(phoenix|pcsc):(.+)$/)))
-		return { src: m[1], dev: m[2] };
-	if ((m = r.match(/^wbsm:(.*)$/)))
-		return { src: 'wbsm', dev: m[1] };
-
-	return { src: '' };
-}
-
-function compose(p) {
-	var local;
-
-	switch (p.src) {
-	case 'modem':   return p.donor ? 'modem:' + p.donor : null;
-	case 'phoenix': local = p.dev ? 'phoenix:' + p.dev : null; break;
-	case 'pcsc':    local = 'pcsc:' + (p.dev || '0'); break;
-	case 'wbsm':    local = 'wbsm:' + (p.dev || ''); break;
-	default:        return null;
-	}
-
-	return (local && p.ssh) ? 'ssh:' + p.ssh + ':' + local : local;
-}
 
 return view.extend({
 	load: function() {
@@ -77,116 +47,161 @@ return view.extend({
 		var modems = uci.sections('network', 'wwand_modem').map(function(x) { return x['.name']; });
 
 		m = new form.Map('network', _('Remote SIM'),
-			_('Use a SIM card that is not in the modem: in a reader on this router, in a reader on another machine reached over SSH, or in another wwand modem that lends its card. The modem firmware must allow it (Quectel: <code>wwandctl rsim MODEM enable --reset</code>). Removing the source gives the modem its own SIM back.'));
+			_('Use a SIM card that is not in the modem itself. Define where cards can come from under <em>SIM readers</em>, then pick one per modem under <em>Modems</em>. The modem firmware has to allow a remote SIM — on Quectel modules once per modem with <code>wwandctl rsim MODEM enable --reset</code>. Choosing <em>its own SIM</em> again gives the modem its own card back at once.'));
 
-		s = m.section(form.TypedSection, 'wwand_modem', _('Modems'));
+		/* ---- SIM readers -------------------------------------------------- */
+		s = m.section(form.TypedSection, 'wwand_simreader', _('SIM readers'),
+			_('Each entry is one place a SIM card can come from. A reader serves one modem at a time; a second modem that names it waits until it is free.'));
 		s.anonymous = false;
-		s.addremove = false;
+		s.addremove = true;
+		s.addbtntitle = _('Add SIM reader');
 
-		/* the split view of rsim_reader: every field below is virtual and
-		   written back as the one option by the source field */
-		var cur = {};
-		var get = function(sid) {
-			if (!cur[sid])
-				cur[sid] = parse(uci.get('network', sid, 'rsim_reader'));
-			return cur[sid];
-		};
-
-		/* The fields are written one after the other, in no order this page
-		   controls, so each of them puts the whole option back together
-		   from the current split view — the last one writes the final
-		   value. */
-		var store = function(sid) {
-			var r = compose(get(sid));
-
-			if (r) uci.set('network', sid, 'rsim_reader', r);
-			else uci.unset('network', sid, 'rsim_reader');
-		};
-
-		o = s.option(form.ListValue, '_src', _('SIM source'));
-		o.value('', _('the modem\'s own SIM'));
+		o = s.option(form.ListValue, 'type', _('Kind'));
 		o.value('wbsm', _('WB Electronics Smartmouse USB'));
 		o.value('phoenix', _('Phoenix/Smartmouse serial reader'));
-		o.value('pcsc', _('PC/SC reader'));
-		o.value('modem', _('another modem lends its card'));
-		o.cfgvalue = function(sid) { return get(sid).src; };
-		o.write = function(sid, v) { get(sid).src = v; store(sid); };
-		o.remove = function(sid) { get(sid).src = ''; store(sid); };
+		o.value('pcsc', _('PC/SC (CCID) reader'));
+		o.value('modem', _('another modem lends its card (SIM sponsor)'));
+		o.default = 'wbsm';
+		/* written even when left at the default: the section must say what
+		   it is (the plugin assumes the same default, but uci should not
+		   depend on that) */
+		o.rmempty = false;
+		o.description = _('Smartmouse USB: clock and mode are set by software, no driver needed. Phoenix: a serial reader whose clock is set with switches. PC/SC: any CCID reader through pcscd. SIM sponsor: another wwand modem on this router lends the card in it.');
 
-		var field = function(key, title, descr, dep) {
-			var f = s.option(form.Value, '_' + key, title, descr);
-
-			f.cfgvalue = function(sid) { return get(sid)[key]; };
-			f.write = function(sid, v) { get(sid)[key] = v; store(sid); };
-			f.remove = function(sid) { get(sid)[key] = null; store(sid); };
-			(dep || []).forEach(function(d) { f.depends('_src', d); });
-			return f;
-		};
-
-		/* empty is valid for two of the three: the Smartmouse USB means "the
-		   first one", PC/SC means reader 0; only a Phoenix reader needs a port */
-		o = field('dev', _('Reader'), _('Phoenix: the serial port (/dev/ttyUSB0). PC/SC: reader name or index. Smartmouse USB: its USB serial number, empty for the first one.'),
-			[ 'phoenix', 'pcsc', 'wbsm' ]);
+		o = s.option(form.Value, 'device', _('Reader'),
+			_('Phoenix: its serial port, e.g. <code>/dev/ttyUSB0</code>. PC/SC: the reader\'s name or index (empty: the first). Smartmouse USB: its USB serial number (empty: the first one).'));
+		o.depends('type', 'wbsm');
+		o.depends('type', 'phoenix');
+		o.depends('type', 'pcsc');
 		o.optional = true;
 		o.validate = function(sid, v) {
-			return (this.section.formvalue(sid, '_src') == 'phoenix' && !v)
+			return (this.section.formvalue(sid, 'type') == 'phoenix' && !v)
 				? _('A Phoenix reader needs its serial port') : true;
 		};
-		o = field('ssh', _('On another machine'), _('<code>user@host</code> to run the reader there over SSH; empty for a reader on this router.'),
-			[ 'phoenix', 'pcsc', 'wbsm' ]);
+
+		o = s.option(form.Value, 'host', _('On another machine'),
+			_('<code>user@host</code> when the reader is attached to another machine: the router runs <code>rsim-card</code> there over SSH. That machine needs rsim-card and access to the reader, and the router\'s SSH key (shown below) in the user\'s <code>~/.ssh/authorized_keys</code>. Leave empty for a reader on this router.'));
+		o.depends('type', 'wbsm');
+		o.depends('type', 'phoenix');
+		o.depends('type', 'pcsc');
 		o.optional = true;
 		o.validate = function(sid, v) {
 			return (!v || /^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$/.test(v)) ? true : _('Expecting user@host');
 		};
 
-		o = s.option(form.ListValue, '_donor', _('Lending modem'));
-		o.depends('_src', 'modem');
-		modems.forEach(function(n) { o.value(n, n); });
-		o.cfgvalue = function(sid) { return get(sid).donor; };
-		o.write = function(sid, v) { get(sid).donor = v; store(sid); };
-		o.validate = function(sid, v) {
-			return (v && v == sid) ? _('A modem cannot lend its card to itself') : true;
-		};
+		o = s.option(form.Value, 'helper', _('rsim-card on that machine'),
+			_('Its path when it is not in the remote user\'s PATH.'));
+		/* regex values: form.js isEqual() takes a RegExp */
+		o.depends({ 'type': 'wbsm', 'host': /./ });
+		o.depends({ 'type': 'phoenix', 'host': /./ });
+		o.depends({ 'type': 'pcsc', 'host': /./ });
+		o.optional = true;
+		o.placeholder = 'rsim-card';
 
-		o = s.option(form.ListValue, 'rsim_donor_mode', _('How it lends'),
-			_('SIM Access: the lending modem hands its card over and stops using it (needs <code>wwandctl rsim DONOR sap-enable</code> on Quectel). APDU: the card stays with it, which must have its radio off.'));
-		o.depends('_src', 'modem');
-		o.value('sap', _('SIM Access Profile'));
+		o = s.option(form.ListValue, 'clock', _('Card clock'),
+			_('Phoenix: must match the reader\'s clock switch. Smartmouse USB: the reader is set to it. 3.58 MHz is right for SIM cards.'));
+		o.depends('type', 'wbsm');
+		o.depends('type', 'phoenix');
+		o.value('', _('3.58 MHz (default)'));
+		o.value('3680', '3.68 MHz');
+		o.value('6000', '6.00 MHz');
+		o.optional = true;
+
+		o = s.option(form.ListValue, 'mode', _('Reader mode'),
+			_('How the reader is wired to the card. Phoenix is right for the Smartmouse USB unless you know otherwise.'));
+		o.depends('type', 'wbsm');
+		o.value('', 'Phoenix');
+		o.value('smartmouse', 'Smartmouse');
+		o.optional = true;
+
+		o = s.option(form.ListValue, 'donor', _('SIM sponsor'),
+			_('The modem whose card is lent. It cannot use that card itself meanwhile, and it must not be the modem that uses it.'));
+		o.depends('type', 'modem');
+		modems.forEach(function(n) { o.value(n, n); });
+
+		o = s.option(form.ListValue, 'donor_mode', _('How it lends'),
+			_('<strong>SIM Access</strong>: the sponsor hands its card over and stops using it — its own connection goes down, and it gets the card back when the lending ends. Quectel modules need it switched on once: <code>wwandctl rsim SPONSOR sap-enable --reset</code>.<br /><strong>APDU</strong>: the card stays in the sponsor and every command is passed through it. The sponsor\'s <strong>radio must be off</strong> meanwhile, or two modems register with the same card: wwand parks it while lending and wakes it afterwards — so do not give the sponsor an interface that starts on its own. For modems that cannot do SIM Access.'));
+		o.depends('type', 'modem');
+		o.value('', _('SIM Access (default)'));
 		o.value('apdu', _('APDU'));
 		o.optional = true;
 
-		o = s.option(form.ListValue, 'rsim_donor_apdu', _('APDU channel'));
-		o.depends({ '_src': 'modem', 'rsim_donor_mode': 'apdu' });
-		o.value('auto', _('automatic (QMI, else AT)'));
+		o = s.option(form.ListValue, 'donor_apdu', _('APDU channel'),
+			_('Automatic tries QMI first and falls back to <code>AT+CSIM</code> (which also works over AT inside MBIM).'));
+		o.depends({ 'type': 'modem', 'donor_mode': 'apdu' });
+		o.value('', _('automatic'));
 		o.value('qmi', 'QMI UIM');
 		o.value('at', 'AT+CSIM');
 		o.optional = true;
 
-		o = s.option(form.ListValue, 'rsim_clock', _('Card clock'), _('Must match the reader. The Smartmouse USB is set to it.'));
-		o.depends('_src', 'wbsm');
-		o.depends('_src', 'phoenix');
-		[ '3580', '3680', '6000' ].forEach(function(v) { o.value(v, v + ' kHz'); });
-		o.optional = true;
+		/* ---- Modems ------------------------------------------------------- */
+		s = m.section(form.TypedSection, 'wwand_modem', _('Modems'),
+			_('Which SIM each modem uses. When the SIM changes, the modem re-reads it: its identity, PIN and the per-SIM settings (APN) of the new card apply, and the same happens when it gets its own card back.'));
+		s.anonymous = false;
+		s.addremove = false;
 
-		o = s.option(form.ListValue, 'rsim_mode', _('Reader mode'));
-		o.depends('_src', 'wbsm');
-		o.value('phoenix', 'Phoenix');
-		o.value('smartmouse', 'Smartmouse');
-		o.optional = true;
+		/* The readers are read again on every render, not once: a reader
+		   added above has to be selectable here right away (the map
+		   re-renders after "Add", the view's render() does not run again). */
+		o = s.option(form.ListValue, 'rsim', _('SIM'));
+		o.load = function(sid) {
+			this.keylist = [];
+			this.vallist = [];
+			this.value('', _('its own SIM'));
+			uci.sections('network', 'wwand_simreader').forEach(L.bind(function(r) {
+				var t = r.type || 'wbsm';
 
-		o = s.option(form.ListValue, 'rsim_slot', _('Modem slot'), _('The slot of THIS modem the card appears in.'));
-		[ 'wbsm', 'phoenix', 'pcsc', 'modem' ].forEach(function(d) { o.depends('_src', d); });
-		[ '1', '2', '3' ].forEach(function(v) { o.value(v, v); });
+				this.value(r['.name'], '%s (%s)'.format(r['.name'], t == 'modem'
+					? _('card of %s').format(r.donor || '?') : (r.host ? _('%s on %s').format(t, r.host) : t)));
+			}, this));
+			return form.ListValue.prototype.load.apply(this, [ sid ]);
+		};
 		o.optional = true;
+		o.validate = function(sid, v) {
+			var r = v ? uci.get('network', v) : null;
+
+			return (r && r['.type'] == 'wwand_simreader' && r.type == 'modem' && r.donor == sid)
+				? _('A modem cannot use the card it is lending out') : true;
+		};
+
+		/* a reader spelled out with uci: shown, left alone — and only where
+		   one exists, so it does not clutter every modem */
+		if (uci.sections('network', 'wwand_modem').some(function(x) { return x.rsim_reader; })) {
+			o = s.option(form.DummyValue, 'rsim_reader', _('Set directly'),
+				_('A reader spelled out with <code>option rsim_reader</code> (e.g. by uci). It applies while no SIM reader is selected above; remove it with <code>uci delete network.MODEM.rsim_reader</code>.'));
+			o.cfgvalue = function(sid) { return uci.get('network', sid, 'rsim_reader') || _('—'); };
+		}
+
+		/* only once a reader is chosen: with its own SIM there is nothing to
+		   place. Rebuilt per render like the list above; with no readers the
+		   dependency can never hold (an empty one would always show). */
+		o = s.option(form.ListValue, 'rsim_slot', _('Modem slot'),
+			_('The slot of this modem the remote card appears in. 1 is right for single-slot modems.'));
+		o.value('', '1');
+		o.value('2', '2');
+		o.value('3', '3');
+		o.optional = true;
+		o.load = function(sid) {
+			var names = uci.sections('network', 'wwand_simreader').map(function(r) { return r['.name']; });
+
+			this.deps = names.length ? names.map(function(n) { return { 'rsim': n }; }) : [ { 'rsim': '\u0000' } ];
+			return form.ListValue.prototype.load.apply(this, [ sid ]);
+		};
 
 		return m.render().then(function(node) {
-			var status = E('div', { 'class': 'cbi-section' }, [ E('h3', {}, _('Status')) ]);
+			var status = E('div', { 'class': 'cbi-section' }, [
+				E('h3', {}, _('Status')),
+				E('div', { 'class': 'cbi-section-descr' }, _('What each modem uses right now. Changes above take effect when saved and applied.')),
+			]);
 
 			data.modems.forEach(function(n, i) {
 				var st = data.st[i] || {};
-				var text = !st.enabled ? _('own SIM')
-					: '%s · %s%s'.format(st.reader, st.state, st.apdus ? ' · %d commands'.format(st.apdus) : '')
-					  + (st.last_error ? ' · ' + st.last_error : '');
+				var name = st.reader_name ? '%s (%s)'.format(st.reader_name, st.reader || '?') : st.reader;
+				var text = st.config_error ? st.config_error
+					: !st.enabled ? _('its own SIM')
+					: st.conflict ? _('%s — not used: %s').format(name, st.conflict)
+					: '%s · %s%s%s'.format(name, st.state, st.apdus ? ' · %d commands'.format(st.apdus) : '',
+					                       st.last_error ? ' · ' + st.last_error : '');
 
 				status.appendChild(E('div', { 'class': 'cbi-value' }, [
 					E('label', { 'class': 'cbi-value-title' }, [ n ]),
@@ -194,6 +209,7 @@ return view.extend({
 						/* array: reader names and errors come from the daemon */
 						E('span', {}, [ text ]), ' ',
 						st.enabled ? E('button', { 'class': 'btn cbi-button',
+							'title': _('Give the modem its own SIM back for a moment, then offer the remote one again'),
 							'click': ui.createHandlerFn(this, function() {
 								return callRsim(n, 'rsim', 'restart');
 							}) }, _('Restart')) : '',
@@ -201,15 +217,17 @@ return view.extend({
 				]));
 			});
 
-			if (data.key)
-				status.appendChild(E('div', { 'class': 'cbi-value' }, [
-					E('label', { 'class': 'cbi-value-title' }, _('Router SSH key')),
-					E('div', { 'class': 'cbi-value-field' }, [
+			status.appendChild(E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, _('Router SSH key')),
+				data.key
+					? E('div', { 'class': 'cbi-value-field' }, [
 						E('code', { 'style': 'word-break:break-all' }, [ data.key.trim() ]),
 						E('div', { 'class': 'cbi-value-description' },
-							_('Add to <code>~/.ssh/authorized_keys</code> on the machine with the reader. Created with <code>wwandctl rsim ssh-key</code>.')),
-					]),
-				]));
+							_('For a reader on another machine: add this line to <code>~/.ssh/authorized_keys</code> of the user named in <em>On another machine</em>. Created with <code>wwandctl rsim ssh-key</code>.')),
+					])
+					: E('div', { 'class': 'cbi-value-field' },
+						_('None yet. Only needed for a reader on another machine: create it with <code>wwandctl rsim ssh-key</code>.')),
+			]));
 
 			return E([], [ node, status ]);
 		});
