@@ -221,4 +221,42 @@ function fake_ctx(start)
 	   'use off: a modem already on its own card is done at once');
 }
 
+// --- scan: what a machine offers, and whose port it is ------------------------------
+{
+	let ran = [];
+	let out = join('\n', [
+		'{"backend":"pcsc","spec":"pcsc:ACS ACR38U 00 00","name":"ACS ACR38U 00 00","card":true}',
+		'{"backend":"wbsm","spec":"wbsm:088888-03","serial":"088888-03"}',
+		'{"backend":"tty","spec":"at:/dev/ttyUSB2","device":"/dev/ttyUSB2","driver":"option","usb":"2c7c:0122","interface":"02","hint":"at"}',
+		'{"backend":"tty","spec":"at:/dev/ttyUSB6","device":"/dev/ttyUSB6","driver":"option","usb":"12d1:1506","interface":"02","hint":"at"}',
+		'{"done":true,"backends":"phoenix,at,wbsm,pcsc"}',
+	]) + '\n';
+	let sys = {
+		run: (cmd) => { push(ran, cmd); return out; },
+		helper: '/usr/bin/rsim-card',
+		status: () => ({ modems: { wwmodem0: { at_tty: '/dev/ttyUSB2' } } }),
+		ssh_sys: { flavor: 'dropbear', exists: () => true },
+	};
+	let rc = ctl.scan({}, [ '--json' ], sys);
+
+	eq(rc, 0, 'scan: done');
+	ok(index(ran[0], "'/usr/bin/rsim-card' '--list'") == 0, 'scan: the local helper with --list');
+
+	let p = ctl.scan_parse(out, sys.status());
+
+	eq([ length(p.rows), p.done?.backends ], [ 4, 'phoenix,at,wbsm,pcsc' ], 'scan: every reader, and the backends');
+	eq(p.rows[2].in_use, 'AT port of wwand modem wwmodem0',
+	   'scan: the AT port of wwand\'s own modem is marked — an at: reader there takes its card');
+	eq(p.rows[3].in_use, null, 'scan: another modem\'s port is free to use');
+	eq(ctl.scan_parse(out, null).rows[2].in_use, null, 'scan: on a SIM host nothing is marked (not our modems)');
+
+	rc = ctl.scan({}, [ 'root@simhost', '--json' ], sys);
+	ok(index(ran[1], 'root@simhost') > 0 && index(ran[1], "'--list'") > 0,
+	   'scan: on a SIM host over SSH, the same --list');
+
+	ran = [];
+	out = '';
+	eq(ctl.scan({}, [ '--json' ], sys), 1, 'scan: no answer (no helper) is a failure, not an empty list');
+}
+
 done('test_ctl_rsim');

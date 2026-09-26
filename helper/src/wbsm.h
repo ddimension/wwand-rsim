@@ -20,4 +20,9 @@ struct wbsm_cfg {
  * (logged). */
 struct phx_io *wbsm_open(const struct wbsm_cfg *cfg, const char *name);
 
+/* every Smartmouse USB attached, one JSON line each ({"backend":"wbsm",
+ * "spec":"wbsm:<serial>","serial"}); the device is only looked at, its mode
+ * and clock stay as they are. Returns how many. */
+int wbsm_list(void);
+
 #endif

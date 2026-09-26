@@ -9,6 +9,7 @@
 #include <winscard.h>
 
 #include "atr.h"
+#include "json.h"
 #include "log.h"
 #include "pcsc.h"
 
@@ -255,4 +256,44 @@ fail:
 	SCardReleaseContext(p->ctx);
 	free(p);
 	return NULL;
+}
+
+int pcsc_list(void)
+{
+	SCARDCONTEXT ctx;
+	char *list = NULL;
+	DWORD len = 0;
+	LONG rv;
+	const char *r;
+	unsigned idx = 0;
+
+	rv = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &ctx);
+	if (rv != SCARD_S_SUCCESS) {
+		log_notice("pcsc: %s (is pcscd running?)", pcsc_stringify_error(rv));
+		return -1;
+	}
+	rv = SCardListReaders(ctx, NULL, NULL, &len);
+	if (rv == SCARD_S_SUCCESS && len && (list = malloc(len)))
+		rv = SCardListReaders(ctx, NULL, list, &len);
+	for (r = list; rv == SCARD_S_SUCCESS && r && r < list + len && *r; r += strlen(r) + 1, idx++) {
+		SCARD_READERSTATE st;
+		char spec[300];
+		struct jw w;
+
+		/* card or not, without touching it: the state pcscd already has */
+		memset(&st, 0, sizeof(st));
+		st.szReader = r;
+		st.dwCurrentState = SCARD_STATE_UNAWARE;
+		SCardGetStatusChange(ctx, 0, &st, 1);
+		snprintf(spec, sizeof(spec), "pcsc:%s", r);
+		jw_begin(&w, stdout);
+		jw_str(&w, "backend", "pcsc");
+		jw_str(&w, "spec", spec);
+		jw_str(&w, "name", r);
+		jw_bool(&w, "card", (st.dwEventState & SCARD_STATE_PRESENT) != 0);
+		jw_end(&w);
+	}
+	free(list);
+	SCardReleaseContext(ctx);
+	return 0;
 }

@@ -70,6 +70,15 @@ real UART). The ATR is the minimal T=0 ATR `3B00`: plain AT has no command for t
 card's own. As a named reader: `option type 'at'`, `option device
 '/dev/ttyUSB2'`, optionally `host`, `radio`, `baud`.
 
+**What is there to use:** `wwandctl rsim scan` lists what this router
+offers as a card source — PC/SC readers (with or without a card), Smartmouse
+USB readers, serial ports that look like a Phoenix adapter or a modem's AT
+port — each with the spec to put into a reader; the ports of wwand's own
+modems are marked (an `at:` reader there would take the card from under
+wwand; that is the `modem` kind). `wwandctl rsim scan user@simhost` asks a
+SIM host over SSH the same. Underneath: `rsim-card --list`, JSON lines,
+which only looks: nothing is sent to a port.
+
 **A reader on another machine:** `rsim_reader 'ssh:<user>@<host>:<reader>'`
 runs the helper there over SSH, e.g. `ssh:rsim@pc.lan:wbsm:`. On the router,
 `wwandctl rsim ssh-key` creates its key and prints the public half for the

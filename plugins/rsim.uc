@@ -2060,6 +2060,8 @@ return {
 	UIMRMT: UIMRMT,
 	cfg_of: cfg_of,
 	helper_argv: helper_argv,
+	helper_found: helper_found,
+	shq: shq,
 	bits_of: bits_of,
 	UIM_SAP: UIM_SAP,
 	UIM_APDU: UIM_APDU,

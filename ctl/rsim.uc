@@ -189,6 +189,106 @@ function list_readers(ctx)
 		printf('%s\n', l);
 }
 
+// `rsim scan [user@host] [--json]`: what a machine offers as a card source —
+// PC/SC readers (with or without a card), Smartmouse USB readers, serial
+// ports that look like a Phoenix adapter or a modem's AT port — from
+// `rsim-card --list`, run here or on a SIM host over SSH exactly as a
+// session would run it. Ports of wwand's own modems here are marked: an at:
+// reader on one of them would take a card from under wwand (a sponsor is
+// the `modem` kind). Each row carries the spec to put into a reader.
+// The lines of `rsim-card --list` -> { done, rows }; with st (a status
+// answer, for a scan HERE) the ports of wwand's own modems are marked.
+function scan_parse(out, st)
+{
+	let rows = [], done = null;
+
+	for (let l in split(out ?? '', '\n')) {
+		let o = null;
+
+		try { o = json(l); } catch (e) { o = null; }
+		if (type(o) != 'object')
+			continue;
+		if (o.done)
+			done = o;
+		else
+			push(rows, o);
+	}
+
+	for (let name, m in (st?.modems ?? {}))
+		for (let k in [ 'at_tty', 'gps_port', 'diag_port' ])
+			for (let r in rows)
+				if (r.device && r.device == m[k])
+					r.in_use = sprintf('%s of wwand modem %s', (k == 'at_tty') ? 'AT port' : (k == 'gps_port') ? 'GPS port' : 'diag port', name);
+
+	return { done: done, rows: rows };
+}
+
+// sys: { run(cmd) -> output, status() } — injectable for the tests.
+function scan(ctx, args, sys)
+{
+	let rsim = require('wwand.plugins.rsim');
+	let json_out = index(args, '--json') >= 0;
+	let host = filter(args, (a) => a != '--json')[0];
+	let run = sys?.run ?? ((cmd) => {
+		let p = fs.popen(cmd, 'r');
+		let out = p ? p.read('all') : null;
+
+		p?.close();
+		return out;
+	});
+	let argv;
+
+	if (host != null) {
+		if (!match(host, /^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$/))
+			die('usage: wwandctl rsim scan [user@host] [--json]');
+
+		// the plugin's own SSH command line (key, keepalives, flavour),
+		// with --list where a reader would go
+		argv = rsim.helper_argv({ reader: '--list', local_reader: '--list',
+		                          ssh: { dest: host, helper: 'rsim-card' } }, null, sys?.ssh_sys);
+	}
+	else
+		argv = [ sys?.helper ?? rsim.helper_found(), '--list' ];
+
+	let out = run(join(' ', map(argv, rsim.shq)) + ' 2>/dev/null');
+	// here, not on a SIM host: whose port is it
+	let status_of = sys?.status ?? ctx.status;
+	let parsed = scan_parse(out, (host == null && status_of) ? status_of() : null);
+	let rows = parsed.rows, done = parsed.done;
+
+	if (done == null) {
+		let r = { ok: false, error: sprintf('no answer from rsim-card --list%s', host ? ' on ' + host : ' (package rsim-card)') };
+
+		if (json_out)
+			printf('%J\n', r);
+		else
+			printf('%s\n', r.error);
+		return 1;
+	}
+
+	if (json_out) {
+		printf('%J\n', { ok: true, host: host, backends: split(done.backends ?? '', ','), readers: rows });
+		return 0;
+	}
+
+	printf('backends in this rsim-card%s: %s\n', host ? ' on ' + host : '', done.backends ?? '?');
+
+	if (!length(rows))
+		printf('no reader or port found\n');
+
+	for (let r in rows) {
+		let what = (r.backend == 'pcsc') ? sprintf('PC/SC reader, %s', r.card ? 'card inserted' : 'no card')
+			: (r.backend == 'wbsm') ? 'Smartmouse USB'
+			: sprintf('serial %s%s%s', r.driver ?? '?', length(r.usb ?? '') ? ' ' + r.usb : '',
+			          (r.hint == 'at') ? ', a modem port' : (r.hint == 'phoenix') ? ', a USB-serial adapter' : '');
+
+		printf('%-34s %s%s\n', (host ? sprintf('ssh:%s:', host) : '') + r.spec, what,
+		       r.in_use ? sprintf(' — IN USE: %s', r.in_use) : '');
+	}
+
+	return 0;
+}
+
 function set_switch(ctx, modem, on, reset)
 {
 	let want = on ? '01' : '00';
@@ -356,6 +456,8 @@ function use_reader(ctx, modem, args, sys)
 return {
 	qnvfr_value: qnvfr_value,
 	use_reader: use_reader,
+	scan: scan,
+	scan_parse: scan_parse,
 	ssh_key: ssh_key,
 	status_lines: status_lines,
 	EFS_ENABLE: EFS_ENABLE,
@@ -368,6 +470,7 @@ return {
 		'rsim [modem] restart                  give the modem its own SIM back, then offer the remote one again',
 		'rsim ssh-key                          the router\'s key for a reader on another machine (ssh:user@host:reader)',
 		'rsim readers                          the SIM readers defined (config wwand_simreader) and who uses them',
+		'rsim scan [user@host] [--json]        the readers and ports a machine offers (here, or a SIM host over SSH)',
 		'rsim [modem] use <reader|off> [--wait S] [--json]  run the modem on that reader\'s card (or its own again); --wait until it does',
 		'rsim [modem] probe                    what this modem\'s UIM offers for lending its card (read-only)',
 		'rsim [modem] donor-test [sap|apdu] [qmi|at]  lend its card once: ATR + SELECT MF, then hand it back',
@@ -382,6 +485,9 @@ return {
 
 		if (args[0] == 'readers')
 			return list_readers(ctx);
+
+		if (args[0] == 'scan')
+			exit(scan(ctx, slice(args, 1)));
 
 		let r = ctx.resolve_modem(ctx.status(), args[0]);
 		let rest = r.consumed ? slice(args, 1) : args;

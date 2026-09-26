@@ -18,6 +18,7 @@
 #include "json.h"
 #include "log.h"
 #include "phoenix.h"
+#include "scan.h"
 #ifdef WITH_LIBUSB
 #include "wbsm.h"
 #endif
@@ -304,6 +305,7 @@ static void usage(FILE *f)
 {
 	fputs("usage: rsim-card [-v] [-s] [options] phoenix:<tty> | wbsm:[serial] | pcsc:<reader substring or index>\n"
 	      "                                    | at:<tty of a modem's AT port>\n"
+	      "       rsim-card --list               what this machine offers, JSON lines\n"
 	      "  -v, --verbose          debug logging\n"
 	      "  -s, --syslog           log to syslog as well as stderr\n"
 	      "phoenix options:\n"
@@ -344,6 +346,7 @@ int main(int argc, char **argv)
 		{ "wbsm-mode", required_argument, NULL, 'w' },
 		{ "at-baud", required_argument, NULL, 'B' },
 		{ "at-radio", required_argument, NULL, 'R' },
+		{ "list", no_argument, NULL, 'L' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
 	};
@@ -419,6 +422,9 @@ int main(int argc, char **argv)
 			}
 			fprintf(stderr, "rsim-card: --at-radio %s: off or keep\n", optarg);
 			return 2;
+		case 'L':
+			/* RSIM_TEST_SYSROOT: a fake /sys for the tests */
+			return scan_run(getenv("RSIM_TEST_SYSROOT"));
 		case 'h':
 			usage(stdout);
 			return 0;

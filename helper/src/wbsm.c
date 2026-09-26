@@ -30,6 +30,7 @@
 #include <libusb.h>
 
 #include "ftdi_usb.h"
+#include "json.h"
 #include "log.h"
 #include "wbsm.h"
 
@@ -154,4 +155,44 @@ fail:
 	}
 	libusb_exit(ctx);
 	return NULL;
+}
+
+int wbsm_list(void)
+{
+	libusb_context *ctx = NULL;
+	libusb_device **list = NULL;
+	ssize_t n;
+	int i, found = 0;
+
+	if (libusb_init(&ctx))
+		return 0;
+	n = libusb_get_device_list(ctx, &list);
+	for (i = 0; i < n; i++) {
+		struct libusb_device_descriptor d;
+		libusb_device_handle *h = NULL;
+		unsigned char serial[64] = "";
+		char spec[80];
+		struct jw w;
+
+		if (libusb_get_device_descriptor(list[i], &d) || d.idVendor != WBSM_VID || d.idProduct != WBSM_PID)
+			continue;
+		/* the serial needs the device opened; without permission it is
+		 * still listed, as the first one */
+		if (!libusb_open(list[i], &h)) {
+			if (libusb_get_string_descriptor_ascii(h, d.iSerialNumber, serial, sizeof(serial)) < 0)
+				serial[0] = '\0';
+			libusb_close(h);
+		}
+		snprintf(spec, sizeof(spec), "wbsm:%s", (const char *)serial);
+		jw_begin(&w, stdout);
+		jw_str(&w, "backend", "wbsm");
+		jw_str(&w, "spec", spec);
+		jw_str(&w, "serial", (const char *)serial);
+		jw_end(&w);
+		found++;
+	}
+	if (list)
+		libusb_free_device_list(list, 1);
+	libusb_exit(ctx);
+	return found;
 }
