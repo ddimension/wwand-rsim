@@ -99,7 +99,8 @@ removed, as its own `option lowpower` allows. `rsim_donor_slot` names the donor'
 one it runs on) — only that one can be lent: on a single-standby modem the
 other slot is switched off and cannot be reached, so one modem cannot use one
 card and lend the other (HW-checked on a Quectel RG502Q and RG650E,
-2026-09-26). `wwandctl rsim MODEM probe` and `donor-test` tell whether a modem
+2026-09-26). `wwandctl rsim MODEM probe` tells whether a modem offers UIM Remote
+(the service a remote card needs) and SIM Access, and `donor-test` whether it
 can lend its card.
 
 **LuCI:** `luci-app-wwand-rsim` — Network → Remote SIM sets all of this per

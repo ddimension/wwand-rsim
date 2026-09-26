@@ -530,6 +530,9 @@ return {
 
 			printf('%-13s%s\n', 'UIM messages', r2?.msgs ? join(' ', map(r2.msgs, (m) => sprintf('0x%02X', m)))
 			                                              : sprintf('not listed by this firmware (%J)', r2?.msgs_error));
+			printf('%-13s%s\n', 'UIM Remote', (r2?.uim_remote == 'available') ? 'offered by the modem (a remote card can be used)'
+				: (r2?.uim_remote == 'service_unavailable') ? 'not offered — switch it on: wwandctl rsim MODEM enable --reset'
+				: sprintf('not usable here (%s)', r2?.uim_remote ?? '?'));
 			printf('%-13s%s\n', 'SIM Access', !r2?.sap ? '?'
 				: !r2.sap.supported ? 'not in this firmware'
 				: r2.sap.error ? sprintf('present, status query failed (%J)', r2.sap.error)

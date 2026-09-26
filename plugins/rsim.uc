@@ -1959,8 +1959,22 @@ function create(deps)
 					if (err)
 						return cb({ error: 'no_uim_client', detail: err });
 
-					let done = (e, r) => { deps.qmi_release(ref, c); cb(e, r); };
 					let slot = +(args?.slot ?? 1);
+
+					// and whether the modem offers UIM Remote at all — the
+					// service a remote card needs (off until the firmware
+					// switch is on and the modem reset): a client asked for
+					// and given back at once, nothing sent on it
+					let done = (e, r) => {
+						deps.qmi_release(ref, c);
+						if (e)
+							return cb(e, r);
+						deps.qmi_client(ref, UIMRMT, (re, rc) => {
+							if (rc)
+								deps.qmi_release(ref, rc);
+							cb(null, { ...r, uim_remote: re ? (re.error ?? 'error') : 'available' });
+						});
+					};
 
 					// SAP "check status" changes nothing; firmware without SAP
 					// answers INVALID_QMI_COMMAND (71)
