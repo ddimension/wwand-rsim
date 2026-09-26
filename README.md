@@ -60,6 +60,36 @@ modem.
 
 Removing `rsim_reader` gives the modem its own SIM back.
 
+## Building the helper
+
+`rsim-card` is the only part a **SIM host** needs: with
+`option rsim_reader ssh:<user>@<host>:<reader>` the plugin runs it on that
+machine **by name**, so it has to be in its `PATH` (`/usr/local/bin/rsim-card`
+is enough). Nothing in it is architecture-specific — the toolchain decides —
+and the backends are optional, so it builds anywhere CMake does:
+
+```sh
+cmake -S helper -B build && cmake --build build          # dynamic, backends AUTO
+
+# static, for a host with nothing installed
+cmake -S helper -B build-static -DRSIM_STATIC=ON -DWITH_LIBUSB=OFF -DWITH_PCSC=OFF
+cmake --build build-static
+
+# cross build: the usual toolchain file, same switches
+cmake -S helper -B build-arm -DRSIM_STATIC=ON \
+      -DCMAKE_TOOLCHAIN_FILE=/path/to/arm.cmake
+cmake --build build-arm
+```
+
+`RSIM_STATIC=ON` links with `-static` and takes the **static** link lines from
+pkg-config, so an enabled backend brings its own dependencies along. That is
+also its limit: `libusb-1.0` on a glibc distribution pulls `libudev`, which is
+rarely installed as an archive — the link then stops with *"have you installed
+the static version of the udev library?"*. Either install it, or leave the
+Smartmouse USB out (`-DWITH_LIBUSB=OFF`, Phoenix readers still work). On
+OpenWrt/musl libusb needs no udev, so a fully static build with the USB
+backend works there.
+
 ## Tests
 
 ```sh

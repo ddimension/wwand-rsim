@@ -15,6 +15,19 @@ endif()
 # cfmakeraw, CRTSCTS and dprintf are outside strict C99/POSIX
 add_compile_definitions(_DEFAULT_SOURCE)
 
+# A static binary runs on a machine that has nothing installed — the usual
+# case for the SIM host reached over `ssh:<user>@<host>:<reader>`, which only
+# needs `rsim-card` in its PATH. ON links with -static and takes the STATIC
+# link lines from pkg-config, so the optional backends bring their own
+# dependencies (libusb pulls -lpthread, libpcsclite -lpthread -ldl) instead of
+# leaving undefined symbols. Nothing here is architecture-specific: the
+# toolchain decides, so the same switch works for a cross build.
+option(RSIM_STATIC "link rsim-card statically" OFF)
+if(RSIM_STATIC)
+	# prefer the archives when both are installed next to each other
+	set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+endif()
+
 # PC/SC is optional so that the Phoenix-only package has no dependency:
 # AUTO builds it when pkg-config finds libpcsclite, ON insists, OFF skips.
 set(WITH_PCSC AUTO CACHE STRING "PC/SC backend: AUTO, ON or OFF")
@@ -64,15 +77,26 @@ if(RSIM_LIBUSB)
 endif()
 add_executable(rsim-card ${RSIM_SOURCES})
 target_link_libraries(rsim-card rsimcore)
+if(RSIM_STATIC)
+	target_link_options(rsim-card PRIVATE -static)
+endif()
 if(RSIM_PCSC)
 	target_compile_definitions(rsim-card PRIVATE WITH_PCSC)
 	target_include_directories(rsim-card PRIVATE ${PCSC_INCLUDE_DIRS})
-	target_link_libraries(rsim-card ${PCSC_LDFLAGS})
+	if(RSIM_STATIC)
+		target_link_libraries(rsim-card ${PCSC_STATIC_LDFLAGS})
+	else()
+		target_link_libraries(rsim-card ${PCSC_LDFLAGS})
+	endif()
 endif()
 if(RSIM_LIBUSB)
 	target_compile_definitions(rsim-card PRIVATE WITH_LIBUSB)
 	target_include_directories(rsim-card PRIVATE ${LIBUSB_INCLUDE_DIRS})
-	target_link_libraries(rsim-card ${LIBUSB_LDFLAGS})
+	if(RSIM_STATIC)
+		target_link_libraries(rsim-card ${LIBUSB_STATIC_LDFLAGS})
+	else()
+		target_link_libraries(rsim-card ${LIBUSB_LDFLAGS})
+	endif()
 endif()
 install(TARGETS rsim-card RUNTIME DESTINATION bin)
 
