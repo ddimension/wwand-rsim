@@ -15,7 +15,9 @@ Status: implemented and host-tested; not yet run on hardware. See
   JSON object per line on stdin/stdout.
 - `plugins/rsim.uc` — the wwand plugin: runs the helper, offers the card to the
   modem, serves its commands.
-- `ctl/rsim.uc` — `wwandctl rsim`: status, and the modem firmware switch.
+- `ctl/rsim.uc` — `wwandctl rsim`: status, the modem firmware switches
+  (UIM Remote, SIM Access), probe and donor test.
+- `luci/` — `luci-app-wwand-rsim`: the configuration page.
 
 ## Use
 
@@ -44,6 +46,17 @@ other machine's `~/.ssh/authorized_keys`; that machine needs `rsim-card` in
 its PATH (or `rsim_ssh_helper`) and access to the reader. Optional:
 `rsim_ssh_port`, `rsim_ssh_key`. A dropped connection is handled like a
 helper that exited: the modem gets its own SIM back and the plugin retries.
+
+**Another modem's card:** `rsim_reader 'modem:<donor>'` lets another wwand
+modem on the router lend its SIM — over the SIM Access Profile
+(`rsim_donor_mode sap`, the donor hands its card over; Quectel needs
+`wwandctl rsim DONOR sap-enable`), or APDU by APDU while the card stays with
+the donor, whose radio must be off (`rsim_donor_mode apdu`, over QMI UIM or
+`AT+CSIM`, `rsim_donor_apdu auto|qmi|at`). `wwandctl rsim MODEM probe` and
+`donor-test` tell whether a modem can lend its card.
+
+**LuCI:** `luci-app-wwand-rsim` — Network → Remote SIM sets all of this per
+modem.
 
 Removing `rsim_reader` gives the modem its own SIM back.
 

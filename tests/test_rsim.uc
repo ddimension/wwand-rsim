@@ -118,6 +118,11 @@ function fake_client(opt)
 	c.on = (name, cb) => { c.handlers[name] = c.handlers[name] ?? []; push(c.handlers[name], cb); };
 	c.request = (name, args, cb, o) => {
 		push(c.sent, { name: name, args: args });
+		if (opt?.answer) {
+			let a = opt.answer(name, args);
+
+			return uloop.timer(opt?.delay ?? 0, () => cb(a?.__err ?? null, a ?? {}));
+		}
 		if (opt?.wire)
 			push(opt.wire, sprintf('%s:%d', c.tag ?? '?', args?.info?.event ?? -1));
 		uloop.timer(opt?.delay ?? 0, () => cb((c.refuse && name == 'EVENT') ? { error: 'qmi', code: 3 } : null, {}));
@@ -404,6 +409,275 @@ const EXT = { rsim_reader: 'phoenix:/dev/ttyUSB0' };
 	run_for(120);
 	eq(filter(slice(client.sent, before), (x) => x.name == 'EVENT' && x.args.info.event == 2), [],
 	   'stale insert: no card-inserted after the modem has powered the card down');
+}
+
+// --- another modem's card (donor) -------------------------------------------------
+
+// A scripted donor UIM with the SIM Access Profile server: connect, then the
+// state becomes 2 (connected); ATR, APDU, power and reset through SAP_REQUEST.
+function sap_donor(log)
+{
+	let st = 0;
+
+	return fake_client({ wire: log, answer: (name, a) => {
+		if (name == 'SAP_CONNECTION') {
+			if (a.conn.op == 1) st = 2;
+			if (a.conn.op == 0) st = 5;
+			return { state: st };
+		}
+		if (name == 'SAP_REQUEST') {
+			if (st != 2) return { __err: { error: 'qmi', code: 1 } };
+			if (a.req.op == 0) return { atr: rsim.bytes(ATR) };
+			if (a.req.op == 1) return { rapdu: rsim.bytes((a.apdu[1] == 0xA4) ? '9F17' : '9000') };
+			return {};
+		}
+		return {};
+	} });
+}
+
+{
+	let t = { now: 1000 };
+	let target = fake_client();
+	let donor_log = [];
+	let donor = sap_donor(donor_log);
+	let p = rsim.create({
+		log: (l, m) => null, sim_changed: () => null,
+		modem_of: () => ({ modem: {} }),
+		qmi_client: (ref, schema, cb) => cb(null, (ref == 'm1') ? donor : target),
+		qmi_release: (ref, c) => { c.released = true; },
+		now: () => t.now,
+	});
+	let ext = { rsim_reader: 'modem:m1' };
+
+	eq(rsim.cfg_of(ext).donor, { ref: 'm1', mode: 'sap', slot: 1, cond: null, apdu: 'auto' }, 'donor: SIM Access Profile by default, slot 1');
+
+	p.tick('m0', ext);
+	run_for(1200);
+
+	let donor_ops = map(filter(donor.sent, (x) => x.name == 'SAP_CONNECTION'), (x) => x.args.conn.op);
+
+	eq(donor_ops[0], 1, 'donor: the donor is asked to lend its card (SAP connect)');
+	ok(length(filter(donor.sent, (x) => x.name == 'SAP_REQUEST' && x.args.req.op == 0)) >= 1,
+	   'donor: its ATR is read through the link');
+	eq(target.events(), [ 1 ], 'donor: the card is offered to the target modem');
+
+	target.fire('CONNECT_IND', { slot: 1 });
+	run_for(50);
+	target.fire('APDU_IND', { slot: 1, apdu_id: 5, command: rsim.bytes('A0A40000023F00') });
+	run_for(50);
+
+	let ans = filter(target.sent, (x) => x.name == 'APDU');
+
+	eq(rsim.hexs(ans[0]?.args?.response), '9F17', 'donor: the target\'s command is answered by the donor\'s card');
+	ok(length(filter(donor.sent, (x) => x.name == 'SAP_REQUEST' && x.args.req.op == 1 &&
+	                                    rsim.hexs(x.args.apdu) == 'A0A40000023F00')) == 1,
+	   'donor: ...sent unchanged through SAP_REQUEST');
+
+	p.tick('m0', {});
+	run_for(50);
+
+	let last = donor.sent[length(donor.sent) - 1];
+
+	eq([ last?.name, last?.args?.conn?.op, last?.args?.mode ], [ 'SAP_CONNECTION', 0, 1 ],
+	   'donor: leaving hands the card back gracefully');
+	ok(donor.released, 'donor: ...and releases the donor client');
+
+	// a modem lending to itself is refused
+	p.tick('m1', { rsim_reader: 'modem:m1' });
+	run_for(20);
+	ok(index(p.status('m1', { rsim_reader: 'modem:m1' })?.text ?? '', 'itself') >= 0,
+	   'donor: a modem cannot lend its card to itself');
+}
+
+// A donor that carries out the connect but never answers it (the E392 on
+// 245): the link must be ended before the client goes back, or the card stays
+// lent to nobody and the next retry stacks another connect on top.
+{
+	let t = { now: 1000 };
+	let donor = fake_client({ answer: (name, a) =>
+		(name == 'SAP_CONNECTION' && a.conn.op == 1) ? { __err: { error: 'timeout' } } : {} });
+	let p = rsim.create({
+		log: (l, m) => null, sim_changed: () => null,
+		modem_of: () => ({ modem: {} }),
+		qmi_client: (ref, schema, cb) => cb(null, (ref == 'm1') ? donor : fake_client()),
+		qmi_release: (ref, c) => { c.released = true; push(c.sent, { name: 'RELEASED' }); },
+		now: () => t.now,
+	});
+
+	p.tick('m0', { rsim_reader: 'modem:m1' });
+	run_for(50);
+
+	let seq = map(donor.sent, (x) => (x.name == 'SAP_CONNECTION') ? sprintf('SAP:%d', x.args.conn.op) : x.name);
+	let i_conn = index(seq, 'SAP:1'), i_disc = index(seq, 'SAP:0'), i_rel = index(seq, 'RELEASED');
+
+	ok(i_conn >= 0 && i_disc > i_conn && i_rel > i_disc,
+	   'donor: a connect that went unanswered is ended (disconnect) before the client is given back');
+	eq(donor.sent[i_disc]?.args?.mode, 0, 'donor: ...immediately, so the donor gets its card back now');
+
+	let n = length(filter(donor.sent, (x) => x.name == 'SAP_CONNECTION' && x.args.conn.op == 1));
+
+	t.now += 1000;
+	p.tick('m0', { rsim_reader: 'modem:m1' });
+	run_for(50);
+	eq(length(filter(donor.sent, (x) => x.name == 'SAP_CONNECTION' && x.args.conn.op == 1)), n,
+	   'donor: an unanswered connect is not retried on its own — each retry costs the donor its registration');
+	ok(index(p.status('m0', { rsim_reader: 'modem:m1' })?.text ?? '', 'rsim_donor_mode apdu') >= 0,
+	   'donor: ...and the status says what to use instead');
+
+	p.ops.restart('m0', {}, {}, () => null);
+	p.tick('m0', { rsim_reader: 'modem:m1' });
+	run_for(50);
+	ok(length(filter(donor.sent, (x) => x.name == 'SAP_CONNECTION' && x.args.conn.op == 1)) > n,
+	   'donor: `wwandctl rsim restart` tries again');
+}
+
+// The donor ends the link while an answer is still on its way: the late
+// answer must find no client and do nothing — a member call on null inside a
+// uloop callback would end the whole daemon.
+{
+	let t = { now: 1000 };
+	let donor_log = [];
+	let donor = sap_donor(donor_log);
+	let target = fake_client();
+	let slow = false;
+	let req = donor.request;
+
+	// power-up answers late; the link breaks before it does
+	donor.request = (name, a, cb, o) => (slow && name == 'SAP_REQUEST')
+		? uloop.timer(60, () => cb(null, {}))
+		: req(name, a, cb, o);
+
+	let p = rsim.create({
+		log: (l, m) => null, sim_changed: () => null,
+		modem_of: () => ({ modem: {} }),
+		qmi_client: (ref, schema, cb) => cb(null, (ref == 'm1') ? donor : target),
+		qmi_release: (ref, c) => null,
+		now: () => t.now,
+	});
+
+	p.tick('m0', { rsim_reader: 'modem:m1' });
+	run_for(1200);
+	slow = true;
+	target.fire('CARD_POWER_UP_IND', { slot: 1 });
+	run_for(10);
+	donor.fire('SAP_CONNECTION_IND', { st: { state: 5, slot: 1 } });
+
+	let died = null;
+
+	try { run_for(150); } catch (e) { died = e.message; }
+	eq(died, null, 'donor: an answer that arrives after the link ended does nothing, and no crash');
+	ok(index(p.status('m0', { rsim_reader: 'modem:m1' })?.text ?? '', 'ended the SIM Access link') >= 0,
+	   'donor: the status says the donor ended the link');
+}
+
+// torn down while the event registration is still on its way: the late
+// answer must not send a connect on a released client (nor crash)
+{
+	let t = { now: 1000 };
+	let held = null;
+	let donor = sap_donor([]);
+	let req = donor.request;
+
+	donor.request = (name, a, cb, o) => (name == 'REGISTER_EVENTS') ? (held = cb) : req(name, a, cb, o);
+
+	let p = rsim.create({
+		log: (l, m) => null, sim_changed: () => null,
+		modem_of: () => ({ modem: {} }),
+		qmi_client: (ref, schema, cb) => cb(null, (ref == 'm1') ? donor : fake_client()),
+		qmi_release: (ref, c) => null,
+		now: () => t.now,
+	});
+
+	p.tick('m0', { rsim_reader: 'modem:m1' });
+	run_for(20);
+	p.tick('m0', {});
+	run_for(20);
+
+	let died = null;
+
+	try { held?.(null, {}); run_for(20); } catch (e) { died = e.message; }
+	eq(died, null, 'donor: a registration answer after teardown does nothing, and no crash');
+	eq(filter(donor.sent, (x) => x.name == 'SAP_CONNECTION' && x.args.conn.op == 1), [],
+	   'donor: ...and no connect goes out on the released client');
+}
+
+// the APDU fallback: ATR and APDUs through the donor's UIM, no SAP link
+{
+	let t = { now: 1000 };
+	let target = fake_client();
+	let donor = fake_client({ answer: (name, a) =>
+		(name == 'GET_ATR') ? { atr: rsim.bytes(ATR) }
+		: (name == 'SEND_APDU') ? { response: rsim.bytes('9000') } : {} });
+	let p = rsim.create({
+		log: (l, m) => null, sim_changed: () => null,
+		modem_of: () => ({ modem: {} }),
+		qmi_client: (ref, schema, cb) => cb(null, (ref == 'm1') ? donor : target),
+		qmi_release: (ref, c) => { c.released = true; },
+		now: () => t.now,
+	});
+	let ext = { rsim_reader: 'modem:m1', rsim_donor_mode: 'apdu' };
+
+	p.tick('m0', ext);
+	run_for(50);
+	target.fire('CONNECT_IND', { slot: 1 });
+	run_for(50);
+	target.fire('APDU_IND', { slot: 1, apdu_id: 6, command: rsim.bytes('A0B0000002') });
+	run_for(50);
+
+	eq(filter(donor.sent, (x) => x.name == 'SAP_CONNECTION'), [], 'apdu donor: no SIM Access link');
+	ok(length(filter(donor.sent, (x) => x.name == 'GET_ATR')) >= 1, 'apdu donor: the ATR the donor reports');
+	eq(rsim.hexs(filter(donor.sent, (x) => x.name == 'SEND_APDU')[0]?.args?.apdu), 'A0B0000002',
+	   'apdu donor: the command goes through SEND_APDU unchanged');
+	eq(rsim.hexs(filter(target.sent, (x) => x.name == 'APDU')[0]?.args?.response), '9000',
+	   'apdu donor: and its answer back to the target');
+}
+
+// the AT channel: AT+CSIM (TS 27.007 §8.17), length in hex characters
+{
+	eq(rsim.csim_cmd('A0A40000023F00'), 'AT+CSIM=14,"A0A40000023F00"', 'csim: the length counts hex characters');
+	eq(rsim.csim_answer([ '+CSIM: 4,"9F17"', 'OK' ]), '9F17', 'csim: the answer');
+	eq(rsim.csim_answer([ '+CSIM: 6,"9F17"' ]), null, 'csim: a length that does not match is not an answer');
+
+	// a donor whose UIM refuses SEND_APDU (auto): the AT channel from then on;
+	// and one with no QMI UIM at all: AT from the start, with the minimal ATR
+	let mk_at = (at_log) => ({ send: (cmd, cb) => {
+		push(at_log, cmd);
+		uloop.timer(0, () => cb(null, { lines: [ '+CSIM: 4,"9000"', 'OK' ] }));
+	} });
+
+	for (let variant in [ 'refuses', 'no_qmi' ]) {
+		let t = { now: 1000 };
+		let target = fake_client();
+		let at_log = [];
+		let donor = fake_client({ answer: (name) =>
+			(name == 'SEND_APDU') ? { __err: { error: 'qmi', code: 71 } } : (name == 'GET_ATR') ? { atr: rsim.bytes(ATR) } : {} });
+		let p = rsim.create({
+			log: (l, m) => null, sim_changed: () => null,
+			modem_of: (ref) => ({ modem: (ref == 'm1') ? { at: mk_at(at_log) } : {} }),
+			qmi_client: (ref, schema, cb) => (ref == 'm1')
+				? ((variant == 'no_qmi') ? cb({ error: 'unsupported' }, null) : cb(null, donor))
+				: cb(null, target),
+			qmi_release: (ref, c) => null,
+			now: () => t.now,
+		});
+
+		p.tick('m0', { rsim_reader: 'modem:m1', rsim_donor_mode: 'apdu' });
+		run_for(50);
+		target.fire('CONNECT_IND', { slot: 1 });
+		run_for(50);
+
+		let ev = filter(target.sent, (x) => x.name == 'EVENT' && x.args.info.event == 5)[0];
+
+		eq(rsim.hexs(ev?.args?.atr), (variant == 'no_qmi') ? '3B00' : ATR,
+		   sprintf('at donor (%s): the ATR the donor reports, or the minimal T=0 one', variant));
+
+		target.fire('APDU_IND', { slot: 1, apdu_id: 9, command: rsim.bytes('A0B0000002') });
+		run_for(50);
+
+		eq(at_log, [ 'AT+CSIM=10,"A0B0000002"' ], sprintf('at donor (%s): the command goes over AT+CSIM', variant));
+		eq(rsim.hexs(filter(target.sent, (x) => x.name == 'APDU')[0]?.args?.response), '9000',
+		   sprintf('at donor (%s): and its answer back to the target', variant));
+	}
 }
 
 // slots are 1..3

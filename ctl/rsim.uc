@@ -25,6 +25,14 @@ const EFS_ENABLE = '/nv/item_files/modem/uim/remote/uim_remote_service_enable';
 // how long the modem waits for a remote card's answer; shown, not set —
 // absent on most firmware, where the modem uses its built-in default
 const EFS_RESP_TIMER = '/nv/item_files/modem/uim/uimdrv/nv_remote_command_resp_timer';
+// A modem LENDING its card through the SIM Access Profile server: the UIM
+// service answers SAP_CONNECTION with ACCESS_DENIED (82) while this item is
+// absent — HW-observed on the RG650E, 2026-09-26, where it does not exist and
+// its neighbour apdu_security_restrictions reads 00 (and our APDUs pass).
+// `sap-enable` writes 00 by that analogy; what the firmware makes of other
+// values is not known, so nothing else is offered. The item did not exist
+// before: writing it cannot be undone from here, only overwritten.
+const EFS_SAP = '/nv/item_files/modem/qmi/uim/sap_security_restrictions';
 
 // Quectel reads an EFS item as hex: `+QNVFR: 01`. null when the answer is
 // anything else (no such item: ERROR; not a Quectel: unknown command).
@@ -189,6 +197,7 @@ return {
 	ssh_key: ssh_key,
 	status_lines: status_lines,
 	EFS_ENABLE: EFS_ENABLE,
+	EFS_SAP: EFS_SAP,
 
 	help: [
 		'rsim [modem] [status]                 remote SIM: reader, card, state',
@@ -196,6 +205,10 @@ return {
 		'rsim [modem] enable|disable [--reset] set it (a modem reset applies it)',
 		'rsim [modem] restart                  give the modem its own SIM back, then offer the remote one again',
 		'rsim ssh-key                          the router\'s key for a reader on another machine (ssh:user@host:reader)',
+		'rsim [modem] probe                    what this modem\'s UIM offers for lending its card (read-only)',
+		'rsim [modem] donor-test [sap|apdu] [qmi|at]  lend its card once: ATR + SELECT MF, then hand it back',
+		'rsim [modem] sap-switch               the firmware switch for lending the card over SIM Access',
+		'rsim [modem] sap-enable [--reset]     allow it (Quectel; writes the EFS item, a modem reset applies it)',
 	],
 
 	run: function(ctx, args) {
@@ -236,13 +249,77 @@ return {
 			set_switch(ctx, r.modem, op == 'enable', rest[1] == '--reset');
 			break;
 
+		case 'probe': {
+			let r2 = ctx.call_ok('modem_plugin', { modem: r.modem, plugin: 'rsim', op: 'probe' });
+
+			printf('%-13s%s\n', 'UIM messages', r2?.msgs ? join(' ', map(r2.msgs, (m) => sprintf('0x%02X', m)))
+			                                              : sprintf('not listed by this firmware (%J)', r2?.msgs_error));
+			printf('%-13s%s\n', 'SIM Access', !r2?.sap ? '?'
+				: !r2.sap.supported ? 'not in this firmware'
+				: r2.sap.error ? sprintf('present, status query failed (%J)', r2.sap.error)
+				: sprintf('present, link %s', r2.sap.state_name ?? r2.sap.state));
+			break;
+		}
+
+		case 'donor-test': {
+			let mode = (rest[1] == 'apdu') ? 'apdu' : 'sap';
+			let apdu = (index([ 'qmi', 'at' ], rest[2]) >= 0) ? rest[2] : 'auto';
+
+			printf('lending the card of %s once (%s%s) — its own connection drops meanwhile\n',
+				r.modem, mode, (mode == 'apdu') ? sprintf(' over %s', apdu) : '');
+
+			let res = ctx.call_ok('modem_plugin', { modem: r.modem, plugin: 'rsim', op: 'donor_test',
+			                                        args: { mode: mode, apdu: apdu } });
+
+			for (let st in (res?.steps ?? []))
+				printf('  %s\n', st);
+			printf('%s\n', res?.ok ? 'ok: this modem can lend its card this way'
+			                        : sprintf('failed: %s', res?.error ?? '?'));
+			break;
+		}
+
+		case 'sap-switch': {
+			let cur = efs_read(ctx, r.modem, EFS_SAP);
+
+			printf('%-13s%s\n', 'SIM Access', cur.error ? sprintf('not set (%s) — lending over SIM Access is denied', cur.error)
+			                                          : sprintf('%s = %s', EFS_SAP, cur.value));
+			break;
+		}
+
+		case 'sap-enable': {
+			let cur = efs_read(ctx, r.modem, EFS_SAP);
+
+			if (!cur.error && cur.value == '00') {
+				printf('modem %s: lending over SIM Access is already allowed (%s = 00)\n', r.modem, EFS_SAP);
+			}
+			else {
+				let w = efs_write(ctx, r.modem, EFS_SAP, '00');
+
+				if (w.error)
+					die(sprintf('modem %s: writing %s failed (%s)', r.modem, EFS_SAP, w.error));
+
+				let back = efs_read(ctx, r.modem, EFS_SAP);
+
+				if (back.value != '00')
+					die(sprintf('modem %s: %s reads %s after writing 00 — not changed', r.modem, EFS_SAP, back.value ?? back.error ?? '?'));
+
+				printf('modem %s: %s written (00) — lending over SIM Access allowed after a modem reset\n', r.modem, EFS_SAP);
+			}
+
+			if (rest[1] == '--reset') {
+				ctx.call_ok('modem_reset', { modem: r.modem });
+				printf('modem %s: reset\n', r.modem);
+			}
+			break;
+		}
+
 		case 'restart':
 			ctx.call_ok('modem_plugin', { modem: r.modem, plugin: 'rsim', op: 'restart' });
 			printf('modem %s: remote SIM restarted — `wwandctl rsim` shows how it goes\n', r.modem);
 			break;
 
 		default:
-			die('usage: wwandctl rsim [modem] [status|switch|enable [--reset]|disable [--reset]|restart]');
+			die('usage: wwandctl rsim [modem] [status|switch|enable [--reset]|disable [--reset]|restart|probe|donor-test|sap-switch|sap-enable [--reset]]');
 		}
 	},
 };

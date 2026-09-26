@@ -107,4 +107,42 @@ function fake_ctx(start)
 	ok(index(err ?? '', 'not changed') >= 0, 'enable: an ignored write is reported, not claimed as done');
 }
 
+// sap-enable writes the SIM Access item and reads it back
+{
+	let efs = {};
+	let c = { at: [], resets: 0 };
+
+	c.status = () => ({ modems: { m0: {} } });
+	c.resolve_modem = (st, a) => ({ modem: 'm0', consumed: a == 'm0' });
+	c.call = (method, args) => {
+		push(c.at, args.command);
+
+		let m = match(args.command, /^AT\+QNVFR="([^"]+)"$/);
+
+		if (m)
+			return (efs[m[1]] != null) ? { ok: true, response: [ sprintf('+QNVFR: %s', efs[m[1]]) ] }
+			                           : { ok: false, error: 'at_error' };
+
+		m = match(args.command, /^AT\+QNVFW="([^"]+)",([0-9A-F]+)$/);
+
+		if (m) {
+			efs[m[1]] = m[2];
+			return { ok: true, response: [] };
+		}
+
+		return { ok: false };
+	};
+	c.call_ok = (method) => { if (method == 'modem_reset') c.resets++; return {}; };
+
+	ctl.run(c, [ 'm0', 'sap-enable' ]);
+	eq(efs[ctl.EFS_SAP], '00', 'sap-enable: the item is written 00');
+	eq(c.at[length(c.at) - 1], sprintf('AT+QNVFR="%s"', ctl.EFS_SAP), 'sap-enable: and read back');
+
+	let n = length(c.at);
+
+	ctl.run(c, [ 'm0', 'sap-enable', '--reset' ]);
+	eq(length(c.at), n + 1, 'sap-enable: already allowed, nothing written');
+	eq(c.resets, 1, 'sap-enable --reset: the modem is reset');
+}
+
 done('test_ctl_rsim');

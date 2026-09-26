@@ -154,6 +154,48 @@ reader on the PC, the modem on the router uses it.
 - Latency: a LAN adds milliseconds per APDU against a modem timeout of
   seconds.
 
+### 3.5 Another modem's card (donor) — implemented 2026-09-26
+
+`rsim_reader 'modem:<donor>'`: another wwand modem on the router lends its
+SIM. Both ways run inside the daemon through the core's `qmi_client` /
+`modem_at` deps (no helper process) and look like the helper's card channel to
+the session logic.
+
+- **`rsim_donor_mode sap`** — the donor's UIM service as SIM Access Profile
+  server: SAP_CONNECTION (0x003C) connect, SAP_REQUEST (0x003D) for ATR /
+  APDU / power off / power on / reset, indication 0x003E. Layout from
+  Qualcomm's Gobi API, BSD-3, shipped in the libqmi 1.38.0 tarball
+  (`gobi-api/`); every enum there is one byte. The donor stops using the card
+  while the link stands.
+  - RG650E (245): the service is there (status answers "not enabled"), the
+    connect is refused with ACCESS_DENIED while
+    `/nv/item_files/modem/qmi/uim/sap_security_restrictions` is absent;
+    `wwandctl rsim MODEM sap-enable` writes it 00 (by analogy with
+    `apdu_security_restrictions` = 00). TLV 0x12 (condition) is refused as
+    malformed there — `rsim_donor_cond none` leaves it out.
+  - Huawei E392 (245): takes its card away on connect but never answers, and
+    does not recover without a modem reset. The plugin therefore ends a sent
+    connect on every exit path and does not retry an unanswered one on its
+    own (HW-found, 2026-09-26).
+- **`rsim_donor_mode apdu`** — the card stays with the donor, whose radio
+  must be off (one card, one registration). APDUs over QMI UIM SEND_APDU or
+  AT+CSIM (`rsim_donor_apdu auto|qmi|at`; AT goes through the core's
+  modem_at, so AT over MBIM too); the ATR from UIM GET_ATR, or the minimal
+  T=0 ATR `3B00` over plain AT; power and reset are answered with that ATR.
+  HW-verified on the RG650E over QMI and AT (SELECT MF -> 6134).
+- Diagnostics: `wwandctl rsim MODEM probe` (read-only: SIM Access present?),
+  `wwandctl rsim MODEM donor-test [sap|apdu] [qmi|at]` (lend once, ATR +
+  SELECT MF, hand back).
+
+### 3.6 LuCI — implemented 2026-09-26
+
+`luci-app-wwand-rsim`, Network → Remote SIM: per wwand_modem the SIM source
+(own SIM, Smartmouse USB, Phoenix, PC/SC, over SSH on another machine,
+another modem lending its card) with only the fields it needs, stored as the
+one option `rsim_reader` plus the rsim_* options; status per modem with a
+restart; the router's SSH key to copy. The modem status page shows the remote
+SIM through the core's plugin status rows.
+
 ### 3.4 Later
 
 A SIM bank: osmo-remsim (bankd with PC/SC readers, RSPRO over IP) as a

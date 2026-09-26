@@ -1,0 +1,15 @@
+{
+	"admin/network/wwand-rsim": {
+		"title": "Remote SIM",
+		"order": 63,
+		"action": {
+			"type": "view",
+			"path": "wwand/rsim"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-wwand-rsim"
+			]
+		}
+	}
+}
