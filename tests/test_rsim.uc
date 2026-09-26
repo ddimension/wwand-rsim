@@ -709,6 +709,10 @@ function sap_donor(log)
 	run_for(30);
 	eq(reader.argv?.[1], 'phoenix:/dev/ttyUSB9', 'named reader: the modem uses the reader the section defines');
 	ok(index(p.status('m0', { rsim: 'sm' }).text, 'sm (phoenix:/dev/ttyUSB9)') == 0, 'named reader: the status names it');
+	eq(p.card_source('m0', { rsim: 'sm' }), null, 'card source: not while the modem has not connected to it');
+	targets.m0.fire('CONNECT_IND', { slot: 1 });
+	run_for(30);
+	eq(p.card_source('m0', { rsim: 'sm' }), 'sm', 'card source: the reader, once the modem uses its card');
 
 	p.tick('m2', { rsim: 'sm' });
 	run_for(30);

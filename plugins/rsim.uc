@@ -1447,6 +1447,19 @@ function create(deps)
 			start_session(ref, cfg);
 		},
 
+		// Where the modem's active card really is (plugins.uc card_source),
+		// for wwand's SIM inventory: the reader, or the lending modem, while
+		// the modem is on the remote card — and nothing otherwise, so a card
+		// the modem reads before the link is up stays filed under the modem.
+		card_source: (ref, ext) => {
+			let s = sessions[ref];
+
+			if (!s || (s.state != 'powered' && s.state != 'connected'))
+				return null;
+
+			return s.cfg.reader_name ?? (s.cfg.donor ? sprintf('modem %s', s.cfg.donor.ref) : s.cfg.reader);
+		},
+
 		// One row for the modem's status page (plugins.uc plugins_status):
 		// polled every second, so built from what is already known — no I/O.
 		status: (ref, ext) => {
