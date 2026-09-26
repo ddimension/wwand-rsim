@@ -24,9 +24,15 @@ import * as libuci from 'uci';
 // — another router with the reader — can install it without wwand; there it
 // sits in /usr/bin, where an SSH reader's `rsim-card` is found by name. The
 // old place inside wwand-rsim is still looked at, for an installation from
-// before the split.
+// before the split. Looked up at every start, not once: an upgrade moves it
+// under a running daemon, which keeps this module loaded.
 const HELPER_PATHS = [ '/usr/bin/rsim-card', '/usr/lib/wwand/rsim-card' ];
-const HELPER = filter(HELPER_PATHS, (p) => fs.access(p))[0] ?? HELPER_PATHS[0];
+const HELPER = HELPER_PATHS[0];
+
+function helper_found()
+{
+	return filter(HELPER_PATHS, (p) => fs.access(p))[0] ?? HELPER_PATHS[0];
+}
 
 // A reader on another machine: `ssh:<user>@<host>:<reader>`. The helper runs
 // there and its lines travel over SSH, so nothing but the command line
@@ -1179,7 +1185,7 @@ function create(deps)
 	let log = deps.log ?? ((l, m) => null);
 	let open = deps.open_helper ?? spawn_helper;
 	let now = deps.now ?? (() => time());
-	let helper_path = deps.helper_path ?? HELPER;
+	let helper_path = () => deps.helper_path ?? helper_found();
 
 	// The named readers, read at most once a second: status() is what LuCI
 	// polls every second, per modem. Injectable for the tests.
@@ -1289,7 +1295,7 @@ function create(deps)
 
 	let fail = (s, why, hold) => {
 		s.last_error = why;
-		note(s.ref, { last_error: why, failures: +(notes[s.ref]?.failures ?? 0) + 1 });
+		note(s.ref, { last_error: why, error_at: now(), failures: +(notes[s.ref]?.failures ?? 0) + 1 });
 
 		// a failure that retrying makes worse: wait for the operator
 		if (hold) {
@@ -1563,10 +1569,10 @@ function create(deps)
 		};
 
 		s.rpc = cfg.donor ? donor_card(deps, cfg.donor.ref, cfg.donor, on_card_event, on_card_exit, log)
-		                  : helper_rpc(open, helper_argv(cfg, helper_path, deps.ssh_sys), on_card_event, on_card_exit, log);
+		                  : helper_rpc(open, helper_argv(cfg, helper_path(), deps.ssh_sys), on_card_event, on_card_exit, log);
 
 		if (!s.rpc)
-			return fail(s, sprintf('cannot start %s', helper_path));
+			return fail(s, sprintf('cannot start %s', helper_path()));
 
 		// The card first: a reader without a card must not take the modem's
 		// own SIM away, which connection-available does.
@@ -2009,6 +2015,9 @@ function create(deps)
 					last_sw: s?.last_sw ?? null,
 					since: s?.since ?? null,
 					last_error: s?.last_error ?? n.last_error ?? null,
+					// when it failed, on the router's clock: a caller that
+					// changed the reader tells an old failure from a new one
+					error_at: n.error_at ?? null,
 					retry_at: n.retry_at ?? null,
 					now: now(),
 				});

@@ -113,6 +113,7 @@ if(BUILD_TESTING)
 			COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_e2e.py $<TARGET_FILE:rsim-card>)
 		add_test(NAME e2e_at
 			COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_e2e_at.py $<TARGET_FILE:rsim-card>)
+		set_tests_properties(e2e_at PROPERTIES TIMEOUT 180)
 		set_tests_properties(e2e_phoenix PROPERTIES TIMEOUT 120)
 	endif()
 endif()

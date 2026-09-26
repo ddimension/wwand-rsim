@@ -26,6 +26,7 @@
 #include <string.h>
 #include <termios.h>
 #include <time.h>
+#include <sys/file.h>
 #include <unistd.h>
 
 #include "atmodem.h"
@@ -34,9 +35,14 @@
 
 #define LINE_MAX_AT 1200	/* +CSIM with 258 bytes = 516 hex characters */
 
+/* at_cmd's answers besides the RSIM codes: the modem answered ERROR/+CME */
+#define AT_REFUSED 1
+
 struct at_backend {
 	struct rsim_backend be;
 	int fd;
+	bool radio_keep;
+	bool dirty;		/* a command timed out: its answer may still come */
 	int cfun_prev;		/* -1: not changed by us */
 	char mark[300];		/* where the mode before ours is kept */
 	char rbuf[4096];
@@ -45,17 +51,18 @@ struct at_backend {
 
 static const uint8_t ATR_T0_MINIMAL[] = { 0x3B, 0x00 };
 
-static speed_t speed_of(unsigned baud)
+int atmodem_speed(unsigned baud)
 {
 	switch (baud) {
 	case 9600: return B9600;
 	case 19200: return B19200;
 	case 38400: return B38400;
 	case 57600: return B57600;
+	case 115200: return B115200;
 	case 230400: return B230400;
 	case 460800: return B460800;
 	case 921600: return B921600;
-	default: return B115200;
+	default: return -1;
 	}
 }
 
@@ -97,9 +104,19 @@ static int read_line(struct at_backend *a, char *out, size_t cap, long deadline)
 			return 0;
 		if (poll(&p, 1, (int)left) <= 0)
 			continue;
+		/* a port that went away (USB unplugged) signals hang-up and reads
+		 * 0 for ever: not a timeout to spin out at full CPU */
+		if (p.revents & (POLLHUP | POLLERR | POLLNVAL) && !(p.revents & POLLIN)) {
+			errno = EIO;
+			return -1;
+		}
 		if (a->rlen >= sizeof(a->rbuf))
 			a->rlen = 0;	/* a line longer than any AT answer: garbage */
 		r = read(a->fd, a->rbuf + a->rlen, sizeof(a->rbuf) - a->rlen);
+		if (r == 0) {
+			errno = EIO;
+			return -1;
+		}
 		if (r < 0 && errno != EINTR && errno != EAGAIN)
 			return -1;
 		if (r > 0)
@@ -107,9 +124,55 @@ static int read_line(struct at_backend *a, char *out, size_t cap, long deadline)
 	}
 }
 
+/* All of buf, on a non-blocking port: a short write or EAGAIN would send half
+ * a command, or one without its CR, and the modem would never answer it. */
+static int write_all(int fd, const char *buf, size_t len, long deadline)
+{
+	while (len) {
+		ssize_t w = write(fd, buf, len);
+
+		if (w > 0) {
+			buf += w;
+			len -= (size_t)w;
+			continue;
+		}
+		if (w < 0 && errno != EAGAIN && errno != EINTR)
+			return -1;
+
+		long left = deadline - now_ms();
+		struct pollfd p = { .fd = fd, .events = POLLOUT };
+
+		if (left <= 0 || poll(&p, 1, (int)left) < 0)
+			return -1;
+	}
+	return 0;
+}
+
+/* After a timeout the modem may still answer that command: its late OK or
+ * +CSIM would be taken for the next command's. A plain AT with its OK read
+ * shows the line is quiet again; everything before that OK is discarded. */
+static void resync(struct at_backend *a)
+{
+	char line[LINE_MAX_AT];
+	long deadline = now_ms() + 3000;
+	int r;
+
+	a->dirty = false;
+	tcflush(a->fd, TCIFLUSH);
+	a->rlen = 0;
+	if (write_all(a->fd, "AT\r", 3, deadline) < 0)
+		return;
+	while ((r = read_line(a, line, sizeof(line), deadline)) == 1)
+		if (!strcmp(line, "OK"))
+			return;
+	a->dirty = true;	/* still not quiet: again before the next one */
+}
+
 /* Send one command and collect its answer. want: the prefix of the line to
- * keep (e.g. "+CSIM:"), copied into got. Returns RSIM_OK on OK, RSIM_E_IO on
- * ERROR (err gets the line), RSIM_E_TIMEOUT without a final result. */
+ * keep (e.g. "+CSIM:"), copied into got; lines of other kinds (echo,
+ * unsolicited results such as +QIND or RDY) are passed over. Returns RSIM_OK
+ * on OK, AT_REFUSED on ERROR/+CME/+CMS (err gets the line), RSIM_E_IO when
+ * the port fails (err says how), RSIM_E_TIMEOUT without a final result. */
 static int at_cmd(struct at_backend *a, const char *cmd, const char *want, char *got, size_t gotcap,
 		  int timeout_ms, char *err, size_t errcap)
 {
@@ -119,11 +182,18 @@ static int at_cmd(struct at_backend *a, const char *cmd, const char *want, char 
 
 	if (got && gotcap)
 		got[0] = '\0';
+	if (err && errcap)
+		snprintf(err, errcap, "no answer");
+	if (a->dirty)
+		resync(a);
 	tcflush(a->fd, TCIFLUSH);
 	a->rlen = 0;
 	log_dbg("at> %s", cmd);
-	if (write(a->fd, cmd, strlen(cmd)) < 0 || write(a->fd, "\r", 1) < 0)
+	if (write_all(a->fd, cmd, strlen(cmd), deadline) < 0 || write_all(a->fd, "\r", 1, deadline) < 0) {
+		if (err && errcap)
+			snprintf(err, errcap, "write: %s", strerror(errno));
 		return RSIM_E_IO;
+	}
 
 	while ((r = read_line(a, line, sizeof(line), deadline)) == 1) {
 		log_dbg("at< %s", line);
@@ -132,12 +202,18 @@ static int at_cmd(struct at_backend *a, const char *cmd, const char *want, char 
 		if (!strcmp(line, "ERROR") || !strncmp(line, "+CME ERROR", 10) || !strncmp(line, "+CMS ERROR", 10)) {
 			if (err && errcap)
 				snprintf(err, errcap, "%s", line);
-			return RSIM_E_IO;
+			return AT_REFUSED;
 		}
 		if (want && got && !strncmp(line, want, strlen(want)))
 			snprintf(got, gotcap, "%s", line);
 	}
-	return r < 0 ? RSIM_E_IO : RSIM_E_TIMEOUT;
+	if (r < 0) {
+		if (err && errcap)
+			snprintf(err, errcap, "read: %s", strerror(errno));
+		return RSIM_E_IO;
+	}
+	a->dirty = true;
+	return RSIM_E_TIMEOUT;
 }
 
 int atmodem_csim_answer(const char *line, unsigned char *resp, int cap)
@@ -188,17 +264,34 @@ static int mark_read(const char *path)
 static int at_power_up(struct rsim_backend *be, uint8_t *atr, size_t *atr_len)
 {
 	struct at_backend *a = (struct at_backend *)be;
-	char got[200], err[120];
+	char got[200], err[120] = "";
 	int r = at_cmd(a, "AT+CPIN?", "+CPIN:", got, sizeof(got), 5000, err, sizeof(err));
 
 	/* a card that asks for its PIN is still a card: the APDUs are the
-	 * target modem's business, and it verifies the PIN itself */
-	if (r == RSIM_E_IO) {
+	 * target modem's business, and it verifies the PIN itself. "SIM busy"
+	 * (CME 14) is a card that is there — tried again, not reported gone */
+	if (r == AT_REFUSED) {
 		snprintf(be->detail, RSIM_DETAIL_MAX, "the modem reports no usable card (%s)", err);
-		return RSIM_E_NO_CARD;
+		return strstr(err, "ERROR: 14") ? RSIM_E_IO : RSIM_E_NO_CARD;
 	}
-	if (r)
+	if (r) {
+		snprintf(be->detail, RSIM_DETAIL_MAX, "the modem's AT port: %s", err);
 		return r;
+	}
+
+	/* A modem that rebooted meanwhile (URC RDY) is back in its default
+	 * mode, usually online, with the card still lent: every power-up and
+	 * reset from the target checks the radio is still off. */
+	if (!a->radio_keep) {
+		char c[40];
+		int mode;
+
+		if (at_cmd(a, "AT+CFUN?", "+CFUN:", c, sizeof(c), 5000, NULL, 0) == RSIM_OK &&
+		    sscanf(c, "+CFUN: %d", &mode) == 1 && mode != 4 && mode != 0) {
+			log_warn("%s: radio is on again (CFUN=%d) while its card is lent — switching it off", be->reader, mode);
+			at_cmd(a, "AT+CFUN=4", NULL, NULL, 0, 15000, NULL, 0);
+		}
+	}
 	memcpy(atr, ATR_T0_MINIMAL, sizeof(ATR_T0_MINIMAL));
 	*atr_len = sizeof(ATR_T0_MINIMAL);
 	return RSIM_OK;
@@ -218,7 +311,7 @@ static int at_power_down(struct rsim_backend *be)
 static int at_transmit(struct rsim_backend *be, const uint8_t *tpdu, size_t len, uint8_t *resp, size_t *resp_len)
 {
 	struct at_backend *a = (struct at_backend *)be;
-	char cmd[2 * RSIM_TPDU_MAX + 32], got[LINE_MAX_AT], err[120];
+	char cmd[2 * RSIM_TPDU_MAX + 32], got[LINE_MAX_AT], err[120] = "";
 	size_t i, o;
 	int r, n;
 
@@ -228,12 +321,16 @@ static int at_transmit(struct rsim_backend *be, const uint8_t *tpdu, size_t len,
 	snprintf(cmd + o, sizeof(cmd) - o, "\"");
 
 	r = at_cmd(a, cmd, "+CSIM:", got, sizeof(got), 10000, err, sizeof(err));
-	if (r == RSIM_E_IO) {
+	if (r == AT_REFUSED) {
 		snprintf(be->detail, RSIM_DETAIL_MAX, "AT+CSIM refused (%s)", err);
-		return RSIM_E_IO;
+		/* CME 10, SIM not inserted: the card left — the powered state
+		 * has to go, not only this command */
+		return strstr(err, "ERROR: 10") ? RSIM_E_NO_CARD : RSIM_E_IO;
 	}
-	if (r)
+	if (r) {
+		snprintf(be->detail, RSIM_DETAIL_MAX, "the modem's AT port: %s", err);
 		return r;
+	}
 	n = atmodem_csim_answer(got, resp, RSIM_RESP_MAX);
 	if (n < 2) {
 		snprintf(be->detail, RSIM_DETAIL_MAX, "no +CSIM answer");
@@ -286,6 +383,7 @@ struct rsim_backend *atmodem_open(const struct at_cfg *cfg)
 	if (!a)
 		return NULL;
 	a->cfun_prev = -1;
+	a->radio_keep = cfg->radio_keep;
 	a->fd = open(cfg->dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
 	if (a->fd < 0) {
 		log_err("%s: %s", cfg->dev, strerror(errno));
@@ -295,8 +393,29 @@ struct rsim_backend *atmodem_open(const struct at_cfg *cfg)
 	if (tcgetattr(a->fd, &t) == 0) {
 		cfmakeraw(&t);
 		t.c_cflag |= CLOCAL | CREAD;
-		cfsetspeed(&t, speed_of(cfg->baud ? cfg->baud : 115200));
+		cfsetspeed(&t, (speed_t)atmodem_speed(cfg->baud ? cfg->baud : 115200));
 		tcsetattr(a->fd, TCSANOW, &t);
+	}
+	/* One helper per port. Two would read each other's answers, and the
+	 * first to end would switch the radio back on under the other, which
+	 * still lends the card. flock, not TIOCEXCL: the lock ends with its
+	 * process, a killed one included; the tty's exclusive flag outlives it
+	 * while anything else holds the port open, and would lock out the very
+	 * run that is to switch the radio back on. */
+	/* Waited for, briefly: the previous helper on this port may still be
+	 * switching the radio back on (up to 15 s) after its session ended. */
+	{
+		long until = now_ms() + 20000;
+
+		while (flock(a->fd, LOCK_EX | LOCK_NB) != 0) {
+			if (now_ms() >= until) {
+				log_err("%s: in use by another rsim-card (or another program holding a lock)", cfg->dev);
+				close(a->fd);
+				free(a);
+				return NULL;
+			}
+			usleep(200000);
+		}
 	}
 	a->be.ops = &AT_OPS;
 	a->be.reader = cfg->dev;
@@ -327,18 +446,45 @@ struct rsim_backend *atmodem_open(const struct at_cfg *cfg)
 			log_notice("%s: radio still off from an earlier run; CFUN=%d is restored at the end", cfg->dev, kept);
 			a->cfun_prev = kept;
 		} else if (prev != 4) {
-			FILE *m = fopen(a->mark, "w");
+			/* the "before" first, on disk: without it a run killed
+			 * after the switch-off would leave the radio off for good */
+			char tmp[320];
+			FILE *m = NULL;
+			int ok = 0;
 
-			if (m) {
-				fprintf(m, "%d\n", prev);
-				fclose(m);
+			int mfd;
+
+			snprintf(tmp, sizeof(tmp), "%s.tmp", a->mark);
+			/* not through a link someone left in /tmp */
+			unlink(tmp);
+			mfd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+			if (mfd >= 0 && !(m = fdopen(mfd, "w")))
+				close(mfd);
+			if (mfd >= 0 && m) {
+				ok = fprintf(m, "%d\n", prev) > 0 && fflush(m) == 0 && fsync(fileno(m)) == 0;
+				ok = (fclose(m) == 0) && ok && rename(tmp, a->mark) == 0;
+				if (!ok)
+					unlink(tmp);
 			}
-			if (at_cmd(a, "AT+CFUN=4", NULL, NULL, 0, 15000, NULL, 0) == RSIM_OK) {
+			if (!ok) {
+				log_err("%s: cannot keep the radio's mode in %s (%s); not switching it off",
+					cfg->dev, a->mark, strerror(errno));
+				close(a->fd);
+				free(a);
+				return NULL;
+			}
+			int rc = at_cmd(a, "AT+CFUN=4", NULL, NULL, 0, 15000, NULL, 0);
+
+			if (rc == RSIM_OK) {
 				a->cfun_prev = prev;
 				log_notice("%s: radio off (CFUN=4) while its card is used elsewhere", cfg->dev);
 			} else {
-				/* two modems must not register with one card */
-				unlink(a->mark);
+				/* two modems must not register with one card. The kept
+				 * mode goes only when the modem REFUSED: after a timeout
+				 * it may still switch off late, and the next run must
+				 * know what to switch back to. */
+				if (rc == AT_REFUSED)
+					unlink(a->mark);
 				log_err("%s: cannot switch the radio off (AT+CFUN=4); --at-radio keep if that is intended",
 					cfg->dev);
 				close(a->fd);

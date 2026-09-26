@@ -34,20 +34,31 @@ def check(cond, what):
 class FakeModem(threading.Thread):
     """Answers AT on the master side: CFUN, CPIN, CSIM, like a Quectel."""
 
-    def __init__(self, fd, card=True, cfun=1):
+    def __init__(self, fd, card=True, cfun=1, urc=False, cpin_err=None, csim_err=None):
         super().__init__(daemon=True)
         self.fd = fd
         self.card = card
         self.cfun = cfun
         self.log = []
         self.running = True
+        self.echo = True        # like a modem fresh from reset: ATE1
+        self.urc = urc          # an unsolicited result before every answer
+        self.cpin_err = cpin_err
+        self.csim_err = csim_err
 
     def say(self, *lines):
         os.write(self.fd, b"".join(b"\r\n" + l.encode() + b"\r\n" for l in lines))
 
     def answer(self, cmd):
         self.log.append(cmd)
-        if cmd in ("ATE0", "AT+CMEE=1", "AT"):
+        if self.echo:
+            os.write(self.fd, cmd.encode() + b"\r")
+        if self.urc:
+            self.say("+QIND: \"csq\",20,99")
+        if cmd == "ATE0":
+            self.echo = False
+            return self.say("OK")
+        if cmd in ("AT+CMEE=1", "AT"):
             return self.say("OK")
         if cmd == "AT+CFUN?":
             return self.say("+CFUN: %d" % self.cfun, "OK")
@@ -55,8 +66,12 @@ class FakeModem(threading.Thread):
             self.cfun = int(cmd[8:])
             return self.say("OK")
         if cmd == "AT+CPIN?":
+            if self.cpin_err:
+                return self.say(self.cpin_err)
             return self.say("+CPIN: READY", "OK") if self.card else self.say("+CME ERROR: 10")
         if cmd.startswith("AT+CSIM="):
+            if self.csim_err:
+                return self.say(self.csim_err)
             n, apdu = cmd[8:].split(",", 1)
             apdu = apdu.strip('"')
             if int(n) != len(apdu):
@@ -157,6 +172,66 @@ rig2.close()
 check(rig2.modem.cfun == 1, "after SIGKILL: the next run switches the radio back on at its end (kept mode 1)")
 rig.modem.running = False
 
+# --- one helper per port -------------------------------------------------------------
+rig = Rig()
+rig.ask({"op": "power_up"})
+t0 = time.monotonic()
+second = subprocess.run([BIN, "at:" + os.ttyname(rig.slave)], input=b"", capture_output=True, timeout=40)
+waited = time.monotonic() - t0
+check(second.returncode != 0, "lock: a second helper on the same port is refused")
+check(15 < waited < 30, "lock: ...after a bounded wait (the first may be restoring the radio) (%.1f s)" % waited)
+check(rig.modem.cfun == 4, "lock: ...and the first one's radio stays off")
+rig.close()
+check(rig.modem.cfun == 1, "lock: the first one restores it at its end")
+
+# --- the lock passes on when its holder ends ---------------------------------------
+rig = Rig()
+rig.ask({"op": "power_up"})
+second = subprocess.Popen([BIN, "at:" + os.ttyname(rig.slave)], stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+time.sleep(1)
+rig.proc.stdin.close()                       # the first ends, restores, unlocks
+rig.proc.wait(20)
+second.stdin.write(b'{"op":"power_up"}\n')
+second.stdin.flush()
+r, _, _ = select.select([second.stdout], [], [], 20)
+ans = json.loads(second.stdout.readline()) if r else None
+check(ans and ans.get("ok"), "lock: the waiting helper takes over once the first has ended (%r)" % ans)
+check(rig.modem.cfun == 4, "lock: ...and has the radio off again")
+second.stdin.close()
+second.wait(20)
+check(rig.modem.cfun == 1, "lock: ...and back on at its end")
+rig.modem.running = False
+
+# --- echo and unsolicited results do not confuse the answers -----------------------
+rig = Rig(urc=True)
+up = rig.ask({"op": "power_up"})
+r = rig.ask({"op": "tpdu", "data": "00A40004023F00"})
+check(up and up.get("ok") and r and r.get("data") == "6124", "URC + echo: the answers are still read right (%r)" % r)
+rig.close()
+
+# --- a modem that rebooted during the lending is switched off again -----------------
+rig = Rig()
+rig.ask({"op": "power_up"})
+rig.modem.cfun = 1                               # RDY: back in its default mode
+rig.ask({"op": "reset"})
+check(rig.modem.cfun == 4, "reboot: the next reset from the target switches its radio off again")
+rig.close()
+check(rig.modem.cfun == 1, "reboot: ...and it is still restored at the end")
+
+# --- what the modem says, classified ---------------------------------------------------
+rig = Rig(cpin_err="+CME ERROR: 14")
+up = rig.ask({"op": "power_up"})
+check(up and up.get("error") == "io", "CME 14 (SIM busy): a card that is there, not no_card (%r)" % up)
+rig.close()
+rig = Rig(csim_err="+CME ERROR: 10")
+rig.ask({"op": "power_up"})
+r = rig.ask({"op": "tpdu", "data": "00A40004023F00"})
+check(r and r.get("error") == "no_card", "CME 10 during a command: the card has left (%r)" % r)
+rig.close()
+bad = subprocess.run([BIN, "--at-baud", "1234", "at:/dev/null"], capture_output=True, timeout=10)
+check(bad.returncode == 2, "an --at-baud the port cannot take is refused")
+
 # --- keep: the radio is left alone ------------------------------------------------
 rig = Rig(args=["--at-radio", "keep"])
 rig.ask({"op": "power_up"})
@@ -168,6 +243,10 @@ rig = Rig(card=False)
 up = rig.ask({"op": "power_up"})
 check(up and not up.get("ok") and up.get("error") == "no_card", "no card: power_up says no_card (%r)" % up)
 rig.close()
+
+for f in os.listdir("/tmp"):                     # the state files of these runs
+    if f.startswith("rsim-card-cfun-_dev_pts_"):
+        os.unlink(os.path.join("/tmp", f))
 
 print("test_e2e_at: %d checks, %d failures" % (checks, failures))
 sys.exit(1 if failures else 0)

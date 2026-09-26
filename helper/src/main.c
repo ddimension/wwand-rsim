@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  * Copyright (C) 2026 André Valentin <avalentin@marcant.net>
  */
+/* ppoll (glibc and musl declare it under _GNU_SOURCE) */
+#define _GNU_SOURCE
 #include <errno.h>
 #include <getopt.h>
 #include <poll.h>
@@ -40,6 +42,10 @@
  * radio switched back on. Killed instead, the AT backend would leave a modem
  * with its radio off for good. */
 static volatile sig_atomic_t stop_sig;
+/* the mask serve() waits with: the stop signals are blocked everywhere else
+ * and let through only inside ppoll, so one arriving between the check of
+ * stop_sig and the wait cannot be lost (it is delivered as the wait starts) */
+static sigset_t wait_mask;
 
 static void on_stop(int sig)
 {
@@ -246,7 +252,11 @@ static int serve(struct state *st)
 
 		if (stop_sig)
 			return 0;
-		r = poll(&pfd, 1, st->last_present >= 0 ? EVENT_POLL_MS : -1);
+		{
+			struct timespec ts = { EVENT_POLL_MS / 1000, (EVENT_POLL_MS % 1000) * 1000000L };
+
+			r = ppoll(&pfd, 1, st->last_present >= 0 ? &ts : NULL, &wait_mask);
+		}
 		if (r < 0) {
 			if (errno == EINTR)
 				continue;	/* the loop head sees a stop signal */
@@ -397,7 +407,7 @@ int main(int argc, char **argv)
 			return 2;
 		case 'B':
 			atc.baud = (unsigned)strtoul(optarg, &end, 10);
-			if (*end || atc.baud < 1200) {
+			if (*end || atmodem_speed(atc.baud) < 0) {
 				fprintf(stderr, "rsim-card: --at-baud %s: expected a baud rate\n", optarg);
 				return 2;
 			}
@@ -430,10 +440,20 @@ int main(int argc, char **argv)
 		struct sigaction sa;
 
 		memset(&sa, 0, sizeof(sa));
-		sa.sa_handler = on_stop;	/* no SA_RESTART: poll returns EINTR */
+		sigset_t stop_set;
+
+		sa.sa_handler = on_stop;	/* no SA_RESTART: ppoll returns EINTR */
 		sigaction(SIGTERM, &sa, NULL);
 		sigaction(SIGHUP, &sa, NULL);
 		sigaction(SIGINT, &sa, NULL);
+		sigemptyset(&stop_set);
+		sigaddset(&stop_set, SIGTERM);
+		sigaddset(&stop_set, SIGHUP);
+		sigaddset(&stop_set, SIGINT);
+		sigprocmask(SIG_BLOCK, &stop_set, &wait_mask);
+		sigdelset(&wait_mask, SIGTERM);
+		sigdelset(&wait_mask, SIGHUP);
+		sigdelset(&wait_mask, SIGINT);
 	}
 
 	memset(&st, 0, sizeof(st));

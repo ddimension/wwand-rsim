@@ -176,16 +176,49 @@ function fake_ctx(start)
 	eq(step, 2, 'use: ...only once the card is powered AND the modem has read the NEW identity');
 
 	step = 0; t = 0;
-	timeline = [ { st: { state: 'failed', last_error: 'no card in wbsm:', retry_at: null }, m: { state: 'READY', iccid: '8949' } } ];
+	timeline = [ { st: { state: 'failed', last_error: 'no card in wbsm:', retry_at: null, error_at: 1 },
+	               m: { state: 'READY', iccid: '8949' } } ];
 	eq(ctl.use_reader(ctx, 'm0', [ 'sm', '--wait', '60', '--json' ], sys), 1, 'use: a held failure ends the wait at once, exit 1');
 	eq(step, 1, 'use: ...without sitting out the timeout');
 
+	// the held failure of the reader BEFORE is still in the note until the
+	// plugin's next tick: not this attempt's, so not an answer
+	step = 0; t = 100;
+	timeline = [ { st: { state: 'off', last_error: 'no card in pcsc:0', retry_at: null, error_at: 50 },
+	               m: { state: 'READY', iccid: '8949' } } ];
+	eq([ ctl.use_reader(ctx, 'm0', [ 'sm', '--wait', '10', '--json' ], sys), step ], [ 1, 5 ],
+	   'use: an older failure does not end the wait — only the timeout does');
+
+	// `--wait --json`: waits with the default, not "no wait"
+	step = 0; t = 0;
+	timeline = [ { st: { state: 'waiting' }, m: { state: 'READY', iccid: '8949' } } ];
+	eq([ ctl.use_reader(ctx, 'm0', [ 'sm', '--wait', '--json' ], sys), step ], [ 1, 60 ],
+	   'use: --wait without a number waits the default 120 s');
+
+	eq(ctl.use_reader(ctx, 'nomodem', [ 'sm', '--json' ], sys), 1, 'use: a modem without a wwand_modem section is refused');
+
 	eq(ctl.use_reader(ctx, 'm0', [ 'nope', '--json' ], sys), 1, 'use: an undefined reader is refused');
+
+	// already on that reader: done at once, although the identity does not change
+	step = 0; t = 0;
+	uci.network.m0.rsim = 'sm';
+	timeline = [ { st: { state: 'powered' }, m: { state: 'READY', iccid: '8988' } } ];
+	eq([ ctl.use_reader(ctx, 'm0', [ 'sm', '--wait', '20', '--json' ], sys), step ], [ 0, 1 ],
+	   'use: the reader already in use is done, not a wait for a new identity');
+
+	// off: right after the switch-off the status still shows the remote
+	// card's identity, READY — done only once its own one is read again
+	step = 0; t = 0;
+	timeline = [ { st: { state: 'powered' }, m: { state: 'READY', iccid: '8988' } },
+	             { st: { state: 'off' },     m: { state: 'READY', iccid: '8988' } },
+	             { st: { state: 'off' },     m: { state: 'READY', iccid: '8949' } } ];
+	eq([ ctl.use_reader(ctx, 'm0', [ 'off', '--wait', '30' ], sys), uci.network.m0.rsim, step ], [ 0, null, 2 ],
+	   'use off: the option goes, done once the modem has read its own card again');
 
 	step = 0; t = 0;
 	timeline = [ { st: { state: 'off' }, m: { state: 'READY', iccid: '8949' } } ];
-	eq([ ctl.use_reader(ctx, 'm0', [ 'off', '--wait', '30' ], sys), uci.network.m0.rsim ], [ 0, null ],
-	   'use off: the option goes, done once the modem runs on its own card');
+	eq([ ctl.use_reader(ctx, 'm0', [ 'off', '--wait', '30' ], sys), step ], [ 0, 1 ],
+	   'use off: a modem already on its own card is done at once');
 }
 
 done('test_ctl_rsim');

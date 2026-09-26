@@ -20,6 +20,9 @@ struct at_cfg {
  * does not open or does not answer AT (logged). */
 struct rsim_backend *atmodem_open(const struct at_cfg *cfg);
 
+/* the termios speed of a baud rate, -1 for one the port cannot be set to */
+int atmodem_speed(unsigned baud);
+
 /* exposed for the tests: the response of a +CSIM line into resp; its
  * length, or -1 when the line is not one */
 int atmodem_csim_answer(const char *line, unsigned char *resp, int cap);

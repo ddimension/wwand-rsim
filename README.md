@@ -39,10 +39,12 @@ wwandctl rsim wwmodem0 use off --wait 60 --json           # own SIM again
 `use` sets `option rsim` and reloads (the modem is not restarted). With
 `--wait` it returns once the modem RUNS on the card — the remote card
 powered and a new identity read (whether it registers depends on the
-network; `modem_state` in the result says), or its own card back and the
-modem READY — and exits 0; a
-failure that is not retried on its own (no card, reader missing) ends the
-wait at once with exit 1. `--json` prints the result as one JSON line
+network; `modem_state` in the result says), or its own card read again and
+the modem READY — and exits 0 (at once when nothing changes: the reader is
+already the one in use, or the modem already on its own card). A failure of
+this attempt that is not retried on its own (no card, reader missing) ends
+the wait at once with exit 1, so does another modem holding the reader;
+`off` also removes a spelled-out `rsim_reader`. `--json` prints the result as one JSON line
 (`ok`, `state`, `iccid`, `error`), for scripts such as a lab test driver.
 
 Options on the `wwand_modem` section: `rsim_reader` (`phoenix:<tty>` or
@@ -58,7 +60,10 @@ manage (on a SIM host, or on this router), reached over its AT port with
 AT+CSIM (TS 27.007 §8.17). That modem keeps the card; its radio is switched
 off (`AT+CFUN=4`, the SIM stays reachable) while the card is used elsewhere
 and put back as it was afterwards, also when the helper is stopped or its SSH
-link drops. Killed hard (SIGKILL, power loss), it cannot: the mode it had is
+link drops. One helper per AT port (a lock; a second one waits up to 20 s,
+long enough for the previous one to finish restoring the radio). A modem
+that rebooted while its card is lent is switched off again on the target's
+next power-up or reset. Killed hard (SIGKILL, power loss), it cannot: the mode it had is
 kept in `/tmp/rsim-card-cfun-<port>`, and the next run restores that one at
 its end (`rsim_at_radio keep` leaves the radio alone, `rsim_at_baud` for a
 real UART). The ATR is the minimal T=0 ATR `3B00`: plain AT has no command for the

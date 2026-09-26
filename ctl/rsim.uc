@@ -247,7 +247,9 @@ function use_reader(ctx, modem, args, sys)
 	let target = args[0];
 	let json_out = index(args, '--json') >= 0;
 	let wi = index(args, '--wait');
-	let wait = (wi >= 0) ? +(args[wi + 1] ?? 120) : 0;
+	let wv = (wi >= 0) ? args[wi + 1] : null;
+	// `--wait --json`: no number after it is the default, not "do not wait"
+	let wait = (wi < 0) ? 0 : (wv != null && match(wv, /^[0-9]+$/)) ? +wv : 120;
 	let res = { ok: false, modem: modem, reader: (target == 'off') ? null : target };
 
 	let finish = (ok, extra) => {
@@ -269,8 +271,19 @@ function use_reader(ctx, modem, args, sys)
 
 	c.load('network');
 
-	if (target == 'off')
+	if (c.get('network', modem) != 'wwand_modem')
+		return finish(false, { error: sprintf('no wwand_modem section %s', modem) });
+
+	// already on that reader, or already on its own card: nothing changes,
+	// so no NEW identity will come — the card in use is the answer
+	let was = c.get('network', modem, 'rsim') ?? c.get('network', modem, 'rsim_reader');
+	let same = (target == 'off') ? (was == null) : (c.get('network', modem, 'rsim') == target);
+
+	if (target == 'off') {
+		// both ways of naming a remote card: a named reader, or one spelled out
 		c.delete('network', modem, 'rsim');
+		c.delete('network', modem, 'rsim_reader');
+	}
 	else {
 		if (c.get('network', target) != 'wwand_simreader')
 			return finish(false, { error: sprintf('no SIM reader %s (config wwand_simreader)', target) });
@@ -281,14 +294,17 @@ function use_reader(ctx, modem, args, sys)
 	// the identity before the change: "read again" means a different one
 	let before = ctx.status()?.modems?.[modem]?.iccid ?? null;
 
-	c.save('network');
-	c.commit('network');
+	if (!c.save('network') || !c.commit('network'))
+		return finish(false, { error: 'cannot write /etc/config/network' });
+
+	let start = now();
+
 	ctx.call_ok('reload', {});
 
 	if (!wait)
 		return finish(true, { state: 'configured' });
 
-	let until = now() + wait;
+	let until = start + wait;
 	let st = null, iccid = null;
 
 	// the plugin ticks every 10 s: the first look is a few seconds away at best
@@ -303,19 +319,32 @@ function use_reader(ctx, modem, args, sys)
 		iccid = m?.iccid ?? null;
 
 		if (target != 'off') {
-			// a failure that is not retried on its own ends the wait at once
-			if (st?.config_error || (st?.last_error && st?.retry_at == null && st?.state != 'powered'))
+			// A failure that is not retried on its own ends the wait at once
+			// — one of THIS attempt: the note of the reader before (a held
+			// failure) is there until the plugin's next tick.
+			let fresh = (st?.error_at != null && st.error_at >= start);
+
+			if (st?.config_error || (fresh && st?.last_error && st?.retry_at == null && st?.state != 'powered'))
 				return finish(false, { state: st?.state, error: st?.config_error ?? st?.last_error });
+
+			// another modem holds that reader: waiting will not change it.
+			// The plugin notes it on its tick, every 10 s; an older note is
+			// not looked at before one tick has passed.
+			if (st?.conflict && now() - start > 12)
+				return finish(false, { state: st?.state, error: st.conflict });
 
 			// Registration is not part of it: it depends on the network (a
 			// test card often has no service at all — HW-observed on 245,
 			// 2026-09-26: powered, new identity read, modem REGISTERING),
 			// and what a caller of `use` needs is the card in use. The
 			// modem's state goes into the result for whoever cares.
-			if (st?.state == 'powered' && iccid != null && iccid != before)
+			if (st?.state == 'powered' && iccid != null && (same || iccid != before))
 				return finish(true, { state: st.state, iccid: iccid, modem_state: m?.state, atr: st?.atr });
 		}
-		else if ((st?.state ?? 'off') == 'off' && iccid != null && m?.state == 'READY')
+		// its own card READ AGAIN: right after the switch-off the status still
+		// shows the remote card's identity, and READY, until the modem has
+		// re-read — unless it never was on a remote card
+		else if ((st?.state ?? 'off') == 'off' && iccid != null && m?.state == 'READY' && (same || iccid != before))
 			return finish(true, { state: 'off', iccid: iccid, modem_state: m.state });
 	}
 
