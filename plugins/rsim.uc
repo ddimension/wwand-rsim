@@ -668,6 +668,13 @@ function create(deps)
 			if (s.state == 'failed')
 				return;
 
+			// A helper that exits before answering never reached a card: the
+			// reader is missing, busy or not permitted (its own message is
+			// in the log). Only an answer without an ATR means "no card".
+			if (err?.error == 'helper_exit' || err?.error == 'timeout')
+				return fail(s, sprintf('cannot use the reader %s (%s; the helper\'s reason is in the log)',
+					cfg.reader, err.error));
+
 			if (err || !bytes(res?.atr))
 				return fail(s, sprintf('no card in %s (%s)', cfg.reader, err?.error ?? 'no ATR'));
 

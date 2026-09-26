@@ -147,6 +147,8 @@ function fake_reader(card)
 
 				let ans;
 
+				if (r.card.dead)
+					return uloop.timer(0, () => on_exit());
 				if (!r.card.present)
 					ans = { ok: false, error: 'no_card' };
 				else if (req.op == 'power_up' || req.op == 'reset')
@@ -450,6 +452,21 @@ const EXT = { rsim_reader: 'phoenix:/dev/ttyUSB0' };
 	p.tick('m0', EXT);
 	run_for(20);
 	eq(asked, 1, 'no card: tried again after the backoff, and the card is found');
+}
+
+// a reader the helper cannot open is not "no card"
+{
+	let t = { now: 1000 };
+	let cm = card_model();
+
+	cm.dead = true;
+
+	let p = mk(fake_reader(cm), (ref, schema, cb) => cb(null, fake_client()), t);
+
+	p.tick('m0', EXT);
+	run_for(20);
+	ok(index(p.status('m0', EXT)?.text ?? '', 'cannot use the reader') >= 0,
+	   'dead helper: says the reader could not be used, not that there is no card');
 }
 
 // a modem without the service
