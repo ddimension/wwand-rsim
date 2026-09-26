@@ -20,7 +20,13 @@ import * as uloop from 'uloop';
 import * as fs from 'fs';
 import * as libuci from 'uci';
 
-const HELPER = '/usr/lib/wwand/rsim-card';
+// The card-side helper. It is its own package (rsim-card) so that a SIM host
+// — another router with the reader — can install it without wwand; there it
+// sits in /usr/bin, where an SSH reader's `rsim-card` is found by name. The
+// old place inside wwand-rsim is still looked at, for an installation from
+// before the split.
+const HELPER_PATHS = [ '/usr/bin/rsim-card', '/usr/lib/wwand/rsim-card' ];
+const HELPER = filter(HELPER_PATHS, (p) => fs.access(p))[0] ?? HELPER_PATHS[0];
 
 // A reader on another machine: `ssh:<user>@<host>:<reader>`. The helper runs
 // there and its lines travel over SSH, so nothing but the command line

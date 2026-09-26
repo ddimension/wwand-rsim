@@ -83,6 +83,25 @@ modem.
 
 Removing `rsim_reader` gives the modem its own SIM back.
 
+## A SIM host: only the reader tool
+
+On another OpenWrt router that just holds the reader, install the package
+**`rsim-card`** from the feed — it is the helper alone (`/usr/bin/rsim-card`,
+plus `libusb-1.0` for the Smartmouse USB), without wwand or anything else of
+this project:
+
+```sh
+apk add rsim-card                     # opkg install rsim-card on older releases
+rsim-card wbsm:                       # try it: {"op":"power_up"} on stdin
+```
+
+Then on the router with the modem: `option rsim_reader
+ssh:<user>@<simhost>:wbsm:` (or a `wwand_simreader` with `host`), and the
+router's key (`wwandctl rsim ssh-key`) in the SIM host's
+`/etc/dropbear/authorized_keys` (root) or `~/.ssh/authorized_keys`. The
+`wwand-rsim` package on the modem's router pulls `rsim-card` in as well, for
+readers plugged into that router itself.
+
 ## Building the helper
 
 `rsim-card` is the only part a **SIM host** needs: with
