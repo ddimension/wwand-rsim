@@ -560,6 +560,14 @@ function create(deps)
 			s.state = 'connected';
 			log('notice', sprintf('rsim %s: the modem connected to the remote card (slot %d)', s.ref, s.cfg.slot));
 			card_up(s, 'power_up');
+
+			// the modem now works on another card: wwand's card-change
+			// process (the one a slot switch runs) forgets the local card —
+			// identity, per-SIM override, eSIM caches — and re-reads this one
+			if (!s.swapped) {
+				s.swapped = true;
+				deps.sim_changed?.(s.ref, 'remote SIM in use');
+			}
 		});
 		c.on('DISCONNECT_IND', (d) => {
 			if (!mine(d))
@@ -692,8 +700,17 @@ function create(deps)
 
 		s.client = null;
 
+		// the modem goes back to its own card: the same card-change process
+		// as on the way in, once the modem has let go of ours
+		let back = () => {
+			if (s.swapped) {
+				s.swapped = false;
+				deps.sim_changed?.(s.ref, 'remote SIM off, own card back');
+			}
+		};
+
 		if (c && !c.destroyed) {
-			let rel = () => deps.qmi_release(s.ref, c);
+			let rel = () => { deps.qmi_release(s.ref, c); back(); };
 
 			if (polite && was != 'starting') {
 				c.request('EVENT', { info: { event: EV_CARD_REMOVED, slot: s.cfg.slot } }, () =>

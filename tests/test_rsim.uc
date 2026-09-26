@@ -177,8 +177,10 @@ let card_model = () => ({
 	answer: (d) => (substr(d, 0, 10) == 'A0A4000002') ? '9F17' : '9000',
 });
 
+let changes = [];
 let mk = (reader, client_of, t) => rsim.create({
 	log: (l, m) => null,
+	sim_changed: (ref, why) => push(changes, why),
 	open_helper: reader.open_helper,
 	helper_path: '/usr/lib/wwand/rsim-card',
 	modem_of: (ref) => ({ modem: {} }),
@@ -207,8 +209,13 @@ const EXT = { rsim_reader: 'phoenix:/dev/ttyUSB0' };
 	eq(client.events(), [ 1 ],
 	   'session: connection available, and nothing more until the modem connects');
 
+	eq(changes, [], 'card change: nothing before the modem has taken the remote card');
+
 	client.fire('CONNECT_IND', { slot: 1 });
 	run_for(20);
+
+	eq(changes, [ 'remote SIM in use' ],
+	   'card change: once the modem connects, wwand re-reads the SIM (the slot-switch process)');
 
 	let last = client.sent[length(client.sent) - 1];
 
@@ -278,6 +285,9 @@ const EXT = { rsim_reader: 'phoenix:/dev/ttyUSB0' };
 	} catch (e) { died = e.message; }
 	eq(died, null, 'leave: indications for an ended session are ignored, not a crash of the daemon');
 	ok(client.released, 'leave: the client is given back to the modem');
+	eq(changes, [ 'remote SIM in use', 'remote SIM off, own card back' ],
+	   'card change: and again once the modem has its own card back');
+	changes = [];
 	eq(reader.closed, 1, 'leave: the helper is closed');
 }
 
