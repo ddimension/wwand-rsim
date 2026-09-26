@@ -47,13 +47,13 @@ if (tty && helper) {
 	let ext = { rsim_reader: 'phoenix:' + tty };
 
 	p.tick('m0', ext);
-	run_until(() => length(events()) >= 2, 8000);
-	eq(events(), [ 1, 2 ], 'e2e: the real reader answered the power-up, the card is offered');
+	run_until(() => length(events()) >= 1, 8000);
+	eq(events(), [ 1 ], 'e2e: the real reader answered the power-up, the card is offered');
 
 	c.fire('CONNECT_IND', { slot: 1 });
-	run_until(() => length(events()) >= 3, 8000);
+	run_until(() => length(events()) >= 2, 8000);
 
-	let ev = filter(c.sent, (s) => s.name == 'EVENT')[2];
+	let ev = filter(c.sent, (s) => s.name == 'EVENT')[1];
 
 	eq(ev?.args?.info?.event, 5, 'e2e: on connect the card is reset');
 	eq(rsim.hexs(ev?.args?.atr), '3B9F96801FC78031A073BE21136743200718000001A5',

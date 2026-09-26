@@ -597,8 +597,19 @@ function create(deps)
 				event(s, EV_CARD_REMOVED);
 			}
 			else if (ev.event == 'inserted') {
+				// the service takes card-inserted only WITH the ATR: without
+				// it the request falls through every branch of its event
+				// decoder and is refused as malformed (QMI error 1,
+				// HW-observed on the RG650E, 2026-09-26)
 				log('notice', sprintf('rsim %s: card inserted in the reader', ref));
-				event(s, EV_CARD_INSERTED);
+				s.rpc.call({ op: 'power_up' }, (err, res) => {
+					if (s.state == 'failed' || err || !bytes(res?.atr))
+						return;
+
+					s.atr = res.atr;
+					s.state = 'powered';
+					event(s, EV_CARD_INSERTED, { atr: bytes(s.atr) });
+				});
 			}
 		}, (why) => {
 			if (s.state != 'failed')
@@ -634,24 +645,28 @@ function create(deps)
 				s.client = c;
 				wire(s);
 
-				// RESET clears what a previous client of ours left behind in
-				// the service (a daemon restart does not release it cleanly)
-				c.request('RESET', {}, () => {
-					event(s, EV_CONN_AVAILABLE, null, (e) => {
-						if (e)
-							return fail(s, sprintf('the modem refused the remote card: %J', e));
+				// NO RESET first. The service's RESET handler runs its own
+				// disconnect callback on the calling client, which takes that
+				// client out of its registry — the next EVENT then finds no
+				// client and fails with QMI_ERR_INTERNAL (HW-observed on the
+				// RG650E, 2026-09-26: error 3 on connection-available right
+				// after RESET). What a previous client of ours left behind is
+				// cleared when its CID is released, which runs the same
+				// disconnect.
+				event(s, EV_CONN_AVAILABLE, null, (e) => {
+					if (e)
+						return fail(s, sprintf('the modem refused the remote card: %J', e));
 
-						s.state = 'waiting';
-						note(ref, { failures: 0, retry_at: null, last_error: null });
-						log('notice', sprintf('rsim %s: remote card offered to the modem (slot %d, reader %s, ATR %s)',
-							ref, cfg.slot, cfg.reader, s.atr));
+					s.state = 'waiting';
+					note(ref, { failures: 0, retry_at: null, last_error: null });
+					log('notice', sprintf('rsim %s: remote card offered to the modem (slot %d, reader %s, ATR %s)',
+						ref, cfg.slot, cfg.reader, s.atr));
 
-						// The sequence the working public client sends: card
-						// inserted right after the connection, the ATR once the
-						// modem connects (CONNECT_IND).
-						event(s, EV_CARD_INSERTED);
-					});
-				}, { no_recovery: true });
+					// Nothing more until the modem connects (CONNECT_IND):
+					// then the card is powered and its ATR goes as card-reset.
+					// That is the sequence proven on the RG650E (2026-09-26);
+					// a card-inserted here, without the ATR, is refused.
+				});
 			});
 		});
 	};

@@ -141,6 +141,7 @@ static void do_tpdu(struct state *st, const char *line)
 		return;
 	}
 	be->detail[0] = '\0';
+	log_dbg("tpdu > %s", hex);
 	r = be->ops->transmit(be, tpdu, (size_t)n, resp, &resp_len);
 	if (r) {
 		log_dbg("tpdu %02X: %s %s", tpdu[1], rsim_err_name(r), be->detail);

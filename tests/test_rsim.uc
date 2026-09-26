@@ -201,9 +201,11 @@ const EXT = { rsim_reader: 'phoenix:/dev/ttyUSB0' };
 
 	eq(reader.lines[0]?.op, 'power_up', 'session: the card is powered before the modem is asked for anything');
 	eq(client.schema?.service, 0x32, 'session: the UIM Remote client is asked for');
-	eq(client.sent[0]?.name, 'RESET', 'session: the service is reset first');
-	eq(client.events(), [ 1, 2 ],
-	   'session: connection available, then card inserted — the sequence the working public client sends');
+	eq(length(filter(client.sent, (x) => x.name == 'RESET')), 0,
+	   'session: no RESET — the modem would drop the client it came from, and the offer fails');
+	eq(client.sent[0]?.name, 'EVENT', 'session: the offer is the first thing the modem hears');
+	eq(client.events(), [ 1 ],
+	   'session: connection available, and nothing more until the modem connects');
 
 	client.fire('CONNECT_IND', { slot: 1 });
 	run_for(20);
@@ -211,6 +213,15 @@ const EXT = { rsim_reader: 'phoenix:/dev/ttyUSB0' };
 	let last = client.sent[length(client.sent) - 1];
 
 	eq(last.args?.info?.event, 5, 'session: on connect the card is reset...');
+
+	// a card put into the reader later goes to the modem WITH its ATR
+	reader.on_line('{"event":"inserted"}');
+	run_for(20);
+
+	let ins = client.sent[length(client.sent) - 1];
+
+	eq(ins.args?.info?.event, 2, 'session: a card inserted in the reader is reported...');
+	eq(rsim.hexs(ins.args?.atr), ATR, '...with its ATR, which the modem requires for that event');
 	eq(rsim.hexs(last.args?.atr), ATR, '...and its ATR goes to the modem');
 
 	client.fire('APDU_IND', { slot: 1, apdu_id: 11, command: rsim.bytes('A0A40000023F00') });
@@ -322,7 +333,7 @@ const EXT = { rsim_reader: 'phoenix:/dev/ttyUSB0' };
 	run_for(20);
 
 	eq(length(clients), 2, 'modem restart: a new client, the card offered again');
-	eq(clients[1].events(), [ 1, 2 ], 'modem restart: ...with the full sequence');
+	eq(clients[1].events(), [ 1 ], 'modem restart: ...offered again');
 }
 
 // a card that stops answering: the command fails and the modem hears about it
