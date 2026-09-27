@@ -1384,7 +1384,11 @@ let donor_plugin = (o) => rsim.create({
 
 	p.tick('m0', { rsim_reader: 'modem:m1', rsim_donor_mode: 'sap' });
 	run_for(100);
-	eq(radio, [ [ 'm1', false ], [ 'm1', true ] ], 'a refused connect after the deregister: the sponsor\'s radio is woken again');
+	eq(radio, [ [ 'm1', false ] ], 'busy after the deregister: parked, and asked again after a moment');
+	run_for(3300);
+	eq(length(filter(donor.sent, (x) => x.name == 'SAP_CONNECTION' && x.args.conn.op == 1)), 2,
+	   '...once (its data session may still be tearing down)');
+	eq(radio, [ [ 'm1', false ], [ 'm1', true ] ], 'still refused: the lending ends and the sponsor\'s radio is woken again');
 	p.stop();
 	run_for(50);
 }

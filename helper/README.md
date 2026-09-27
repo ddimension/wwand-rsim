@@ -127,10 +127,15 @@ phone.
 reads what the SSH client asked for from `SSH_ORIGINAL_COMMAND`, splits it
 into words as a shell would for plain and quoted words (no expansion), and
 execs it only when it is `rsim-card [options] <reader>` with a reader one of
-the SPECs matches (fnmatch; no SPECs: any), `rsim-card --list`, or
+the SPECs matches (fnmatch with `FNM_PATHNAME`: a `*` does not cross a `/`,
+so `at:/dev/ttyUSB*`, not `at:*`; no SPECs: any), `rsim-card --list`, or
 `wwandctl rsim proxy [options] <target>` with `wwand:<target>` matching (or
-its `--list`). A second reader, `--serve` again, an option the proxy lacks,
-or anything else is refused with a message. `RSIM_TEST_SELF` /
+its `--list`). With SPECs, both lists are cut down to the rows they match (a
+modem's card also by `wwand:<modem>`). A reader that names a path must be a
+serial port under `/dev` (`tty*`, `rfcomm*`, `pts/*`) — rsim-card's AT and
+Phoenix backends refuse anything that is not a tty themselves. Only
+rsim-card's own options pass, spelled out. A second reader, `--serve` again,
+an option the proxy lacks, or anything else is refused with a message. `RSIM_TEST_SELF` /
 `RSIM_TEST_WWANDCTL`: what to exec instead, for the tests.
 
 On a router with wwand-rsim, `--list` also passes on the lines of

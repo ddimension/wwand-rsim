@@ -1175,6 +1175,14 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 			// as malformed) the firmware's default refuses the link while
 			// one is up (HW-seen on an RG502Q, 2026-09-27). Park its radio,
 			// which ends the session, and ask once more.
+			// Parked already (deregister_then): its data session may still be
+			// tearing down — asked once more after a moment, as before
+			if (e?.error == 'qmi' && e?.code == 52 && parked && !retried_busy) {
+				retried_busy = true;
+				log('notice', sprintf('rsim: %s is still busy with its card — asking again in 3 s', donor));
+				return uloop.timer(3000, () => (dead || !c) ? null : connect());
+			}
+
 			if (e?.error == 'qmi' && e?.code == 52 && !parked && !retried_busy && deps.modem_radio) {
 				retried_busy = true;
 				log('notice', sprintf('rsim: %s is busy with its card — parking its radio, then asking again', donor));

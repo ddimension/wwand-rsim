@@ -38,21 +38,27 @@ with tempfile.TemporaryDirectory() as root:
             env["SSH_ORIGINAL_COMMAND"] = cmd
         return subprocess.run([BIN, "--serve", *allow], input="", capture_output=True, text=True, timeout=30, env=env)
 
+    # a terminal to name as a reader: nothing answers on it, which is fine —
+    # these checks are about what --serve lets through, not about the reader
+    import pty as _pty
+    _master, _slave = _pty.openpty()
+    TTY = os.ttyname(_slave)
+
     p = serve(None)
     check(p.returncode == 2 and "authorized_keys" in p.stderr, "no SSH_ORIGINAL_COMMAND: says what it is for")
 
     p = serve("'rsim-card' '--list'", "bt:*")
     check(p.returncode == 0 and '"done":true' in p.stdout, "the scan is served (%r)" % p.stderr)
 
-    p = serve("'/opt/rsim/rsim-card' '-v' 'at:/dev/null'", "at:/dev/*")
-    check("/dev/null" in p.stderr and "--serve" not in p.stderr,
+    p = serve("'/opt/rsim/rsim-card' '-v' 'phoenix:%s'" % TTY, "phoenix:/dev/pts/*")
+    check(TTY in p.stderr and "--serve" not in p.stderr,
           "an allowed reader: run (as ourselves, whatever path was named) (%r)" % p.stderr)
 
     p = serve("'rsim-card' 'at:/dev/ttyUSB2'", "bt:*", "wwand:m1")
     check(p.returncode == 1 and "not served to this key: at:/dev/ttyUSB2" in p.stderr, "a reader not given: refused")
 
-    p = serve("'rsim-card' '--at-radio' 'keep' 'phoenix:/dev/null'", "phoenix:/dev/*")
-    check("not served" not in p.stderr and "--serve" not in p.stderr and "/dev/null" in p.stderr,
+    p = serve("'rsim-card' '--at-radio' 'keep' 'phoenix:%s'" % TTY, "phoenix:/dev/pts/*")
+    check("not served" not in p.stderr and "--serve" not in p.stderr and TTY in p.stderr,
           "an option's value is not taken for the reader (%r)" % p.stderr)
 
     # A FILE IS NOT A MODEM PORT. An open key (or one allowing `at:*`) could
@@ -63,24 +69,31 @@ with tempfile.TemporaryDirectory() as root:
     with open(victim, "w") as f:
         f.write("secret\n")
     p = serve("'rsim-card' '-v' 'at:%s'" % victim)
-    check(p.returncode == 1 and "not a device under /dev" in p.stderr, "a file named as an AT port: refused (%r)" % p.stderr)
+    check(p.returncode == 1 and "not a serial port under /dev" in p.stderr, "a file named as an AT port: refused (%r)" % p.stderr)
     p = serve("'rsim-card' 'at:/dev/../%s'" % victim.lstrip("/"))
-    check(p.returncode == 1 and "not a device under /dev" in p.stderr, "...also through /dev/.. (%r)" % p.stderr)
+    check(p.returncode == 1 and "not a serial port under /dev" in p.stderr, "...also through /dev/.. (%r)" % p.stderr)
     p = serve("'rsim-card' 'phoenix:%s'" % victim, "phoenix:*")
     check(p.returncode == 1 and "not served" in p.stderr, "`*` does not cross a `/` (%r)" % p.stderr)
     with open(victim) as f:
         check(f.read() == "secret\n", "...and the file is left as it was")
     p = subprocess.run([BIN, "at:%s" % victim], input="", capture_output=True, text=True, timeout=30, env=base_env)
-    check(p.returncode == 1 and "not a character device" in p.stderr,
+    check(p.returncode == 1 and "not a serial port" in p.stderr,
           "rsim-card itself refuses a file as an AT port, --serve or not (%r)" % p.stderr)
 
     # only rsim-card's own options, spelled out
-    p = serve("'rsim-card' '--' 'at:/dev/null'", "at:/dev/*")
+    p = serve("'rsim-card' '--' 'at:%s'" % TTY, "at:/dev/pts/*")
     check(p.returncode == 1 and "an option this does not pass on: --" in p.stderr, "`--` refused (%r)" % p.stderr)
-    p = serve("'rsim-card' '--at-r' 'keep' 'at:/dev/null'", "at:/dev/*")
+    p = serve("'rsim-card' '--at-r' 'keep' 'at:%s'" % TTY, "at:/dev/pts/*")
     check(p.returncode == 1 and "an option this does not pass on" in p.stderr, "an abbreviated option refused")
-    p = serve("'rsim-card' '--at-radio=keep' 'phoenix:/dev/null'", "phoenix:/dev/*")
+    p = serve("'rsim-card' '--at-radio=keep' 'phoenix:%s'" % TTY, "phoenix:/dev/pts/*")
     check("--serve" not in p.stderr, "--opt=value passed on (%r)" % p.stderr)
+
+    # a character device that is not a serial port (/dev/null here; /dev/mtdN,
+    # /dev/mem on a router): refused by --serve, and by rsim-card itself
+    p = serve("'rsim-card' 'at:/dev/null'")
+    check(p.returncode == 1 and "not a serial port under /dev" in p.stderr, "/dev/null as an AT port: refused (%r)" % p.stderr)
+    p = subprocess.run([BIN, "at:/dev/null"], input="", capture_output=True, text=True, timeout=30, env=base_env)
+    check(p.returncode == 1 and "not a serial port" in p.stderr, "...by rsim-card itself too (%r)" % p.stderr)
 
     # a restricted key sees only its readers in the scan
     selfbin = os.path.join(root, "self")
@@ -94,7 +107,19 @@ with tempfile.TemporaryDirectory() as root:
     check(p.returncode == 0 and "bt:AA:BB" in p.stdout and "8949" not in p.stdout and '"done":true' in p.stdout,
           "--list for a restricted key: its readers only (%r)" % p.stdout)
 
-    p = serve("'rsim-card' 'at:/dev/null' 'bt:00:11:22:33:44:55'", "at:/dev/*")
+    # ...and so does the proxy's list of a wwand router's cards, by ICCID or
+    # by the modem they sit in
+    fake2 = os.path.join(root, "wwandctl2")
+    with open(fake2, "w") as f:
+        f.write('#!/bin/sh\necho \'{"backend":"wwand","spec":"wwand:iccid:8949","modem":"m0","imsi":"26201"}\'\n'
+                'echo \'{"backend":"wwand","spec":"wwand:iccid:8988","modem":"m1","imsi":"90128"}\'\n')
+    os.chmod(fake2, 0o755)
+    env = dict(base_env, RSIM_TEST_WWANDCTL=fake2, SSH_ORIGINAL_COMMAND="'wwandctl' 'rsim' 'proxy' '--list'")
+    p = subprocess.run([BIN, "--serve", "wwand:m1"], input="", capture_output=True, text=True, timeout=30, env=env)
+    check(p.returncode == 0 and "8988" in p.stdout and "8949" not in p.stdout,
+          "proxy --list for a key to one modem: that modem's card only (%r)" % p.stdout)
+
+    p = serve("'rsim-card' 'at:%s' 'bt:00:11:22:33:44:55'" % TTY, "at:/dev/pts/*")
     check(p.returncode == 1 and "more than one reader" in p.stderr, "two readers: refused")
 
     p = serve("'rsim-card' '--serve'", "at:*")

@@ -218,7 +218,7 @@ struct phx_io *phx_tty_open(const char *dev)
 	{
 		struct stat st;
 
-		if (fstat(t->fd, &st) || !S_ISCHR(st.st_mode)) {
+		if (fstat(t->fd, &st) || !S_ISCHR(st.st_mode) || !isatty(t->fd)) {
 			log_err("%s: not a character device — not a serial port, not used", dev);
 			close(t->fd);
 			free(t);

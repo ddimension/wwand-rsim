@@ -743,7 +743,11 @@ return view.extend({
 
 	/* wwandctl rsim test: one source, opened like a session */
 	testSource: function(x, host) {
-		ui.showModal(_('Test %s').format(x.spec), [ E('p', { 'class': 'spinning' }, _('Opening it…')) ]);
+		/* the title is set as HTML by showModal: a text node for a spec from
+		   a remote scan */
+		var title = E('span', {}, [ _('Test %s').format(x.spec) ]);
+
+		ui.showModal(title, [ E('p', { 'class': 'spinning' }, _('Opening it…')) ]);
 
 		return fs.exec('/usr/bin/wwandctl', [ 'rsim', 'test', x.spec ].concat(host ? [ host ] : []).concat([ '--json' ]))
 			.then(function(res) {
@@ -758,7 +762,7 @@ return view.extend({
 					(r.log && r.log.length) ? E('pre', { 'style': 'white-space:pre-wrap;font-size:90%' }, [ r.log.join('\n') ]) : '',
 				] : [ level('error', (res.stderr || res.stdout || _('no answer')).trim()) ];
 
-				ui.showModal(_('Test %s').format(x.spec), body.concat([
+				ui.showModal(E('span', {}, [ _('Test %s').format(x.spec) ]), body.concat([
 					E('div', { 'class': 'right' }, E('button', { 'class': 'btn', 'click': ui.hideModal }, _('Close'))),
 				]));
 			});

@@ -81,8 +81,10 @@ struct sa_l2 {
 /* ...and that bound is kept as a whole, not per step: SDP, RFCOMM, a connect
  * the phone's user has to allow and the size retries each have their own
  * timeout, and added up they went well past it — the plugin then started a
- * second helper while the first still waited at the phone's prompt */
-#define BRINGUP_MS		55000
+ * second helper while the first still waited at the phone's prompt. 35 s:
+ * the SSH start before it and the first power-up after it (SIM on, ATR)
+ * share the plugin's 60 s. */
+#define BRINGUP_MS		35000
 /* an eUICC works through a profile download in single commands that take
  * seconds each; below the plugin's 30 s for a TPDU */
 #define REQUEST_TIMEOUT_MS	25000
@@ -715,8 +717,8 @@ static int sap_connect(struct bt_backend *b)
 	/* the server's STATUS_IND says the card is ready; without it (a call
 	 * still going on) the card is reported absent until it comes */
 	deadline = now_ms() + STATUS_TIMEOUT_MS;
-	if (deadline > b->bringup_until + STATUS_TIMEOUT_MS)
-		deadline = b->bringup_until + STATUS_TIMEOUT_MS;
+	if (deadline > b->bringup_until)
+		deadline = b->bringup_until;
 	while (!b->gone && b->card < 0) {
 		struct sap_msg m;
 		int r = read_msg(b, deadline, &m);

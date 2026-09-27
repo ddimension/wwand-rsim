@@ -189,8 +189,12 @@ static int device_ok(const char *spec)
 		path = spec + l;
 		if (!*path && l)
 			return 1;	/* `phoenix:` alone is not a path */
+		/* ...and a serial port by its name: /dev/mtdN, /dev/mem, /dev/kmsg
+		 * are character devices too (found by audit, 2026-09-27) */
 		return !strncmp(path, "/dev/", 5) && !strstr(path, "/..") && realpath(path, real) &&
-		       !strncmp(real, "/dev/", 5) && !stat(real, &st) && S_ISCHR(st.st_mode);
+		       (!strncmp(real, "/dev/tty", 8) || !strncmp(real, "/dev/rfcomm", 11) ||
+			!strncmp(real, "/dev/pts/", 9)) && strcmp(real, "/dev/tty") &&
+		       !stat(real, &st) && S_ISCHR(st.st_mode);
 	}
 	return 1;
 }
@@ -223,6 +227,26 @@ static int option_kind(const char *a)
 	return 0;
 }
 
+/* a JSON line's string field (the writers here escape `"` and `\\` only);
+ * 1 when it is there and not empty */
+static int field(const char *line, const char *name, char *out, size_t cap)
+{
+	char key[64];
+	const char *p;
+	size_t o = 0;
+
+	snprintf(key, sizeof(key), "\"%s\":\"", name);
+	if (!(p = strstr(line, key)))
+		return 0;
+	for (p += strlen(key); *p && *p != '"' && o < cap - 1; p++) {
+		if (*p == '\\' && p[1])
+			p++;
+		out[o++] = *p;
+	}
+	out[o] = '\0';
+	return o > 0;
+}
+
 /* `--list` for a key restricted to some readers: only those rows — the rest
  * of what that machine has (other readers, other cards with their ICCID,
  * IMSI and APN) is none of this key's business */
@@ -248,22 +272,28 @@ static int list_filtered(char **argv, int nallow, char **allow, const char *self
 	close(pfd[1]);
 	if (!(in = fdopen(pfd[0], "r")))
 		return refuse("fdopen", strerror(errno));
-	while (fgets(line, sizeof(line), in)) {
-		char spec[512];
-		const char *p = strstr(line, "\"spec\":\"");
-		size_t o = 0;
+	int cont = 0;		/* the rest of a line longer than the buffer */
 
-		if (!p) {		/* the done line, notes */
-			fputs(line, stdout);
+	while (fgets(line, sizeof(line), in)) {
+		char spec[512], modem[300];
+		size_t l = strlen(line);
+		int whole = l && line[l - 1] == '\n';
+
+		if (cont) {		/* never judged on its own */
+			cont = !whole;
 			continue;
 		}
-		for (p += 8; *p && *p != '"' && o < sizeof(spec) - 1; p++) {
-			if (*p == '\\' && p[1])
-				p++;
-			spec[o++] = *p;
+		cont = !whole;
+		if (!field(line, "spec", spec, sizeof(spec))) {	/* the done line, notes */
+			if (whole)
+				fputs(line, stdout);
+			continue;
 		}
-		spec[o] = '\0';
-		if (*spec && allowed(spec, nallow, allow))
+		/* a modem's card is named both ways in a key: by ICCID, and by
+		 * the modem it sits in */
+		if (allowed(spec, nallow, allow) ||
+		    (field(line, "modem", modem, sizeof(modem) - 6) &&
+		     (memmove(modem + 6, modem, strlen(modem) + 1), memcpy(modem, "wwand:", 6), allowed(modem, nallow, allow))))
 			fputs(line, stdout);
 	}
 	fclose(in);
@@ -313,7 +343,7 @@ int serve_run(int nallow, char **allow)
 		if (!list && !allowed(spec, nallow, allow))
 			return refuse("this reader is not served to this key", spec);
 		if (!list && !device_ok(spec))
-			return refuse("not a device under /dev", spec);
+			return refuse("not a serial port under /dev", spec);
 		/* ourselves, whatever path the client named: not a program of its
 		 * choice */
 		argv[0] = "rsim-card";
@@ -359,6 +389,10 @@ int serve_run(int nallow, char **allow)
 		}
 		argv[0] = "wwandctl";
 		drop_test_env();
+		if (list && nallow) {
+			fflush(stdout);
+			return list_filtered(argv, nallow, allow, wwandctl ? wwandctl : "/usr/bin/wwandctl");
+		}
 		execv(wwandctl ? wwandctl : "/usr/bin/wwandctl", argv);
 		fprintf(stderr, "rsim-card --serve: wwandctl: %s — is wwand-rsim installed here?\n", strerror(errno));
 		return 1;

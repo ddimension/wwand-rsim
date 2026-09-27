@@ -544,8 +544,10 @@ struct rsim_backend *atmodem_open(const struct at_cfg *cfg)
 	{
 		struct stat st;
 
-		if (fstat(a->fd, &st) || !S_ISCHR(st.st_mode)) {
-			log_err("%s: not a character device — not a modem port, not used", cfg->dev);
+		/* ...and a terminal: /dev/mtdN or /dev/mem are character devices
+		 * too (found by audit, 2026-09-27) */
+		if (fstat(a->fd, &st) || !S_ISCHR(st.st_mode) || !isatty(a->fd)) {
+			log_err("%s: not a serial port (a tty) — not a modem port, not used", cfg->dev);
 			close(a->fd);
 			free(a);
 			return NULL;
