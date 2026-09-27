@@ -246,9 +246,12 @@ enable --reset`):
 | | Huawei E392 on the same router, APDU over QMI UIM | works (registered; no data with that SIM's plan) |
 | | Galaxy S20 FE over Bluetooth SAP, via a PC | card only (inactive SIM) |
 | | Galaxy A5 (2016) over Bluetooth SAP, via a PC | card only (inactive SIM) |
+| Quectel RM520N-GL (MBIM, GL-X3000) | Smartmouse USB on a PC over SSH, through the QMI-over-MBIM passthrough | card only (a test card without service there; 431 commands, identity read) |
 
-Not a client: NCM and MBIM-only modems (no QMI UIM Remote); other Qualcomm
-modems are untested.
+An MBIM modem is a client through its QMI-over-MBIM passthrough (wwand's
+`qmi_client` there): on the RM520N the UIM Remote indications come over it,
+although NAS's do not. Not a client: NCM modems (no QMI at all), and MBIM
+modems without the passthrough; other Qualcomm modems are untested.
 
 **Providers — where a card can come from:**
 
