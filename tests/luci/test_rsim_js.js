@@ -173,6 +173,14 @@ const page = new Function('view', 'form', 'rpc', 'ui', 'fs', 'uci', 'dom', 'poll
 	ok(st.indexOf('in use by the modem') >= 0 && st.indexOf('ATR 3B9F') >= 0 && st.indexOf('12 commands · last SW 9000') >= 0,
 	   'status: a modem on a phone\'s SIM, its card and commands');
 	ok(st.indexOf('since 100 s') >= 0, 'status: since when');
+
+	/* a lendable card: to another router only with wwand-rsim-provider */
+	view.renderStatus({ modems: [ 'm1' ], st: [ { enabled: false, now: 1000, lendable: true, lend_provider: false } ], info: status });
+	ok(text(view.statusBox).indexOf('wwand-rsim-provider is not installed') >= 0 && text(view.statusBox).indexOf('can be lent to another router') < 0,
+	   'status: lendable, but no provider: to modems here only');
+	view.renderStatus({ modems: [ 'm1' ], st: [ { enabled: false, now: 1000, lendable: true, lend_provider: true } ], info: status });
+	ok(text(view.statusBox).indexOf('can be lent to another router') >= 0, 'status: with the provider: to another router');
+	view.renderStatus(data);
 	ok(st.indexOf('"Galaxy S9" (smartphone) · authenticated pairing · channel 8') >= 0, 'status: what the reader in use is (its info event)');
 	ok(st.indexOf('lent to 10.0.0.2 (another router)') >= 0 && st.indexOf('5 commands') >= 0, 'status: a card lent to another router');
 	ok(st.indexOf('no card (retry in 30 s)') >= 0, 'status: an error and when it is tried again');
@@ -270,6 +278,7 @@ const page = new Function('view', 'form', 'rpc', 'ui', 'fs', 'uci', 'dom', 'poll
 	] }) });
 	await view.scan('root@simrouter2');
 	eq(execs[execs.length - 1], '/usr/bin/wwandctl rsim scan root@simrouter2 --json', 'scan: another machine');
+	ok(text(view.scanBox).indexOf('without wwand-rsim-provider') < 0, 'scan: a router with the provider: no hint');
 	let r2 = find(view.scanBox, (x) => x.tag == 'tr').slice(1);
 	await button(r2[0], 'Add').attrs.click();
 	await button(r2[1], 'Add').attrs.click();
@@ -308,6 +317,39 @@ const page = new Function('view', 'form', 'rpc', 'ui', 'fs', 'uci', 'dom', 'poll
 	await button(hostRow, 'Test').attrs.click();
 	ok(text(hostRow).indexOf('Works: rsim-card there answers (backends: phoenix, bt)') >= 0, 'ssh test: works');
 
+	/* a wwand router without wwand-rsim-provider: the hint, its AT port still offered */
+	execAnswer = () => ({ code: 0, stdout: JSON.stringify({ ok: true, backends: [ 'phoenix', 'at' ], wwand_provider: false,
+		provider_hint: 'root@r3 is a wwand router without wwand-rsim-provider: its modems\' cards are not offered to other routers (only through an AT port) — install wwand-rsim-provider there to lend them',
+		readers: [ { backend: 'tty', spec: 'at:/dev/ttyUSB2', device: '/dev/ttyUSB2', hint: 'at' } ] }) });
+	await view.scan('root@r3');
+	ok(text(view.scanBox).indexOf('install wwand-rsim-provider there') >= 0, 'scan: a router without the provider says so');
+	let r3 = find(view.scanBox, (x) => x.tag == 'tr').slice(1);
+	ok(r3.length == 1 && button(r3[0], 'Add').attrs.disabled == null, 'scan: ...and its AT port can still be added');
+
+	/* an osmo-remsim SIM bank: its slots, from the server's REST API */
+	execAnswer = () => ({ code: 0, stdout: JSON.stringify({ ok: true, server: 'bank.lan', backends: [ 'rspro' ], readers: [
+		{ backend: 'rspro', spec: 'rspro:bank.lan/1:0', server: 'bank.lan', bank: 1, slot: 0, name: 'bank-1', bank_state: 'CONNECTED_BANKD' },
+		{ backend: 'rspro', spec: 'rspro:bank.lan/1:1', server: 'bank.lan', bank: 1, slot: 1, mapped_to: '7:0', map_state: 'ACTIVE' },
+	] }) });
+	await view.scanBank('bank.lan', '8997');
+	eq(execs[execs.length - 1], '/usr/bin/wwandctl rsim scan --rspro bank.lan --rest-port 8997 --json', 'scan bank: through wwandctl');
+	const sb = text(view.scanBox);
+	[ 'SIM bank slots at remsim-server bank.lan', 'bank 1, slot 0', '"bank-1"', 'free', 'mapped to client 7:0 (ACTIVE)',
+	  'in use by client 7:0' ].forEach((w) => ok(sb.indexOf(w) >= 0, 'scan bank shows: ' + w));
+	let br = find(view.scanBox, (x) => x.tag == 'tr').slice(1);
+	ok(button(br[1], 'Add').attrs.disabled === true && button(br[1], 'Test').attrs.disabled === true,
+	   'scan bank: a slot mapped to another client can be neither added nor tested');
+	await button(br[0], 'Add').attrs.click();
+	added = uci.sections('network', 'wwand_simreader').filter((r) => r.type == 'rspro')[0];
+	ok(added && added.device == 'bank.lan' && added.bank == '1:0' && added.rest_port == '8997' && !added.host,
+	   'add: a SIM bank slot, with the REST port it was found on (' + JSON.stringify(added) + ')');
+	eq(added && added['.name'], 'rspro_b1s0'.replace('rspro', 'bank'), 'add: named after the bank slot');
+	await button(br[0], 'Test').attrs.click();
+	eq(execs[execs.length - 1], '/usr/bin/wwandctl rsim test rspro:bank.lan/1:0 --rspro-rest-port 8997 --json',
+	   'test bank: on the REST port it was found on');
+	await view.scanBank('bank.lan;x', '');
+	ok(text(view.scanBox).indexOf('Expecting host[:port]') >= 0, 'scan bank: a server that is none is not asked');
+
 	await view.scan('not a host');
 	ok(text(view.scanBox).indexOf('Expecting user@host') >= 0, 'scan: a host that is not user@host is not run');
 
@@ -331,7 +373,17 @@ const page = new Function('view', 'form', 'rpc', 'ui', 'fs', 'uci', 'dom', 'poll
 	ok(host.validate('t1', '') !== true && host.validate('t1', 'root@b') === true, 'form: another wwand router needs its host');
 	conf.t1.type = 'pcsc';
 	ok(host.validate('t1', '') === true, 'form: a reader here needs none');
-	ok(options['wwand_simreader.type'].values.join(',') == 'wbsm,phoenix,pcsc,at,bt,modem,wwand', 'form: every kind of source');
+	ok(options['wwand_simreader.type'].values.join(',') == 'wbsm,phoenix,pcsc,at,bt,modem,wwand,rspro', 'form: every kind of source');
+	conf.t1.type = 'rspro';
+	ok(dev.validate('t1', 'bank.lan') === true && dev.validate('t1', '[fd00::1]:9998') === true, 'form: a SIM bank\'s server');
+	ok(dev.validate('t1', '') !== true && dev.validate('t1', 'bank.lan;x') !== true, 'form: ...nothing else');
+	ok(options['wwand_simreader.bank'].validate('t1', '1:0') === true && options['wwand_simreader.bank'].validate('t1', '1') !== true,
+	   'form: a bank slot is bank:slot');
+	ok(options['wwand_simreader.bank'].validate('t1', '70000:0') !== true && options['wwand_simreader.client'].validate('t1', '70000') !== true
+	   && dev.validate('t1', 'bank.lan:0') !== true && dev.validate('t1', 'bank.lan:99999') !== true,
+	   'form: numbers rsim-card would refuse are refused here (each 0..65535, a port 1..65535)');
+	ok(options['wwand_simreader.client'].validate('t1', '12') === true && options['wwand_simreader.client'].validate('t1', 'a:1') !== true,
+	   'form: a client is id or id:slot');
 	ok(options['wwand_simreader.donor_mode'].deps.some((d) => d.type == 'wwand' || d == 'type') , 'form: how it lends, also for another router');
 
 	console.log('test_rsim_js: %d checks, %d failures', checks, failures);

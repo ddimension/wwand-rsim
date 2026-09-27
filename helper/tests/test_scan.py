@@ -168,6 +168,27 @@ with tempfile.TemporaryDirectory() as root:
         check("run as root" in lines[-1].get("note", ""), "not root: the note says how to see the phones (%r)" % lines[-1])
         check(not any(l.get("backend") == "bt" for l in lines), "...and lists none")
 
+# a wwand router without wwand-rsim-provider: said so, and no cards of its
+# modems (another router can reach one only over its AT port)
+with tempfile.TemporaryDirectory() as root:
+    os.makedirs(os.path.join(root, "sys/class/tty"))
+    os.makedirs(os.path.join(root, "usr/bin"))
+    ctl = os.path.join(root, "usr/bin/wwandctl")
+    with open(ctl, "w") as f:
+        f.write("#!/bin/sh\necho '{\"backend\":\"wwand\",\"spec\":\"wwand:iccid:1\"}'\n")
+    os.chmod(ctl, 0o755)
+    env = {k: v for k, v in dict(os.environ, RSIM_TEST_SYSROOT=root).items() if k != "RSIM_TEST_WWAND_LIST"}
+    out = subprocess.run([BIN, "--list"], capture_output=True, text=True, timeout=20, env=env)
+    lines = [json.loads(l) for l in out.stdout.splitlines() if l.strip()]
+    check(lines[-1].get("wwand_provider") is False and "wwand" not in lines[-1].get("backends", "").split(",")
+          and not [l for l in lines if l.get("backend") == "wwand"],
+          "wwand router without the provider: wwand_provider false, no cards (%r)" % lines[-1])
+    os.makedirs(os.path.join(root, "usr/share/ucode/wwand/ctl"))
+    open(os.path.join(root, "usr/share/ucode/wwand/ctl/rsim_provider.uc"), "w").close()
+    out = subprocess.run([BIN, "--list"], capture_output=True, text=True, timeout=20, env=env)
+    lines = [json.loads(l) for l in out.stdout.splitlines() if l.strip()]
+    check(lines[-1].get("wwand_provider") is True, "with the provider: wwand_provider true (%r)" % lines[-1])
+
 # without wwand-rsim here: nothing of it
 with tempfile.TemporaryDirectory() as root:
     out = subprocess.run([BIN, "--list"], capture_output=True, text=True, timeout=30,

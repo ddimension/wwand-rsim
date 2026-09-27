@@ -24,6 +24,7 @@ Contents:
 - [4. The card of an external AT modem (`at:`)](#4-the-card-of-an-external-at-modem-at)
 - [5. A SIM sponsor: another modem on the same router](#5-a-sim-sponsor-another-modem-on-the-same-router)
 - [6. A modem on another wwand router (`wwand:`)](#6-a-modem-on-another-wwand-router-wwand)
+- [7. A card in an osmo-remsim SIM bank (`rspro:`)](#7-a-card-in-an-osmo-remsim-sim-bank-rspro)
 - [Checking any setup](#checking-any-setup)
 
 ## The pieces
@@ -415,7 +416,7 @@ over `AT+CSIM` (TS 27.007 §8.17). The card stays in that modem.
 flowchart LR
     M["Client modem"] <-- "QMI UIM Remote" --> P["wwand + rsim plugin"]
     P <-- "stdin/stdout, or SSH" --> H["rsim-card at:/dev/ttyUSB2"]
-    H <-- "AT+CFUN=4 (radio off, SIM on)<br/>AT+CSIM=…" --> E["External modem<br/>its own SIM"]
+    H <-- "AT+COPS=2 (deregister), AT+CFUN=4 (radio off, SIM on)<br/>AT+CSIM=…" --> E["External modem<br/>its own SIM"]
 ```
 
 ```
@@ -423,7 +424,7 @@ config wwand_simreader 'usbstick'
 	option type 'at'
 	option device '/dev/ttyUSB2'      # its AT port
 	# option host 'root@simhost'      on another machine
-	# option radio 'keep'             leave its radio alone (default: CFUN=4 while lent)
+	# option radio 'keep'             leave its radio alone (default: deregister + CFUN=4 while lent)
 	# option baud '115200'            a real UART; USB ports ignore it
 ```
 
@@ -434,10 +435,17 @@ that is a tty); rsim-card refuses anything else. Through a restricted key
 `/dev/tty*`, `/dev/rfcomm*` or `/dev/pts/*`.
 
 What happens: at open, a diagnostic port is refused unopened, `AT+CSIM` is
-probed once (a modem that refuses it is refused with the reason), the radio
-is parked with `AT+CFUN=4` and read back. It is put back as it was at the
-end — also when the helper is stopped or its SSH link drops, and a modem that
-rebooted meanwhile is parked again. One helper per AT port (a lock); a
+probed once (a modem that refuses it is refused with the reason). Then the
+modem **deregisters** — its network selection is read (`AT+COPS?`), it
+detaches with `AT+COPS=2` while it still has the card, so the network lets
+go of the IMSI before the client attaches with it — and only then is the
+radio parked with `AT+CFUN=4` and read back (a modem that refuses `COPS=2`
+is parked with `CFUN=4` alone). At the end the radio mode is put back, then
+the network selection (automatic, or the manual operator it had; a manual
+one that cannot be set again falls back to automatic) — also when the
+helper is stopped or its SSH link drops; after a hard kill the next run on
+that port restores both. A modem that rebooted meanwhile is deregistered and
+parked again. One helper per AT port (a lock); a
 second one waits up to 20 s.
 
 ### Check
@@ -589,8 +597,9 @@ Spelled out: `option rsim_reader 'ssh:root@router2.lan:wwand:wwmodem0'` or
 `'ssh:root@router2.lan:wwand:iccid:8949…'`. `iccid:` stays right when the card
 moves between that router's modems.
 
-On router B: wwand-rsim installed (the proxy is part of it — a box with
-only `rsim-card` has no modems to lend), and the line from `wwandctl rsim
+On router B: **wwand-rsim-provider** installed (the proxy; it pulls in
+wwand-rsim — without it a scan from A says the package is missing there and
+offers only AT ports; a box with only `rsim-card` has no modems to lend), and the line from `wwandctl rsim
 ssh-key root@router2.lan` (run on A) in `/etc/dropbear/authorized_keys`:
 
 ```
@@ -639,6 +648,68 @@ LuCI on B shows the lending in the status with *Take back* / *Allow lending*.
 - HW-tested: Quectel RG502Q (SIM Access) and MeiG SLM770A-R on NCM (APDU over
   `AT+CSIM`) as lenders. Through the MeiG, ~1 s per command: 2–3 minutes to
   the first registration.
+
+## 7. A card in an osmo-remsim SIM bank (`rspro:`)
+
+An [osmo-remsim](https://osmocom.org/projects/osmo-remsim) installation has
+a **remsim-bankd** next to the cards (PC/SC readers, a sysmoOCTSIM, …) and a
+**remsim-server** that decides which bank slot goes to which client. The
+router is such a client: rsim-card talks RSPRO to the server and to the
+bankd, and the modem uses the card through QMI UIM Remote as with every
+other source. **Not tested against a real osmo-remsim yet** — only against
+a simulation (helper/README.md).
+
+```
+modem ── QMI UIM Remote ── rsim plugin ── rsim-card ──RSPRO/TCP──► remsim-server :9998
+                                              │  └────REST/HTTP──► remsim-server :9997 (slot mapping)
+                                              └───────RSPRO/TCP──► remsim-bankd  :9999 ── card
+```
+
+### Configuration
+
+List the slots first — the server's REST API, since RSPRO cannot list them:
+
+```sh
+wwandctl rsim scan --rspro bank.lan
+# rspro:bank.lan/1:0                 SIM bank 1 slot 0 ("bank-1"), free
+# rspro:bank.lan/1:1                 SIM bank 1 slot 1, mapped to client 7:0 (ACTIVE)
+```
+
+A slot of your choice — the router maps it to itself while it uses it:
+
+```
+config wwand_simreader 'bank1'
+	option type 'rspro'
+	option device 'bank.lan'        # the remsim-server, host[:port]
+	option bank '1:0'               # <bank>:<slot>
+	option client '10'              # our client id[:slot], unique per modem
+
+config wwand_modem 'wwmodem0'
+	option rsim 'bank1'
+```
+
+Leave `bank` out to use whatever the operator maps to client `10` (the
+server's VTY or REST API); the modem gets that card when the mapping
+appears and loses it when the mapping goes. In LuCI: *SIM readers → Kind:
+a card in an osmo-remsim SIM bank*, or *Find SIM sources → SIM bank → Ask*,
+then *Add*.
+
+### Check
+
+```sh
+wwandctl rsim test rspro:bank.lan/1:0 --rspro-client 10   # maps the slot, powers the card up, unmaps it
+                                        # (--rspro-rest-port N for a REST API elsewhere)
+wwandctl rsim wwmodem0                  # reader: remsim-server …, bank slot 1:0 at <bankd>, as client 10:0
+```
+
+### Limits
+
+- The server and the bankd must be reachable from the router directly (no
+  SSH), unencrypted TCP as osmo-remsim has it — a VPN if they are elsewhere.
+- One client slot per modem: two modems with the same `client` are refused
+  by the server (`identityInUse`).
+- Without a mapping the first start fails and is retried with the usual
+  backoff; with `bank` the helper makes the mapping itself.
 
 ## Checking any setup
 

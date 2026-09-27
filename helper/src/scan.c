@@ -105,12 +105,14 @@ static int tty_list(const char *sysroot)
 	return n;
 }
 
-/* On a router with wwand and wwand-rsim: the cards of its modems, which
- * another router's wwand-rsim can borrow through `wwandctl rsim proxy` — with
- * the wwand_sim settings of each. Its lines are passed on as they are.
- * RSIM_TEST_WWAND_LIST: the command to run instead (tests). -1 when there is
- * no wwand-rsim here. */
-static int wwand_list(void)
+/* On a router with wwand and wwand-rsim-provider: the cards of its modems,
+ * which another router's wwand-rsim can borrow through `wwandctl rsim proxy`
+ * — with the wwand_sim settings of each. Its lines are passed on as they
+ * are. RSIM_TEST_WWAND_LIST: the command to run instead (tests). -1 when
+ * this is no wwand router, -2 when it is one without wwand-rsim-provider:
+ * its modems' cards are then not lent to another router (only an AT port
+ * of one, through rsim-card itself). sysroot: a fake / for the tests. */
+static int wwand_list(const char *sysroot)
 {
 	const char *cmd = getenv("RSIM_TEST_WWAND_LIST");
 	char line[8192];
@@ -118,8 +120,14 @@ static int wwand_list(void)
 	int n = 0;
 
 	if (!cmd) {
-		if (access("/usr/share/ucode/wwand/ctl/rsim.uc", R_OK) || access("/usr/bin/wwandctl", X_OK))
+		char path[PATH_MAX];
+
+		snprintf(path, sizeof(path), "%s/usr/bin/wwandctl", sysroot);
+		if (access(path, X_OK))
 			return -1;
+		snprintf(path, sizeof(path), "%s/usr/share/ucode/wwand/ctl/rsim_provider.uc", sysroot);
+		if (access(path, R_OK))
+			return -2;
 		cmd = "/usr/bin/wwandctl rsim proxy --list 2>/dev/null";
 	}
 	fflush(stdout);
@@ -150,6 +158,7 @@ int scan_run(const char *sysroot)
 {
 	struct jw w;
 	char backends[64] = "phoenix,at", note[PATH_MAX + 80] = "", adapters[400] = "";
+	int ww;
 
 #ifdef WITH_LIBUSB
 	strcat(backends, ",wbsm");
@@ -163,8 +172,13 @@ int scan_run(const char *sysroot)
 	strcat(backends, ",bt");
 	bt_list(sysroot ? sysroot : "", note, sizeof(note), adapters, sizeof(adapters));
 #endif
+#ifdef WITH_RSPRO
+	/* nothing to list without a server: --list --rspro-server asks one */
+	strcat(backends, ",rspro");
+#endif
 	tty_list(sysroot ? sysroot : "");
-	if (wwand_list() >= 0)
+	ww = wwand_list(sysroot ? sysroot : "");
+	if (ww >= 0)
 		strcat(backends, ",wwand");
 
 	jw_begin(&w, stdout);
@@ -173,6 +187,9 @@ int scan_run(const char *sysroot)
 	if (note[0])
 		jw_str(&w, "note", note);
 	jw_opt(&w, "bt_adapters", adapters);
+	/* a wwand router: whether it lends its modems' cards to other routers */
+	if (ww != -1)
+		jw_bool(&w, "wwand_provider", ww >= 0);
 	jw_end(&w);
 	return 0;
 }

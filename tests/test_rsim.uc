@@ -96,6 +96,33 @@ uloop.init();
 	ok(index(rsim.reader_options({ type: 'bt', device: 'phone' }).error ?? '', 'Bluetooth address') >= 0,
 	   'reader bt: a device that is no address, refused');
 
+	// a card in an osmo-remsim SIM bank: the helper is the remsim client
+	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: 'rspro:bank.lan' }), '/x'), [ '/x', 'rspro:bank.lan' ],
+	   'cfg rspro: the server; client 0:0 and the REST port by the helper\'s default');
+	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: 'rspro:[fd00::1]:9998/1:4', rsim_rspro_client: '12:1',
+	                                  rsim_rspro_rest_port: '8997', rsim_clock: '6000' }), '/x'),
+	   [ '/x', 'rspro:[fd00::1]:9998/1:4', '--rspro-client', '12:1', '--rspro-rest-port', '8997' ],
+	   'cfg rspro: a bank slot, the client and the REST port reach the helper, other readers\' options do not');
+	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: 'rspro:bank.lan', rsim_rspro_client: '1:x', rsim_rspro_rest_port: '0' }), '/x'),
+	   [ '/x', 'rspro:bank.lan' ], 'cfg rspro: values out of range are left out');
+	eq(rsim.cfg_of({ rsim_reader: 'rspro:bank.lan;reboot' }), null, 'cfg rspro: a server is a host name or address');
+	eq(rsim.cfg_of({ rsim_reader: 'rspro:bank.lan/1' }), null, 'cfg rspro: a bank slot is <bank>:<slot>');
+	eq([ rsim.cfg_of({ rsim_reader: 'rspro:bank.lan:0' }), rsim.cfg_of({ rsim_reader: 'rspro:bank.lan:99999' }),
+	     rsim.cfg_of({ rsim_reader: 'rspro:bank.lan/70000:0' }) ], [ null, null, null ],
+	   'cfg rspro: numbers rsim-card would refuse (a port 1..65535, bank and slot 0..65535)');
+	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: 'rspro:bank.lan', rsim_rspro_client: '70000' }), '/x'), [ '/x', 'rspro:bank.lan' ],
+	   'cfg rspro: a client id over 65535 is left out');
+	eq(rsim.cfg_of({ rsim_reader: 'ssh:u@h:rspro:bank.lan' }), null, 'cfg rspro: not over SSH');
+	let rb = rsim.reader_options({ type: 'rspro', device: 'bank.lan:9998', bank: '2:7', client: '5' });
+	eq([ rb.rsim_reader, rb.rsim_rspro_client ], [ 'rspro:bank.lan:9998/2:7', '5' ], 'reader rspro: a named bank slot');
+	eq(rsim.reader_options({ type: 'rspro', device: 'bank.lan' }).rsim_reader, 'rspro:bank.lan',
+	   'reader rspro: without a bank slot, whatever the server maps to us');
+	ok(index(rsim.reader_options({ type: 'rspro' }).error ?? '', 'remsim-server') >= 0, 'reader rspro: without a server, refused');
+	ok(index(rsim.reader_options({ type: 'rspro', device: 'bank.lan', bank: 'x' }).error ?? '', 'bank') >= 0,
+	   'reader rspro: a bank slot that is none, refused');
+	ok(index(rsim.reader_options({ type: 'rspro', device: 'bank.lan', host: 'u@h' }).error ?? '', 'SSH') >= 0,
+	   'reader rspro: not over SSH');
+
 	// a modem's card on another wwand router, lent by its wwand-rsim
 	let pc = rsim.cfg_of({ rsim_reader: 'ssh:root@simhost:wwand:wwmodem0' });
 
@@ -1827,6 +1854,7 @@ let donor_plugin = (o) => rsim.create({
 	ok(index(op('lend_open', 'm1', { client: 'x', pid: 78 })?.err?.detail ?? '', 'stopped here') >= 0,
 	   'take back: the other router\'s retry is refused');
 	eq([ op('status', 'm1')?.lend_hold, op('status', 'm1')?.lendable ], [ true, false ], 'take back: the status says so');
+	eq(type(op('status', 'm1')?.lend_provider), 'bool', 'status: whether wwand-rsim-provider is installed (another router can be served)');
 	op('lend_allow', 'm1');
 	eq(op('status', 'm1')?.lendable, true, 'take back: allowed again');
 

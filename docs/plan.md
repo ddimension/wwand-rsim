@@ -223,7 +223,8 @@ The helper's `at:` backend (helper/src/atmodem.c): the card of any modem
 with an AT port — typically one on a SIM host, reached over SSH like a
 reader — as APDUs over AT+CSIM, the same path as the plugin's AT donor
 inside the router. The modem keeps the card; power and reset answer the
-minimal ATR 3B00. It is put into CFUN=4 while the card is lent (the SIM
+minimal ATR 3B00. It deregisters (AT+COPS=2, its selection restored at the
+end) and is put into CFUN=4 while the card is lent (the SIM
 stays reachable, the radio off: one card, one registration) and back to its
 previous mode at the end; SIGTERM/SIGHUP/SIGINT end the helper through the
 same cleanup, so a dropped SSH link does not leave it off. Tested against a
@@ -238,10 +239,24 @@ one option `rsim_reader` plus the rsim_* options; status per modem with a
 restart; the router's SSH key to copy. The modem status page shows the remote
 SIM through the core's plugin status rows.
 
-### 3.4 Later
+### 3.7 An osmo-remsim SIM bank (`rspro:`) — implemented 2026-09-27
 
-A SIM bank: osmo-remsim (bankd with PC/SC readers, RSPRO over IP) as a
-backend for many cards and routers.
+rsim-card as a remsim client (helper/README.md, *osmo-remsim SIM bank*):
+RSPRO to the remsim-server and the bankd it names, its own BER codec, no
+dependency, `WITH_RSPRO` at build time. The bank slot is either the
+operator's mapping for our client id, or named in the spec and mapped by
+the helper over the server's REST API for as long as it runs. Enumeration
+is the REST API too — RSPRO has no message that lists banks or slots.
+Plugin: `rsim_reader 'rspro:…'`, `rsim_rspro_client`,
+`rsim_rspro_rest_port`; a named reader `type rspro`; never over SSH (the
+router reaches the server itself). `wwandctl rsim scan --rspro`, LuCI:
+the kind *SIM bank*, and *Find SIM sources → SIM bank*.
+Not tested against a real osmo-remsim: open points are the reset
+signalling (whether a bankd resets on the RST edge, and whether it sends a
+new ATR — both are handled either way), the REST id of a slotmap in the
+DELETE, and the RSPRO version the server accepts.
+
+### 3.4 Later
 
 A software USIM (Milenage from Ki/OPc) — another card behind the same
 helper lines.

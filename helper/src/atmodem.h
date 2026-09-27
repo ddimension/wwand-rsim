@@ -27,4 +27,8 @@ int atmodem_speed(unsigned baud);
  * length, or -1 when the line is not one */
 int atmodem_csim_answer(const char *line, unsigned char *resp, int cap);
 
+/* exposed for the tests: a +COPS? answer (NULL: none) -> the command that
+ * restores that network selection, "" when there is nothing to restore */
+int atmodem_cops_restore(const char *line, char *out, size_t cap);
+
 #endif

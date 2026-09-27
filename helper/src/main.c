@@ -21,6 +21,9 @@
 #include "json.h"
 #include "log.h"
 #include "phoenix.h"
+#ifdef WITH_RSPRO
+#include "remsim.h"
+#endif
 #include "scan.h"
 #include "serve.h"
 #ifdef WITH_LIBUSB
@@ -340,7 +343,10 @@ static void usage(FILE *f)
 {
 	fputs("usage: rsim-card [-v] [-s] [options] phoenix:<tty> | wbsm:[serial] | pcsc:<reader substring or index>\n"
 	      "                                    | at:<tty of a modem's AT port> | bt:<phone's address>\n"
+	      "                                    | rspro:<server>[:port][/<bank>:<slot>]\n"
 	      "       rsim-card --list               what this machine offers, JSON lines\n"
+	      "       rsim-card --list --rspro-server <server>[:port]\n"
+	      "                                      the bank slots an osmo-remsim server knows\n"
 	      "       rsim-card --serve [SPEC...]    the command= of an authorized_keys line: runs only\n"
 	      "                                      wwand-rsim's own calls, for the readers SPEC matches\n"
 	      "  -v, --verbose          debug logging\n"
@@ -355,12 +361,16 @@ static void usage(FILE *f)
 	      "  --wbsm-mode MODE       phoenix (default) | smartmouse\n"
 	      "at (the SIM of another modem, over AT+CSIM; ATR is the minimal 3B00):\n"
 	      "  --at-baud N            115200 (default); USB ports ignore it\n"
-	      "  --at-radio off|keep    off (default): AT+CFUN=4 while its card is used\n"
-	      "                         elsewhere, the previous mode restored at the end\n"
+	      "  --at-radio off|keep    off (default): deregistered (AT+COPS=2) and AT+CFUN=4\n"
+	      "                         while its card is used elsewhere, both restored at the end\n"
 	      "bt (a paired phone's SIM over the Bluetooth SIM Access Profile):\n"
 	      "  --bt-channel N         its RFCOMM channel (default: looked up over SDP)\n"
 	      "  --bt-security LEVEL    medium (default, encrypted) | high (MITM-protected key)\n"
-	      "  --bt-apdu FORMAT       gsm (default, CommandAPDU) | 7816 (CommandAPDU7816)\n", f);
+	      "  --bt-apdu FORMAT       gsm (default, CommandAPDU) | 7816 (CommandAPDU7816)\n"
+	      "rspro (a card in an osmo-remsim SIM bank; this is a remsim client):\n"
+	      "  --rspro-client ID[:SLOT]  our client id and slot at the server (default 0:0)\n"
+	      "  --rspro-rest-port N    the server's REST API (default 9997), for /<bank>:<slot>\n"
+	      "                         (mapped while in use) and --list\n", f);
 }
 
 static int parse_enum(const char *arg, const char *const *names, int n)
@@ -390,6 +400,9 @@ int main(int argc, char **argv)
 		{ "bt-channel", required_argument, NULL, 'C' },
 		{ "bt-security", required_argument, NULL, 'S' },
 		{ "bt-apdu", required_argument, NULL, 'P' },
+		{ "rspro-client", required_argument, NULL, 'I' },
+		{ "rspro-rest-port", required_argument, NULL, 'T' },
+		{ "rspro-server", required_argument, NULL, 'E' },
 		{ "list", no_argument, NULL, 'L' },
 		{ "help", no_argument, NULL, 'h' },
 		{ NULL, 0, NULL, 0 },
@@ -405,6 +418,9 @@ int main(int argc, char **argv)
 	int wbsm_smartmouse = 0;
 	struct at_cfg atc = { .baud = 115200, .radio_keep = false };
 	int bt_channel = 0, bt_high = 0, bt_7816 = 0;
+	unsigned long rspro_id = 0, rspro_slot = 0, rspro_rest = 0;
+	const char *rspro_server = NULL;
+	int list = 0;
 	int verbose = 0, use_syslog = 0, opt, v, ret;
 	char *end;
 
@@ -492,9 +508,28 @@ int main(int argc, char **argv)
 			}
 			fprintf(stderr, "rsim-card: --bt-apdu %s: gsm or 7816\n", optarg);
 			return 2;
+		case 'I':
+			rspro_id = strtoul(optarg, &end, 10);
+			if (end != optarg && *end == ':')
+				rspro_slot = strtoul(end + 1, &end, 10);
+			if (end == optarg || *end || end[-1] == ':' || rspro_id > 65535 || rspro_slot > 65535) {
+				fprintf(stderr, "rsim-card: --rspro-client %s: expected ID[:SLOT], 0..65535\n", optarg);
+				return 2;
+			}
+			break;
+		case 'T':
+			rspro_rest = strtoul(optarg, &end, 10);
+			if (*end || !rspro_rest || rspro_rest > 65535) {
+				fprintf(stderr, "rsim-card: --rspro-rest-port %s: expected 1..65535\n", optarg);
+				return 2;
+			}
+			break;
+		case 'E':
+			rspro_server = optarg;
+			break;
 		case 'L':
-			/* RSIM_TEST_SYSROOT: a fake /sys for the tests */
-			return scan_run(getenv("RSIM_TEST_SYSROOT"));
+			list = 1;
+			break;
 		case 'h':
 			usage(stdout);
 			return 0;
@@ -502,6 +537,23 @@ int main(int argc, char **argv)
 			usage(stderr);
 			return 2;
 		}
+	}
+	if (list) {
+		if (optind != argc) {
+			usage(stderr);
+			return 2;
+		}
+		if (rspro_server) {
+#ifdef WITH_RSPRO
+			log_init(verbose, use_syslog);
+			return rspro_list(rspro_server, (uint16_t)rspro_rest);
+#else
+			fprintf(stderr, "rsim-card: built without RSPRO (WITH_RSPRO=OFF)\n");
+			return 1;
+#endif
+		}
+		/* RSIM_TEST_SYSROOT: a fake /sys for the tests */
+		return scan_run(getenv("RSIM_TEST_SYSROOT"));
 	}
 	if (optind != argc - 1) {
 		usage(stderr);
@@ -582,6 +634,23 @@ int main(int argc, char **argv)
 		(void)bt_high;
 		(void)bt_7816;
 		log_err("built without Bluetooth support (WITH_BLUETOOTH=OFF)");
+		return 1;
+#endif
+	} else if (!strncmp(spec, "rspro:", 6) && spec[6]) {
+#ifdef WITH_RSPRO
+		struct rspro_cfg rc = {
+			.spec = spec + 6,
+			.client_id = (uint16_t)rspro_id,
+			.client_slot = (uint16_t)rspro_slot,
+			.rest_port = (uint16_t)rspro_rest,
+		};
+
+		st.be = rspro_open(&rc);
+#else
+		(void)rspro_id;
+		(void)rspro_slot;
+		(void)rspro_rest;
+		log_err("built without RSPRO support (WITH_RSPRO=OFF)");
 		return 1;
 #endif
 	} else if (!strncmp(spec, "pcsc:", 5)) {

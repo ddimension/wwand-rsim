@@ -6,6 +6,8 @@
 import { eq, ok, done } from './lib/check.uc';
 
 let ctl = require('wwand.ctl.rsim');
+// the provider side (package wwand-rsim-provider)
+let prov = require('wwand.ctl.rsim_provider');
 
 // --- reading the switch --------------------------------------------------------
 {
@@ -308,6 +310,51 @@ function fake_ctx(start)
 	ran = [];
 	out = '';
 	eq(ctl.scan({}, [ '--json' ], sys), 1, 'scan: no answer (no helper) is a failure, not an empty list');
+
+	{
+	// a wwand router without wwand-rsim-provider, and what the scan prints
+	let out = '{"backend":"tty","spec":"at:/dev/ttyUSB6","device":"/dev/ttyUSB6","hint":"at"}\n' +
+		'{"done":true,"backends":"phoenix,at","wwand_provider":false}\n';
+	let sysp = { run: () => out, helper: '/usr/bin/rsim-card', status: () => ({ modems: {} }),
+	             ssh_sys: { flavor: 'dropbear', exists: () => true },
+	             lend_rows: () => [ { backend: 'wwand', modem: 'm1', iccid: '8949', lendable: true } ] };
+	let res = [];
+	let orig = global.printf;
+
+	global.printf = (f, ...a) => push(res, sprintf(f, ...a));
+	ctl.scan({}, [ 'root@r2', '--json' ], sysp);
+	ctl.scan({}, [ '--json' ], sysp);
+	global.printf = orig;
+
+	let far = json(res[0]), here = json(res[1]);
+
+	eq([ far.wwand_provider, length(filter(far.readers, (r) => r.backend == 'wwand')), far.readers[0].spec ],
+	   [ false, 0, 'at:/dev/ttyUSB6' ],
+	   'scan there without the provider: no modem card offered, an AT port still is');
+	ok(index(far.provider_hint ?? '', 'wwand-rsim-provider') >= 0 && index(far.provider_hint, 'root@r2') >= 0,
+	   'scan there: says which package is missing, and where');
+	eq(filter(here.readers, (r) => r.backend == 'wwand')[0]?.spec, 'modem:m1',
+	   'scan here without the provider: the sponsors still listed (they need no provider)');
+	ok(index(here.provider_hint ?? '', 'not to other routers') >= 0, 'scan here: says what is missing');
+	}
+
+	// an osmo-remsim SIM bank: its slots from the server's REST API
+	ran = [];
+	out = join('\n', [
+		'{"backend":"rspro","spec":"rspro:bank.lan/1:0","server":"bank.lan","bank":1,"slot":0,"name":"bank-1"}',
+		'{"backend":"rspro","spec":"rspro:bank.lan/1:1","server":"bank.lan","bank":1,"slot":1,"mapped_to":"7:0","map_state":"ACTIVE"}',
+		'{"done":true,"backends":"rspro","server":"bank.lan","slots":2}' ]) + '\n';
+	eq(ctl.scan({}, [ '--rspro', 'bank.lan', '--rest-port', '8997', '--json' ], sys), 0, 'scan --rspro: done');
+	eq(ran[0], "'/usr/bin/rsim-card' '--list' '--rspro-server' 'bank.lan' '--rspro-rest-port' '8997' 2>/dev/null",
+	   'scan --rspro: the helper asks that server, here');
+	p = ctl.scan_parse(out, null);
+	eq([ length(p.rows), p.rows[1].mapped_to ], [ 2, '7:0' ], 'scan --rspro: a row per slot, a mapped one says to whom');
+	out = '{"done":true,"backends":"rspro","server":"bank.lan","slots":0,"error":"bank.lan port 9997: Connection refused"}\n';
+	eq(ctl.scan({}, [ '--rspro', 'bank.lan', '--json' ], sys), 1, 'scan --rspro: a server that cannot be asked is a failure');
+	let died = false;
+
+	try { ctl.scan({}, [ '--rspro', 'bank.lan;reboot' ], sys); } catch (e) { died = true; }
+	ok(died, 'scan --rspro: a server is a host name or address, nothing else');
 }
 
 // --- proxy: this router's cards for another router ---------------------------------
@@ -362,10 +409,10 @@ function fake_ctx(start)
 	eq([ out[0].event, out[0].backend, out[0].reader ], [ 'info', 'wwand', 'm1' ], 'proxy: first an info event, like rsim-card');
 	eq(out[0].sim, { apn: 'internet.work', pdp_type: 'ipv4v6', auth: null, username: null, password: 's', source: 'sim' },
 	   'proxy: ...with the card\'s wwand_sim settings, the password included (the other router keeps them)');
-	eq(ctl.lend_settings([], [ { proto: 'wwand', modem: 'm2', apn: 'x' }, { proto: 'wwand', modem: 'm1', apn: 'internet.m1', auth: 'pap' } ], ICC, 'm1'),
+	eq(prov.lend_settings([], [ { proto: 'wwand', modem: 'm2', apn: 'x' }, { proto: 'wwand', modem: 'm1', apn: 'internet.m1', auth: 'pap' } ], ICC, 'm1'),
 	   { apn: 'internet.m1', pdp_type: null, auth: 'pap', username: null, password: null, source: 'interface' },
 	   'proxy: no wwand_sim for the card: the modem\'s interface');
-	eq(ctl.lend_settings([], [ { proto: 'wwand', modem: 'm1' } ], ICC, 'm1'), null, 'proxy: no APN anywhere: nothing');
+	eq(prov.lend_settings([], [ { proto: 'wwand', modem: 'm1' } ], ICC, 'm1'), null, 'proxy: no APN anywhere: nothing');
 	eq(slice(out, 1), [ { ok: true, atr: '3B00' }, { ok: true, data: '9000' }, { ok: false, error: 'bad_request', detail: 'not a request object with an op' } ],
 	   'proxy: every request answered, one line each');
 	let open = filter(calls, (c) => c[1] == 'lend_open')[0];
@@ -394,6 +441,20 @@ function fake_ctx(start)
 	out = [];
 	eq(ctl.proxy({}, [ '--list' ], sys), 0, 'proxy --list');
 	eq(length(out), 2, 'proxy --list: one JSON line per card');
+
+	// without wwand-rsim-provider: neither a lend nor the list, and it says
+	// which package is missing
+	out = [];
+	calls = [];
+	let noprov = { ...sys, provider: false };
+
+	eq(ctl.proxy({}, [ 'm1' ], noprov), 1, 'proxy without the provider package: 1');
+	eq(ctl.proxy({}, [ '--list' ], noprov), 1, 'proxy --list without it: 1, no cards for another router');
+	eq([ length(out), length(calls) ], [ 0, 0 ], '...nothing written, wwand not asked');
+	eq(ctl.proxy({}, [ '--list' ], { ...sys, provider: { proxy: () => 7 } }), 7, 'proxy: handed to the provider module');
+	ok(index(ctl.ssh_diagnose([ 'wwandctl rsim proxy: wwand-rsim-provider is not installed here — this router\'s modem cards are not lent to other routers' ],
+	                          'root@r2', true) ?? '', 'apk add wwand-rsim-provider') >= 0,
+	   'ssh: a router without the provider — which package to install there');
 
 	// the scan shows them, and here they are sponsors (modem:)
 	let sl = join('\n', [ sprintf('%J', rows[0]), '{"done":true,"backends":"phoenix,at,wwand"}' ]) + '\n';
@@ -504,6 +565,24 @@ function fake_ctx(start)
 	ran = [];
 	ctl.test_source({}, [ 'bt:34:82:C5:58:C9:21', 'root@simhost' ], sys);
 	ok(index(ran[0][0], 'root@simhost') >= 0 && index(ran[0][0], "'bt:34:82:C5:58:C9:21'") >= 0, 'test: on another machine, over SSH');
+	ran = [];
+	answers["'rspro:bank.lan/1:0'"] = join('\n', [
+		'{"event":"info","backend":"rspro","reader":"rspro:bank.lan/1:0","server":"bank.lan:9998","client":"0:0","bank":"1:0","mapping":"helper"}',
+		'{"ok":true,"atr":"3B9F96"}',
+		'{"ok":true,"present":true,"powered":true,"backend":"rspro","reader":"rspro:bank.lan/1:0","atr":"3B9F96"}' ]) + '\n';
+	eq(ctl.test_source({}, [ 'rspro:bank.lan/1:0', '--json' ], sys), 0, 'test: a SIM bank slot');
+	eq(ran[0][0], "'/usr/bin/rsim-card' 'rspro:bank.lan/1:0'", 'test: ...the helper as a remsim client, here');
+	ran = [];
+	eq(ctl.test_source({}, [ 'rspro:bank.lan/1:0', 'root@simhost' ], sys), 1, 'test: a SIM bank is not asked over SSH');
+	eq(length(ran), 0, 'test: ...and nothing is run');
+	ran = [];
+	answers["'rspro:bank.lan/1:0' '--rspro-client'"] = answers["'rspro:bank.lan/1:0'"];
+	eq(ctl.test_source({}, [ 'rspro:bank.lan/1:0', '--rspro-client', '10:1', '--rspro-rest-port', '8997', '--json' ], sys), 0,
+	   'test: a SIM bank slot as a given client, on a given REST port');
+	eq(ran[0][0], "'/usr/bin/rsim-card' 'rspro:bank.lan/1:0' '--rspro-client' '10:1' '--rspro-rest-port' '8997'",
+	   'test: ...both passed to the helper');
+	eq(ctl.test_source({}, [ 'rspro:bank.lan/1:0', '--rspro-client', '70000' ], sys), 2, 'test: a client id over 65535 is refused');
+	eq(ctl.test_source({}, [ 'rspro:bank.lan:0/1:0' ], sys), 1, 'test: port 0 is no SIM bank spec');
 }
 
 done('test_ctl_rsim');

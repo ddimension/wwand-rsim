@@ -14,9 +14,16 @@
  * - power and reset: the card stays with its modem, powered; both answer that
  *   ATR again.
  *
- * One card, one registration: unless told to keep it, the modem's radio is
- * switched off (AT+CFUN=4: RF off, the SIM stays reachable) for as long as
- * the card is used elsewhere, and its previous mode is restored at the end.
+ * One card, one registration: unless told to keep it, the modem first
+ * DEREGISTERS (AT+COPS=2, TS 27.007 §7.3: a detach while it still has the
+ * card — the network lets go of the IMSI before the other modem attaches
+ * with it, instead of holding a registration that dropped off), then its
+ * radio is switched off (AT+CFUN=4: RF off, the SIM stays reachable) for as
+ * long as the card is used elsewhere. At the end the radio mode and then the
+ * network selection it had (AT+COPS? before: automatic, or the manual
+ * operator) are restored — COPS=2 would otherwise keep it off the network
+ * with its radio on. Not left to CFUN=4 alone: whether a modem detaches
+ * before RF off is its firmware's choice.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -47,6 +54,9 @@ struct at_backend {
 	bool radio_keep;
 	bool dirty;		/* a command timed out: its answer may still come */
 	int cfun_prev;		/* -1: not changed by us */
+	/* the command that puts its network selection back (AT+COPS=0, or the
+	 * manual operator it had); empty: nothing to put back */
+	char cops_restore[128];
 	char mark[300];		/* where the mode before ours is kept */
 	/* who the modem is and which card it has, read once at the open */
 	char manuf[64], model[64], rev[96], imei[32], iccid[32];
@@ -297,6 +307,86 @@ static int mark_read(const char *path)
 	return v;
 }
 
+/* what else the mark keeps: line 2, the network selection to restore */
+static void mark_read_cops(const char *path, char *out, size_t cap)
+{
+	FILE *f = fopen(path, "r");
+	/* the size of cops_restore: what it holds fits, anything longer is
+	 * not one of ours */
+	char line[128];
+
+	out[0] = '\0';
+	if (!f)
+		return;
+	if (fgets(line, sizeof(line), f) && fgets(line, sizeof(line), f)) {
+		line[strcspn(line, "\r\n")] = '\0';
+		/* only what this file ever holds: an AT+COPS= command */
+		if (!strncmp(line, "AT+COPS=", 8) && !strpbrk(line, ";\\"))
+			snprintf(out, cap, "%s", line);
+	}
+	fclose(f);
+}
+
+/* `+COPS: <mode>[,<format>,"<oper>"[,<AcT>]]` -> the command that sets that
+ * selection again: automatic (0) as it is; manual (1) or manual/automatic
+ * (4) with its operator in the same format and access technology.
+ * Deregistered (2) already, or manual without an operator: nothing ("").
+ * Unreadable: automatic, the usual default — after COPS=2 something has to
+ * bring it back to a network. */
+int atmodem_cops_restore(const char *line, char *out, size_t cap)
+{
+	int mode = -1, fmt = -1, act = -1, n;
+	char oper[64] = "";
+	const char *q;
+
+	out[0] = '\0';
+	if (!line || sscanf(line, "+COPS: %d", &mode) != 1) {
+		snprintf(out, cap, "AT+COPS=0");
+		return 0;
+	}
+	if (mode == 0) {
+		snprintf(out, cap, "AT+COPS=0");
+		return 0;
+	}
+	if (mode != 1 && mode != 4)
+		return 0;
+	q = strchr(line, ',');
+	if (!q || sscanf(q + 1, "%d", &fmt) != 1 || !(q = strchr(q, '"')))
+		return 0;
+	for (n = 0, q++; *q && *q != '"' && n < (int)sizeof(oper) - 1; q++)
+		oper[n++] = *q;
+	oper[n] = '\0';
+	if (*q != '"' || !n || strchr(oper, ';'))
+		return 0;
+	if (sscanf(q + 1, " , %d", &act) == 1)
+		snprintf(out, cap, "AT+COPS=%d,%d,\"%s\",%d", mode, fmt, oper, act);
+	else
+		snprintf(out, cap, "AT+COPS=%d,%d,\"%s\"", mode, fmt, oper);
+	return 0;
+}
+
+/* Deregister, then RF off: the park. A refused or unanswered COPS=2 (not
+ * registered, a modem without it, a detach the network is slow with) is no
+ * reason not to park — CFUN=4 still takes the radio off. cops_ms: at the
+ * open the helper has time (the plugin waits 60 s for its first answer); a
+ * re-park inside a power-up must stay within the plugin's 15 s for that
+ * answer. deregister false: a modem whose selection we have nothing to put
+ * back for (it was off already when we came) gets CFUN=4 alone. */
+static int park(struct at_backend *a, bool deregister, int cops_ms)
+{
+	char err[120] = "";
+	int r;
+
+	if (deregister) {
+		r = at_cmd(a, "AT+COPS=2", NULL, NULL, 0, cops_ms, err, sizeof(err));
+		if (r == RSIM_OK)
+			log_notice("%s: deregistered from the network (AT+COPS=2)", a->be.reader);
+		else
+			log_notice("%s: AT+COPS=2 not taken (%s) — parked with CFUN=4 alone", a->be.reader, err);
+	}
+	return at_cmd(a, "AT+CFUN=4", NULL, NULL, 0, deregister ? 5000 : 15000, NULL, 0);
+}
+
 /* The value of a query answered with one line (+CGMI: "Quectel", or just
  * Quectel): without prefix and quotes; "" when refused. */
 static void at_value(struct at_backend *a, const char *cmd, char *out, size_t cap)
@@ -390,7 +480,7 @@ static int at_power_up(struct rsim_backend *be, uint8_t *atr, size_t *atr_len)
 			/* refused or unanswered: the card is not lent — two modems
 			 * must not register with it — until a later power-up gets
 			 * the radio off */
-			if (at_cmd(a, "AT+CFUN=4", NULL, NULL, 0, 15000, NULL, 0) != RSIM_OK) {
+			if (park(a, a->cops_restore[0] != '\0', 8000) != RSIM_OK) {
 				snprintf(be->detail, RSIM_DETAIL_MAX, "cannot switch the radio of this modem off again (CFUN=%d)", mode);
 				return RSIM_E_IO;
 			}
@@ -460,7 +550,7 @@ static void at_tick(struct rsim_backend *be)
 	if (at_cmd(a, "AT+CFUN?", "+CFUN:", c, sizeof(c), 5000, NULL, 0) == RSIM_OK &&
 	    sscanf(c, "+CFUN: %d", &mode) == 1 && mode != 4 && mode != 0) {
 		log_warn("%s: radio is on again (CFUN=%d) while its card is lent — parking it again", be->reader, mode);
-		at_cmd(a, "AT+CFUN=4", NULL, NULL, 0, 15000, NULL, 0);
+		park(a, a->cops_restore[0] != '\0', 8000);
 	}
 }
 
@@ -490,6 +580,19 @@ static void at_close(struct rsim_backend *be)
 		}
 		if (tries < 2) {
 			log_notice("%s: radio back to CFUN=%d", a->be.reader, a->cfun_prev);
+			/* then its network selection: after COPS=2 it would stay
+			 * off the network with the radio on. A manual operator
+			 * that cannot be set again (out of reach now) falls back
+			 * to automatic rather than to none. */
+			if (a->cops_restore[0]) {
+				if (at_cmd(a, a->cops_restore, NULL, NULL, 0, 30000, NULL, 0) == RSIM_OK)
+					log_notice("%s: network selection back (%s)", a->be.reader, a->cops_restore);
+				else if (strcmp(a->cops_restore, "AT+COPS=0") &&
+					 at_cmd(a, "AT+COPS=0", NULL, NULL, 0, 30000, NULL, 0) == RSIM_OK)
+					log_warn("%s: %s refused — automatic network selection instead", a->be.reader, a->cops_restore);
+				else
+					log_warn("%s: could not restore its network selection (%s)", a->be.reader, a->cops_restore);
+			}
 			unlink(a->mark);
 		} else
 			log_warn("%s: could not restore CFUN=%d — the next run on this port tries again", a->be.reader, a->cfun_prev);
@@ -647,7 +750,24 @@ struct rsim_backend *atmodem_open(const struct at_cfg *cfg)
 			 * "before" is the one to go back to */
 			log_notice("%s: radio still off from an earlier run; CFUN=%d is restored at the end", cfg->dev, kept);
 			a->cfun_prev = kept;
+			mark_read_cops(a->mark, a->cops_restore, sizeof(a->cops_restore));
 		} else if (prev != 4) {
+			char cops[120];
+
+			/* how it chooses its network now, to be put back after
+			 * the deregistration — unless a run before this one
+			 * deregistered it and ended before its radio went off
+			 * (killed, or CFUN=4 timed out): its mark holds the
+			 * selection from before, the modem now says COPS=2 */
+			mark_read_cops(a->mark, a->cops_restore, sizeof(a->cops_restore));
+			if (!a->cops_restore[0]) {
+				if (at_cmd(a, "AT+COPS?", "+COPS:", cops, sizeof(cops), 10000, NULL, 0) != RSIM_OK)
+					cops[0] = '\0';
+				atmodem_cops_restore(cops[0] ? cops : NULL, a->cops_restore, sizeof(a->cops_restore));
+			} else {
+				log_notice("%s: network selection kept from an earlier run: %s", cfg->dev, a->cops_restore);
+			}
+
 			/* the "before" first, on disk: without it a run killed
 			 * after the switch-off would leave the radio off for good */
 			char tmp[320];
@@ -663,7 +783,7 @@ struct rsim_backend *atmodem_open(const struct at_cfg *cfg)
 			if (mfd >= 0 && !(m = fdopen(mfd, "w")))
 				close(mfd);
 			if (mfd >= 0 && m) {
-				ok = fprintf(m, "%d\n", prev) > 0 && fflush(m) == 0 && fsync(fileno(m)) == 0;
+				ok = fprintf(m, "%d\n%s\n", prev, a->cops_restore) > 0 && fflush(m) == 0 && fsync(fileno(m)) == 0;
 				ok = (fclose(m) == 0) && ok && rename(tmp, a->mark) == 0;
 				if (!ok)
 					unlink(tmp);
@@ -675,7 +795,7 @@ struct rsim_backend *atmodem_open(const struct at_cfg *cfg)
 				free(a);
 				return NULL;
 			}
-			int rc = at_cmd(a, "AT+CFUN=4", NULL, NULL, 0, 15000, NULL, 0);
+			int rc = park(a, true, 30000);
 
 			/* confirmed, like a QMI park: the mode read back */
 			if (rc == RSIM_OK) {
@@ -700,8 +820,13 @@ struct rsim_backend *atmodem_open(const struct at_cfg *cfg)
 				 * mode goes only when the modem REFUSED: after a timeout
 				 * it may still switch off late, and the next run must
 				 * know what to switch back to. */
-				if (rc == AT_REFUSED)
+				if (rc == AT_REFUSED) {
 					unlink(a->mark);
+					/* it did deregister: back on the network it
+					 * stays with its card, as before */
+					if (a->cops_restore[0])
+						at_cmd(a, a->cops_restore, NULL, NULL, 0, 30000, NULL, 0);
+				}
 				log_err("%s: cannot switch the radio off (AT+CFUN=4); --at-radio keep if that is intended",
 					cfg->dev);
 				close(a->fd);

@@ -33,6 +33,11 @@ Design notes: [docs/plan.md](docs/plan.md).
   modem, serves its commands.
 - `ctl/rsim.uc` — `wwandctl rsim`: status, the modem firmware switches
   (UIM Remote, SIM Access), probe and donor test.
+- `ctl/rsim_provider.uc` — `wwandctl rsim proxy`, package
+  **wwand-rsim-provider** (depends on wwand-rsim): this router's modem cards
+  lent to another router over SSH. Without it a router lends its cards only
+  to its own modems (a SIM sponsor); a scan from another router says the
+  package is missing there and offers nothing of its modems but an AT port.
 - `luci/` — `luci-app-wwand-rsim`: the configuration page.
 
 ## Use
@@ -81,9 +86,11 @@ Readers: `phoenix:<tty>` (a Phoenix/Smartmouse serial reader with switches),
 software, `rsim_clock` 3580/3680/6000, `rsim_mode` phoenix/smartmouse),
 `pcsc:<name or index>`, `at:<tty>` — the SIM of a modem that wwand does not
 manage (on a SIM host, or on this router), reached over its AT port with
-AT+CSIM (TS 27.007 §8.17). That modem keeps the card; its radio is switched
-off (`AT+CFUN=4`, the SIM stays reachable) while the card is used elsewhere
-and put back as it was afterwards, also when the helper is stopped or its SSH
+AT+CSIM (TS 27.007 §8.17). That modem keeps the card; it deregisters first
+(`AT+COPS=2`, a detach while it still has the card), then its radio is
+switched off (`AT+CFUN=4`, the SIM stays reachable) while the card is used
+elsewhere, and both — radio mode, then network selection — are put back as
+they were afterwards, also when the helper is stopped or its SSH
 link drops. One helper per AT port (a lock; a second one waits up to 20 s,
 long enough for the previous one to finish restoring the radio). A modem
 that rebooted while its card is lent is switched off again on the target's
@@ -134,10 +141,33 @@ home when the proxy ends: at the end of stdin (a dropped SSH link
 included), or — killed hard — when the daemon there sees its process gone
 (within 10 s). A modem there that uses a remote card itself, lends its card
 to a modem there, or is configured as a sponsor there is not lent. This
-needs wwand-rsim on that router (the proxy is part of it); a router with
-only rsim-card has no modems to lend. As a named reader: `option type
+needs **wwand-rsim-provider** on that router (the proxy; it pulls in
+wwand-rsim) — without it, `wwandctl rsim scan` from here says so and lists
+none of its modems' cards, only their AT ports; a router with only
+rsim-card has no modems to lend. As a named reader: `option type
 'wwand'`, `option host`, `option device '<modem>|iccid:<ICCID>'`, and the
 `donor_*` options.
+
+**A card in an osmo-remsim SIM bank:** `rspro:<server>[:<port>]` or
+`rspro:<server>[:<port>]/<bank>:<slot>`. rsim-card is then a remsim
+*client*: it talks RSPRO (osmo-remsim's Remote SIM Protocol — ASN.1/BER in
+IPA frames over TCP) to the remsim-server (port 9998) and to the
+remsim-bankd the server points it to, which owns the card. With a bank slot
+in the spec, the helper maps that slot to this client over the server's
+REST API (port 9997) while it runs, and removes the mapping at the end; a
+slot mapped to another client is refused, one already mapped to our client
+(a run that was killed) is taken as ours and removed at the end too. Without one, it uses whatever the server's operator mapped
+to its client — a mapping that appears later is reported as a card
+inserted, one taken away as removed. The client is `rsim_rspro_client
+'<id>[:<slot>]'` (default `0:0`; two modems using the bank at the same
+time need two), the REST port `rsim_rspro_rest_port`. As a named reader:
+`option type 'rspro'`, `option device '<server>[:<port>]'`, `option bank
+'<bank>:<slot>'`, `option client`, `option rest_port`. It is reached
+directly, never over SSH. `rsim-card` has its own small BER codec — no
+asn1c, no libosmocore; `-DWITH_RSPRO=OFF` builds it without.
+**Not tested against a real osmo-remsim** (none at hand, 2026-09-27): the
+messages follow `asn1/RSPRO.asn`, the REST calls remsim-server's
+`rest_api.c`, and the tests run against a simulated server and bankd.
 
 `rsim-card --list` on a router with wwand-rsim adds its modems' cards
 (`wwandctl rsim proxy --list`): each with its ICCID, IMSI, modem and slot,
@@ -156,7 +186,12 @@ readable by root only) — each with the spec to put into a reader; the ports of
 modems are marked (an `at:` reader there would take the card from under
 wwand; that is the `modem` kind). `wwandctl rsim scan user@simhost` asks a
 SIM host over SSH the same. Underneath: `rsim-card --list`, JSON lines,
-which only looks: nothing is sent to a port.
+which only looks: nothing is sent to a port. The slots of a SIM bank come
+from its server instead: `wwandctl rsim scan --rspro <server>[:port]
+[--rest-port N]` (`rsim-card --list --rspro-server …`) — RSPRO itself has no
+message to list banks or slots (a client only learns the slot mapped to it),
+so this asks the remsim-server's REST API: each bank slot with its spec,
+and to which client it is mapped, if any.
 
 **SSH, restricted to what wwand-rsim needs:** `wwandctl rsim ssh-key
 [user@host]` creates the router's key and prints, per machine the
@@ -292,8 +327,9 @@ let go of it. Generic: the same park for QMI, MBIM and AT/NCM.
 
 **While a card is lent, its modem's radio is off, the SIM left on** — on
 every path: QMI `LOW_POWER`, MBIM radio state off, `AT+CFUN=4` on an NCM
-modem and on an AT port (rsim-card; read back, parked again if something
-switches it on, put back as it was at the end). `CFUN=0` is used only on an
+modem and on an AT port (rsim-card; deregistered with `AT+COPS=2` first,
+read back, parked again if something switches it on, radio and network
+selection put back as they were at the end). `CFUN=0` is used only on an
 NCM modem that refuses 4 (wwand's `modem_ncm`); an `at:` port whose modem
 refuses `CFUN=4`, or does not read back 4, is not lent at all (unless
 `rsim_at_radio keep`). Two modems must never register with one card.
@@ -336,6 +372,7 @@ modems without the passthrough; other Qualcomm modems are untested.
 | `at:` a modem wwand does not manage | Huawei E392 PC UI port, Samsung S20 USB modem | both refuse `AT+CSIM` (CME 4 / Samsung's AT lock) — refused at open, with the reason |
 | `modem:` sponsor on this router | Huawei E392 (QMI) | works, APDU (automatic) |
 | `wwand:` modem on another wwand router | Quectel RG502Q (SIM Access), MeiG SLM770A-R on NCM (APDU over `AT+CSIM`) | works |
+| `rspro:` osmo-remsim SIM bank | simulated remsim-server and bankd only | not tested against osmo-remsim |
 
 **Workarounds** — each found on the hardware above, each covered by a test:
 
@@ -371,8 +408,9 @@ modems without the passthrough; other Qualcomm modems are untested.
 - *AT ports (`at:`):* nothing is sent at scan time. At open: a diagnostic
   port (by the interface's name or Huawei's protocol byte) is refused
   unopened, `AT+CSIM` is probed once and a modem that refuses it is refused
-  with the reason (Samsung's `PACM` lock named as such), the radio is parked
-  with `CFUN=4` and read back — not parked, not lent.
+  with the reason (Samsung's `PACM` lock named as such), the modem
+  deregisters (`COPS=2`) and the radio is parked with `CFUN=4` and read back
+  — not parked, not lent (its network selection then put back).
 - *Slow links:* a command through a remote AT sponsor takes about 1 s (the
   Cudy: SSH, a small CPU, `AT+CSIM`); a client reads ~150–250 commands
   before it registers, so the first registration takes 2–3 minutes. The
@@ -421,6 +459,10 @@ cmake --build build-arm
 `WITH_BLUETOOTH` (default ON) builds the `bt:` backend. It needs no
 library, only the kernel's sockets, and costs about 12 KB (aarch64, -Os);
 `-DWITH_BLUETOOTH=OFF` leaves it out of a minimal build.
+
+`WITH_RSPRO` (default ON) builds the `rspro:` backend, the osmo-remsim
+client. No library either (its own BER codec and HTTP/1.0 for the REST
+calls); `-DWITH_RSPRO=OFF` leaves it out.
 
 `RSIM_STATIC=ON` links with `-static` and takes the **static** link lines from
 pkg-config, so an enabled backend brings its own dependencies along. That is

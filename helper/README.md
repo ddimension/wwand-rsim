@@ -14,6 +14,7 @@ modem's QMI UIM Remote requests to it (`docs/plan.md` §2, §3).
 `-DWITH_PCSC=ON` fails the configure when libpcsclite is missing.
 `WITH_LIBUSB` (AUTO/ON/OFF, libusb-1.0 via pkg-config) adds `wbsm:`.
 `WITH_BLUETOOTH` (ON/OFF, no dependency) adds `bt:`.
+`WITH_RSPRO` (ON/OFF, no dependency) adds `rspro:`.
 `-DRSIM_WERROR=OFF` drops `-Werror` for a compiler newer than this was
 written against. The end-to-end test needs `python3` (standard library only).
 
@@ -24,6 +25,8 @@ written against. The end-to-end test needs `python3` (standard library only).
     rsim-card [-v] [-s] pcsc:<reader-name substring | index>
     rsim-card [-v] [-s] [options] at:<tty>
     rsim-card [-v] [-s] [options] bt:<phone's Bluetooth address>
+    rsim-card [-v] [-s] [options] rspro:<server>[:<port>][/<bank>:<slot>]
+    rsim-card --list --rspro-server <server>[:<port>] [--rspro-rest-port N]
 
 | Option | Default | |
 |---|---|---|
@@ -37,6 +40,8 @@ written against. The end-to-end test needs `python3` (standard library only).
 | `--bt-channel N` | SDP | the phone's SAP RFCOMM channel, 1..30 |
 | `--bt-security L` | `medium` | `high`: a link key with MITM protection required |
 | `--bt-apdu F` | `gsm` | `7816`: send CommandAPDU7816 instead of CommandAPDU |
+| `--rspro-client ID[:SLOT]` | `0:0` | our client id and slot at the remsim-server |
+| `--rspro-rest-port N` | 9997 | the remsim-server's REST API (bank slot mapping, `--list`) |
 
 stdin EOF ends the helper: the card is powered down first, exit status 0.
 
@@ -123,6 +128,58 @@ phones (device class) or devices whose stored services include SAP, with
 `"sap": true|false|null` (null: services never read); nothing is sent to a
 phone.
 
+**osmo-remsim SIM bank** (`rspro:`, `src/remsim.c`, `src/rspro.c`,
+`WITH_RSPRO`): a remsim client. RSPRO is osmo-remsim's ASN.1 module
+(`asn1/RSPRO.asn`, IMPLICIT TAGS, BER; `RsproPDU.version` 2), each message
+in an IPA frame (ip.access's multiplex header: u16 length, 0xEE, extension
+0x07 — not the eIM's IoT Profile Assistant) over TCP. IPA's own signalling
+is answered as an IPA client does (libosmocore's ipa_ccm_rcvmsg_bts_base):
+PING with PONG, ID_GET with ID_RESP (unit name `rsim-card`), ID_ACK not at
+all — a server answers it, so two answering sides would never stop. `src/rspro.c` encodes and decodes by hand only what a client
+needs (the tests check it against hand-built BER). The session:
+ConnectClientReq (identity + client id:slot) to the server (default port
+9998) → ConnectClientRes; the server's ConfigClientIdReq (it may reassign
+the client slot) and ConfigClientBankReq (bank id:slot + bankd ip:port; the
+all-zero address when the mapping is removed; ResetStateReq drops it too)
+are answered `ok`; the client then connects to that bankd with its own
+ConnectClientReq and waits for SetAtrReq, the card's ATR. That connect does
+not block: it runs on while the helper serves (a bankd that drops SYNs
+would otherwise stall stdin and the server's PINGs), 5 s at most, retried
+every 5 s. power_up waits up to 10 s for the ATR (no mapping: `no_card`
+with the reason; no bankd: `io`, the bankd named). An ATR the bankd has
+just sent on its own (it brought the card up) is the answer as it is;
+otherwise — after a power_down, or later — power_up signals a cold start as
+a card emulator would: ClientSlotStatusInd RST active, then released, VCC
+and CLK on, and answers with an ATR the bankd sends within 1.5 s, else the
+one it has; reset the same; power_down RST active, VCC and CLK off. tpdu is one TpduModemToCard (header present, final part) → the
+TpduCardToModem's data, response and SW as the bankd's SCardTransmit
+returned them (25 s timeout; after one the bankd link is dropped and made
+again — an answer names no command, a late one would answer the next). Between requests (every 500 ms) the server's
+and bankd's messages are taken in: a mapping that arrives becomes
+`inserted`, one removed (or a bankd that went away) `removed`; a bankd that
+cannot be reached is tried again every 5 s. The server closing the
+connection ends the helper with 1.
+With `/<bank>:<slot>` in the spec the helper first POSTs
+`{"bank":{"bankId","slotNr"},"client":{"clientId","slotNr"}}` to
+`/api/backend/v1/slotmaps` on the REST port; a refusal is looked up in
+`GET …/slotmaps` (mapped to our client slot: ours — the client slot is the
+reader's identity, and a run that could not clean up, killed or without
+power, must not hold the slot for good — but not removed when the server
+then refuses the client as `identityInUse`: a live session holds it; to
+another client: refused). A slot the server takes away during the session
+is mapped again (at most every 30 s). At the
+end it DELETEs `…/slotmaps/<bank << 16 | slot>`. REST answers up to 1 MiB
+(the JSON token array sized for the answer). `--list --rspro-server` reads `GET /api/backend/v1/banks`
+(`bankId`, `numberOfSlots`, `component_id.name`) and `…/slotmaps`: one line
+per slot, `{"backend":"rspro","spec":"rspro:<server>/<bank>:<slot>",
+"bank","slot","name","bank_state","peer"}` plus `mapped_to` / `map_state`
+when it is mapped, then `{"done":true,"backends":"rspro","slots":N}` with an
+`error` when the server could not be asked. HTTP/1.0 and a small JSON token
+reader (`src/jtok.c`); no library.
+Written from the osmo-remsim sources, **not run against a real
+remsim-server or bankd yet** (2026-09-27); `tests/test_e2e_rspro.py`
+simulates both from the same reading.
+
 **`--serve [SPEC...]`** is the `command=` of an `authorized_keys` line: it
 reads what the SSH client asked for from `SSH_ORIGINAL_COMMAND`, splits it
 into words as a shell would for plain and quoted words (no expansion), and
@@ -138,10 +195,14 @@ rsim-card's own options pass, spelled out. A second reader, `--serve` again,
 an option the proxy lacks, or anything else is refused with a message. `RSIM_TEST_SELF` /
 `RSIM_TEST_WWANDCTL`: what to exec instead, for the tests.
 
-On a router with wwand-rsim, `--list` also passes on the lines of
+On a router with wwand-rsim-provider, `--list` also passes on the lines of
 `wwandctl rsim proxy --list` — the cards of its modems another router can
 borrow — and names `wwand` among the backends (`RSIM_TEST_WWAND_LIST`: the
-command to run instead, for the tests).
+command to run instead, for the tests). On a wwand router without it
+(`/usr/bin/wwandctl` there, `/usr/share/ucode/wwand/ctl/rsim_provider.uc`
+not), the done line carries `"wwand_provider": false` and no card of its
+modems is listed — the scanning router says which package is missing; its
+AT ports are listed as usual.
 
 ## Test hook
 
@@ -171,7 +232,7 @@ FTDI transport) with a real card; Bluetooth SAP with a Galaxy S20 FE and a
 Galaxy A5 (2016); the AT backend's refusals (a diag port, a modem without
 `AT+CSIM`, Samsung's AT lock) — see the top-level README, *What works*.
 
-Not verified on hardware: the libusb FTDI transport's other adapters, real UART timing and parity, the termios2 rate
+Not verified on hardware: the `rspro:` backend against osmo-remsim, the libusb FTDI transport's other adapters, real UART timing and parity, the termios2 rate
 on a USB-serial bridge, the modem-control lines, card-detect polarity, the PC/SC
 backend against pcscd with a card. Not implemented: T=0 character
 repetition when the *card* flags a parity error on a byte we sent (it fails

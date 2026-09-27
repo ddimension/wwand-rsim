@@ -38,8 +38,25 @@ var STATE_LEVEL = { powered: 'ok', failed: 'error' };
 
 var KIND = {
 	pcsc: _('PC/SC reader'), wbsm: _('Smartmouse USB'), tty: _('serial port'), bt: _('phone (Bluetooth)'),
-	wwand: _('modem card'),
+	wwand: _('modem card'), rspro: _('SIM bank'),
 };
+
+/* an osmo-remsim server: host[:port], the port 1..65535 (the plugin's
+   rspro_ok: a value rsim-card refuses would fail every start) */
+var RSPRO_SERVER = /^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(:[0-9]{1,5})?$/;
+
+function rsproServerOk(v) {
+	var m = RSPRO_SERVER.exec(v || '');
+
+	return !!m && (!m[2] || (+m[2].substr(1) >= 1 && +m[2].substr(1) <= 65535));
+}
+
+/* numbers a:b (or a alone when single), each 0..65535 */
+function u16Pair(v, single) {
+	var m = /^([0-9]{1,5})(?::([0-9]{1,5}))?$/.exec(v || '');
+
+	return !!m && (single || m[2] != null) && +m[1] <= 65535 && (m[2] == null || +m[2] <= 65535);
+}
 
 function level(l, text) {
 	var c = { ok: '#2a8a2a', warn: '#b07800', error: '#c0392b' }[l] || 'inherit';
@@ -143,6 +160,10 @@ function readerText(i) {
 	add(i.clock_khz ? _('%d kHz, %s reset').format(i.clock_khz, i.reset_line || '?') : null);
 	add(i.operator ? i.operator + (i.rat ? ' ' + i.rat : '') : null);
 	add(i.iccid ? 'ICCID ' + i.iccid : null);
+	/* a SIM bank: the server, the slot it gave us, who we are there */
+	add(i.server ? _('remsim-server %s').format(i.server) + (i.server_version ? ' (%s %s)'.format(i.server_software || '', i.server_version) : '') : null);
+	add(i.bank && i.server ? _('bank slot %s').format(i.bank) + (i.bankd ? ' ' + _('at %s').format(i.bankd) : '') : null);
+	add(i.client && i.server ? _('as client %s').format(i.client) : null);
 
 	return parts.join(' · ');
 }
@@ -206,6 +227,12 @@ function describe(x) {
 			[ _('Profiles'), x.services ], [ _('Adapter'), x.adapter ? x.adapter + (x.adapter_name ? ' (%s)'.format(x.adapter_name) : '') +
 				(x.adapter_powered === false ? ' — ' + _('off') : '') : null ],
 		]));
+		break;
+	case 'rspro':
+		out.push(E('div', {}, [ E('strong', {}, [ _('bank %s, slot %s').format(x.bank, x.slot) ]), x.name ? ' · "%s"'.format(x.name) : '' ]),
+			x.mapped_to ? E('div', {}, _('mapped to client %s').format(x.mapped_to) + (x.map_state ? ' (%s)'.format(x.map_state) : ''))
+			: E('div', {}, _('free — taken while in use, given back afterwards')));
+		out = out.concat(metaLines([ [ _('Bank'), x.bank_state ], [ _('Bankd'), x.peer ] ]));
 		break;
 	case 'wwand':
 		out.push(E('div', {}, [ E('strong', {}, [ x.iccid || '?' ]), ' · ', _('modem %s').format(x.modem || '?'),
@@ -279,21 +306,23 @@ return view.extend({
 		o.value('bt', _('a paired phone over Bluetooth (SIM Access Profile)'));
 		o.value('modem', _('another modem lends its card (SIM sponsor)'));
 		o.value('wwand', _('a modem of another wwand router lends its card'));
+		o.value('rspro', _('a card in an osmo-remsim SIM bank (RSPRO)'));
 		o.default = 'wbsm';
 		/* written even when left at the default: the section must say what
 		   it is (the plugin assumes the same default, but uci should not
 		   depend on that) */
 		o.rmempty = false;
-		o.description = _('Smartmouse USB: clock and mode are set by software, no driver needed. Phoenix: a serial reader whose clock is set with switches. PC/SC: any CCID reader through pcscd. AT modem: the card in a modem that wwand does not manage — on another machine, or here — reached over its AT port (AT+CSIM). Phone: the SIM of a phone paired over Bluetooth that offers the SIM Access Profile (rSAP) — while it is lent the phone has no network of its own. SIM sponsor: another wwand modem on this router lends the card in it. Another wwand router: one of its modems lends its card the same way, over SSH — that router needs wwand-rsim.');
+		o.description = _('Smartmouse USB: clock and mode are set by software, no driver needed. Phoenix: a serial reader whose clock is set with switches. PC/SC: any CCID reader through pcscd. AT modem: the card in a modem that wwand does not manage — on another machine, or here — reached over its AT port (AT+CSIM). Phone: the SIM of a phone paired over Bluetooth that offers the SIM Access Profile (rSAP) — while it is lent the phone has no network of its own. SIM sponsor: another wwand modem on this router lends the card in it. Another wwand router: one of its modems lends its card the same way, over SSH — that router needs wwand-rsim. SIM bank: a card in an osmo-remsim SIM bank; the router is a remsim client of its remsim-server (RSPRO, not tested against a real one yet).');
 
 		o = s.option(form.Value, 'device', _('Reader'),
-			_('Phoenix: its serial port, e.g. <code>/dev/ttyUSB0</code>. PC/SC: the reader\'s name or index (empty: the first). Smartmouse USB: its USB serial number (empty: the first one). AT modem: its AT port, e.g. <code>/dev/ttyUSB2</code>. Phone: its Bluetooth address, e.g. <code>AA:BB:CC:DD:EE:FF</code> (<code>wwandctl rsim scan</code> lists the paired phones). Another wwand router: its modem\'s name there, or <code>iccid:</code> and the card\'s ICCID — <code>wwandctl rsim scan user@host</code> lists them.'));
+			_('Phoenix: its serial port, e.g. <code>/dev/ttyUSB0</code>. PC/SC: the reader\'s name or index (empty: the first). Smartmouse USB: its USB serial number (empty: the first one). AT modem: its AT port, e.g. <code>/dev/ttyUSB2</code>. Phone: its Bluetooth address, e.g. <code>AA:BB:CC:DD:EE:FF</code> (<code>wwandctl rsim scan</code> lists the paired phones). Another wwand router: its modem\'s name there, or <code>iccid:</code> and the card\'s ICCID — <code>wwandctl rsim scan user@host</code> lists them. SIM bank: the remsim-server, <code>host</code> or <code>host:port</code> (default port 9998).'));
 		o.depends('type', 'wbsm');
 		o.depends('type', 'phoenix');
 		o.depends('type', 'pcsc');
 		o.depends('type', 'at');
 		o.depends('type', 'bt');
 		o.depends('type', 'wwand');
+		o.depends('type', 'rspro');
 		o.optional = true;
 		o.validate = function(sid, v) {
 			var t = this.section.formvalue(sid, 'type');
@@ -306,8 +335,35 @@ return view.extend({
 				return _('The modem on that router, or iccid:<ICCID>');
 			if (t == 'bt' && !/^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$/.test(v || ''))
 				return _('A phone needs its Bluetooth address (AA:BB:CC:DD:EE:FF)');
+			if (t == 'rspro' && !rsproServerOk(v))
+				return _('A SIM bank needs its remsim-server (host or host:port)');
 			return true;
 		};
+
+		o = s.option(form.Value, 'bank', _('Bank slot'),
+			_('<code>bank:slot</code>, e.g. <code>1:0</code>: wwand-rsim maps that slot to this router at the remsim-server (over its REST API) while the card is in use, and removes the mapping afterwards. Empty: the card the server\'s operator mapped to the client below.'));
+		o.depends('type', 'rspro');
+		o.optional = true;
+		o.placeholder = _('mapped by the operator');
+		o.validate = function(sid, v) {
+			return (!v || u16Pair(v, false)) ? true : _('Expecting bank:slot, each 0..65535');
+		};
+
+		o = s.option(form.Value, 'client', _('Client'),
+			_('Who this router is at the remsim-server: <code>id</code> or <code>id:slot</code>. Each modem using a SIM bank at the same time needs its own.'));
+		o.depends('type', 'rspro');
+		o.optional = true;
+		o.placeholder = '0:0';
+		o.validate = function(sid, v) {
+			return (!v || u16Pair(v, true)) ? true : _('Expecting id or id:slot, each 0..65535');
+		};
+
+		o = s.option(form.Value, 'rest_port', _('REST port'),
+			_('The remsim-server\'s REST API, used to map a bank slot and to list the slots.'));
+		o.depends('type', 'rspro');
+		o.datatype = 'port';
+		o.optional = true;
+		o.placeholder = '9997';
 
 		o = s.option(form.ListValue, 'radio', _('That modem\'s radio'),
 			_('<strong>Off</strong> while its card is used elsewhere (<code>AT+CFUN=4</code>; the SIM stays reachable), back to what it was afterwards — two modems must never register with the same card. <strong>Keep</strong> only when that modem is off the network anyway.'));
@@ -330,7 +386,7 @@ return view.extend({
 		o.optional = true;
 
 		o = s.option(form.Value, 'host', _('On another machine'),
-			_('<code>user@host</code> when the reader is attached to another machine: the router runs <code>rsim-card</code> there over SSH. That machine needs rsim-card and access to the reader, and the router\'s SSH key (shown below) in the user\'s <code>~/.ssh/authorized_keys</code>. Leave empty for a reader on this router.<br />Another wwand router: required — the router runs <code>wwandctl rsim proxy</code> there, which needs <strong>wwand-rsim</strong> installed on it, and the key in its <code>/etc/dropbear/authorized_keys</code> (root).'));
+			_('<code>user@host</code> when the reader is attached to another machine: the router runs <code>rsim-card</code> there over SSH. That machine needs rsim-card and access to the reader, and the router\'s SSH key (shown below) in the user\'s <code>~/.ssh/authorized_keys</code>. Leave empty for a reader on this router.<br />Another wwand router: required — the router runs <code>wwandctl rsim proxy</code> there, which needs <strong>wwand-rsim-provider</strong> installed on it, and the key in its <code>/etc/dropbear/authorized_keys</code> (root).'));
 		o.depends('type', 'wbsm');
 		o.depends('type', 'phoenix');
 		o.depends('type', 'pcsc');
@@ -474,6 +530,10 @@ return view.extend({
 
 			var hostInput = E('input', { 'class': 'cbi-input-text', 'type': 'text', 'placeholder': _('user@host — empty: this router'),
 				'style': 'width:18em' });
+			var bankInput = E('input', { 'class': 'cbi-input-text', 'type': 'text', 'placeholder': _('remsim-server host[:port]'),
+				'style': 'width:18em' });
+			var restInput = E('input', { 'class': 'cbi-input-text', 'type': 'text', 'placeholder': _('REST port 9997'),
+				'style': 'width:8em' });
 
 			return E([], [
 				E('div', { 'class': 'cbi-section' }, [
@@ -491,6 +551,16 @@ return view.extend({
 							E('button', { 'class': 'btn cbi-button cbi-button-action', 'click': ui.createHandlerFn(view, function() {
 								return view.scan(hostInput.value.trim());
 							}) }, _('Scan')),
+						]),
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title' }, _('SIM bank')),
+						E('div', { 'class': 'cbi-value-field' }, [
+							bankInput, ' ', restInput, ' ',
+							E('button', { 'class': 'btn cbi-button cbi-button-action', 'click': ui.createHandlerFn(view, function() {
+								return view.scanBank(bankInput.value.trim(), restInput.value.trim());
+							}) }, _('Ask')),
+							E('div', { 'class': 'cbi-value-description' }, _('The slots of an osmo-remsim SIM bank, from its remsim-server\'s REST API — RSPRO itself has no way to list them.')),
 						]),
 					]),
 					view.scanBox,
@@ -596,6 +666,9 @@ return view.extend({
 			else if (st.lendable === false && st.lend_why) {
 				lending.push(E('span', { 'style': 'opacity:.75;font-size:92%' }, [ _('not lendable: %s').format(st.lend_why) ]));
 			}
+			else if (st.lendable && st.lend_provider === false) {
+				lending.push(E('span', { 'style': 'opacity:.75;font-size:92%' }, _('to modems of this router only — wwand-rsim-provider is not installed')));
+			}
 			else if (st.lendable) {
 				lending.push(E('span', { 'style': 'opacity:.75;font-size:92%' }, _('can be lent to another router')));
 			}
@@ -681,12 +754,41 @@ return view.extend({
 			});
 	},
 
+	/* wwandctl rsim scan --rspro: an osmo-remsim server's bank slots */
+	scanBank: function(server, rest) {
+		var view = this;
+
+		if (!rsproServerOk(server) || (rest && !(/^[0-9]{1,5}$/.test(rest) && +rest >= 1 && +rest <= 65535))) {
+			dom.content(this.scanBox, level('error', _('Expecting host[:port], and a port number for REST')));
+			return Promise.resolve();
+		}
+
+		dom.content(this.scanBox, E('p', { 'class': 'spinning' }, [ _('Asking %s…').format(server) ]));
+
+		return fs.exec('/usr/bin/wwandctl', [ 'rsim', 'scan', '--rspro', server ].concat(rest ? [ '--rest-port', rest ] : []).concat([ '--json' ]))
+			.then(function(res) {
+				var r = null;
+
+				try { r = JSON.parse(res.stdout || ''); } catch (e) { r = null; }
+
+				if (r && r.ok) {
+					r.rest_port = rest || null;
+					return view.renderScan(r, null);
+				}
+
+				dom.content(view.scanBox, level('error', (r && r.error) || (res.stderr || '').trim() || _('no answer')));
+			}).catch(function(e) {
+				dom.content(view.scanBox, level('error', _('Scan failed: %s').format(e.message)));
+			});
+	},
+
 	renderScan: function(r, host) {
 		var view = this;
 		var rows = (r.readers || []).map(function(x) {
 			var what = describe(x);
 			var blocked = !x.spec ? _('not a card source')
 				: x.in_use ? _('in use: %s').format(x.in_use)
+				: x.mapped_to ? _('in use by client %s').format(x.mapped_to)
 				: (x.backend == 'wwand' && x.lendable === false) ? _('not now: %s').format(x.why || '?')
 				: null;
 
@@ -699,22 +801,26 @@ return view.extend({
 					   speaks to a port on its own; a wwand router's card is
 					   checked by that router (its lend_check) */
 					(x.backend != 'wwand') ? E('button', { 'class': 'btn cbi-button cbi-button-action', 'style': 'margin:1px',
-						'disabled': (x.in_use || !x.spec) ? true : null,
+						'disabled': (x.in_use || x.mapped_to || !x.spec) ? true : null,
 						'title': _('Open this source once, power its card up and hand it back — for a phone, it lends its SIM for a moment'),
-						'click': ui.createHandlerFn(view, function() { return view.testSource(x, host); }) }, _('Test')) : '',
+						'click': ui.createHandlerFn(view, function() { return view.testSource(x, host, r.rest_port); }) }, _('Test')) : '',
 					E('button', { 'class': 'btn cbi-button cbi-button-add', 'disabled': blocked ? true : null,
 						'title': _('Create a SIM reader for this (save and apply to use it)'),
-						'click': ui.createHandlerFn(view, function() { return view.addReader(x, host); }) }, _('Add')),
+						'click': ui.createHandlerFn(view, function() { return view.addReader(x, host, r.rest_port); }) }, _('Add')),
 				]),
 			]);
 		});
 
 		dom.content(this.scanBox, [
 			E('div', { 'style': 'opacity:.75;font-size:92%' }, [
-				_('rsim-card backends %s: %s').format(host ? _('on %s').format(host) : _('here'), (r.backends || []).join(', ')),
+				r.server ? _('SIM bank slots at remsim-server %s').format(r.server)
+				: _('rsim-card backends %s: %s').format(host ? _('on %s').format(host) : _('here'), (r.backends || []).join(', ')),
 				r.note ? E('div', {}, [ r.note ]) : '',
 				r.bt_adapters ? E('div', {}, [ _('Bluetooth adapters: %s').format(r.bt_adapters) ]) : '',
 			]),
+			/* a wwand router without wwand-rsim-provider: its modems' cards
+			   are not offered (an AT port of one still is) */
+			r.provider_hint ? E('div', { 'class': 'alert-message warning' }, [ r.provider_hint ]) : '',
 			rows.length ? E('table', { 'class': 'table' }, [
 				E('tr', { 'class': 'tr table-titles' }, [
 					E('th', { 'class': 'th' }, _('Kind')), E('th', { 'class': 'th' }, _('Source')),
@@ -742,14 +848,16 @@ return view.extend({
 	},
 
 	/* wwandctl rsim test: one source, opened like a session */
-	testSource: function(x, host) {
+	testSource: function(x, host, restPort) {
 		/* the title is set as HTML by showModal: a text node for a spec from
 		   a remote scan */
 		var title = E('span', {}, [ _('Test %s').format(x.spec) ]);
 
 		ui.showModal(title, [ E('p', { 'class': 'spinning' }, _('Opening it…')) ]);
 
-		return fs.exec('/usr/bin/wwandctl', [ 'rsim', 'test', x.spec ].concat(host ? [ host ] : []).concat([ '--json' ]))
+		/* a SIM bank found on another REST port: the test maps it there too */
+		return fs.exec('/usr/bin/wwandctl', [ 'rsim', 'test', x.spec ].concat(host ? [ host ] : [])
+			.concat(restPort && x.backend == 'rspro' ? [ '--rspro-rest-port', restPort ] : []).concat([ '--json' ]))
 			.then(function(res) {
 				var r = null;
 
@@ -769,20 +877,28 @@ return view.extend({
 	},
 
 	/* a scan row -> a new wwand_simreader, staged in the form */
-	addReader: function(x, host) {
+	addReader: function(x, host, restPort) {
 		var m = this.map;
 		var view = this;
 		var i = x.spec.indexOf(':');
 		var kind = x.spec.substr(0, i), rest = x.spec.substr(i + 1);
 		var o = { 'modem': { type: 'modem', donor: rest } }[kind] || { type: kind, device: rest };
 
+		/* a SIM bank slot: rspro:<server>/<bank>:<slot> */
+		if (kind == 'rspro') {
+			o = { type: 'rspro', device: rest.substr(0, rest.lastIndexOf('/')), bank: rest.substr(rest.lastIndexOf('/') + 1) };
+			if (restPort)
+				o.rest_port = restPort;
+		}
+
 		if (host && kind != 'modem')
 			o.host = host;
 		if (kind == 'pcsc' && !rest)
 			delete o.device;
 
-		var base = (kind == 'bt' ? 'phone' : kind == 'wwand' ? 'remote' : kind) + '_' +
-			((x.backend == 'wwand' ? (x.iccid || '').slice(-6) : (x.name || rest || '')).replace(/[^A-Za-z0-9]/g, '').slice(-8) || 'x');
+		var base = (kind == 'bt' ? 'phone' : kind == 'wwand' ? 'remote' : kind == 'rspro' ? 'bank' : kind) + '_' +
+			((x.backend == 'wwand' ? (x.iccid || '').slice(-6) : (kind == 'rspro') ? 'b%ss%s'.format(x.bank, x.slot)
+			  : (x.name || rest || '')).replace(/[^A-Za-z0-9]/g, '').slice(-8) || 'x');
 		var name = base, k = 2;
 
 		while (uci.get('network', name))
@@ -857,7 +973,8 @@ return view.extend({
 							try { o = JSON.parse(r.stdout || ''); } catch (e) { o = null; }
 
 							dom.content(res, (o && o.ok)
-								? level('ok', _('Works: rsim-card there answers (backends: %s).').format((o.backends || []).join(', ')))
+								? [ level('ok', _('Works: rsim-card there answers (backends: %s).').format((o.backends || []).join(', '))),
+								    o.provider_hint ? level('warn', o.provider_hint) : '' ]
 								: view.failure(h, (o && o.error) || _('no answer'), o && o.detail, o && o.hint));
 						});
 					}) }, _('Test')),

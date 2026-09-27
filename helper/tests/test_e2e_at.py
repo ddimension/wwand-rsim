@@ -34,7 +34,8 @@ def check(cond, what):
 class FakeModem(threading.Thread):
     """Answers AT on the master side: CFUN, CPIN, CSIM, like a Quectel."""
 
-    def __init__(self, fd, card=True, cfun=1, urc=False, cpin_err=None, csim_err=None, cfun_refuse=False):
+    def __init__(self, fd, card=True, cfun=1, urc=False, cpin_err=None, csim_err=None, cfun_refuse=False,
+                 cops='+COPS: 0,0,"Telekom.de",7', cops_refuse=False):
         super().__init__(daemon=True)
         self.fd = fd
         self.card = card
@@ -46,6 +47,9 @@ class FakeModem(threading.Thread):
         self.cpin_err = cpin_err
         self.csim_err = csim_err
         self.cfun_refuse = cfun_refuse
+        self.cops = cops            # the +COPS? answer: how it selects its network
+        self.cops_refuse = cops_refuse
+        self.cops_set = []          # every AT+COPS=… it took
 
     def say(self, *lines):
         os.write(self.fd, b"".join(b"\r\n" + l.encode() + b"\r\n" for l in lines))
@@ -88,6 +92,14 @@ class FakeModem(threading.Thread):
             if not getattr(self, "cfun_stuck", False):  # a modem that says OK and does not do it
                 self.cfun = int(cmd[8:])
             return self.say("OK")
+        if cmd == "AT+COPS?":
+            return self.say(self.cops, "OK")
+        if cmd.startswith("AT+COPS="):
+            if self.cops_refuse:
+                return self.say("+CME ERROR: 30")
+            self.cops_set.append(cmd[8:])
+            self.cops = "+COPS: 2" if cmd == "AT+COPS=2" else "+COPS: " + cmd[8:]
+            return self.say("OK")
         if cmd == "AT+CPIN?":
             if self.cpin_err:
                 return self.say(self.cpin_err)
@@ -126,7 +138,7 @@ class FakeModem(threading.Thread):
 
 
 class Rig:
-    def __init__(self, args=(), reuse=None, **modem):
+    def __init__(self, args=(), reuse=None, premark=None, **modem):
         if reuse:
             # the same modem on the same port, for a second helper run
             self.master, self.slave, self.modem = reuse.master, reuse.slave, reuse.modem
@@ -136,6 +148,10 @@ class Rig:
             tty.setraw(self.slave)
             self.modem = FakeModem(self.master, **modem)
             self.modem.start()
+        if premark is not None:
+            # what a run before this one left: its mark file
+            with open("/tmp/rsim-card-cfun-" + os.ttyname(self.slave).replace("/", "_"), "w") as f:
+                f.write(premark)
         self.proc = subprocess.Popen(
             [BIN, "-v"] + list(args) + ["at:" + os.ttyname(self.slave)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -187,8 +203,52 @@ check(st.get("modem_manufacturer") == "Quectel" and st.get("modem_model") == "EG
       "status: who the modem is (%r)" % st)
 check(st.get("iccid") == "8949020000184496711", "status: its card's ICCID, through the vendor command, F dropped (%r)" % st.get("iccid"))
 check(getattr(rig, "info", {}).get("modem_model") == "EG06", "info event after the open: the same")
+log = [c for c in rig.modem.log if c.startswith(("AT+COPS", "AT+CFUN="))]
+check(log[:3] == ["AT+COPS?", "AT+COPS=2", "AT+CFUN=4"],
+      "park: its network selection read, deregistered (COPS=2), THEN the radio off (%r)" % log)
 rig.close()
 check(rig.modem.cfun == 1, "radio: back to the mode it had (CFUN=1) at the end")
+log = [c for c in rig.modem.log if c.startswith(("AT+COPS", "AT+CFUN="))]
+check(log[-2:] == ["AT+CFUN=1", "AT+COPS=0"] and rig.modem.cops == "+COPS: 0",
+      "end: the radio on, then automatic network selection again (%r)" % log[-2:])
+
+# --- a manual operator comes back as it was --------------------------------------
+rig = Rig(cops='+COPS: 1,2,"26201",7')
+rig.ask({"op": "power_up"})
+check(rig.modem.cops == "+COPS: 2", "manual: deregistered")
+rig.close()
+check(rig.modem.cops_set[-1] == '1,2,"26201",7', "manual: the same operator, format and AcT again (%r)" % rig.modem.cops_set)
+
+# --- deregistered already: nothing to put back -----------------------------------
+rig = Rig(cops="+COPS: 2")
+rig.ask({"op": "power_up"})
+rig.close()
+check(rig.modem.cops_set == ["2"], "already deregistered: left so at the end (%r)" % rig.modem.cops_set)
+
+# --- deregistered, but the radio refuses to go off: back on the network ------------
+rig = Rig(cfun_refuse=True)
+rig.ask({"op": "power_up"}, timeout=10)
+try:
+    rig.proc.wait(20)
+except subprocess.TimeoutExpired:
+    pass
+check(rig.proc.returncode == 1 and rig.modem.cops_set == ["2", "0"],
+      "CFUN=4 refused: not lent, and its network selection put back (%r)" % rig.modem.cops_set)
+rig.modem.running = False
+
+# --- a run before deregistered and was killed before CFUN=4: its mark wins ------
+rig = Rig(premark="1\nAT+COPS=0\n", cops="+COPS: 2")
+rig.ask({"op": "power_up"})
+rig.close()
+check(rig.modem.cops_set[-1:] == ["0"] and rig.modem.cops == "+COPS: 0",
+      "an earlier run's mark: its selection comes back, not the COPS=2 it left (%r)" % rig.modem.cops_set)
+
+# --- a modem that refuses COPS=2 is still parked ---------------------------------
+rig = Rig(cops_refuse=True)
+up = rig.ask({"op": "power_up"})
+check(up and up.get("ok") and rig.modem.cfun == 4, "COPS=2 refused: parked with CFUN=4 alone (%r)" % up)
+rig.close()
+check(rig.modem.cfun == 1, "COPS=2 refused: radio back at the end")
 
 # --- a stop signal restores the radio too (an SSH link that dropped) -----------
 rig = Rig()
@@ -215,6 +275,8 @@ up = rig2.ask({"op": "power_up"})
 check(up and up.get("ok"), "after SIGKILL: the next run works")
 rig2.close()
 check(rig2.modem.cfun == 1, "after SIGKILL: the next run switches the radio back on at its end (kept mode 1)")
+check(rig2.modem.cops_set[-1:] == ["0"] and rig2.modem.cops == "+COPS: 0",
+      "after SIGKILL: ...and its network selection from the kept file, not the COPS=2 it finds (%r)" % rig2.modem.cops_set)
 rig.modem.running = False
 
 # --- one helper per port -------------------------------------------------------------
@@ -273,8 +335,12 @@ rig.close()
 rig = Rig()
 rig.ask({"op": "power_up"})
 rig.modem.cfun = 1                               # RDY: back in its default mode
+rig.modem.cops = '+COPS: 0,0,"Telekom.de",7'   # ...and registered again
+rig.modem.log.clear()
 rig.ask({"op": "reset"})
 check(rig.modem.cfun == 4, "reboot: the next reset from the target switches its radio off again")
+log = [c for c in rig.modem.log if c.startswith(("AT+COPS=", "AT+CFUN="))]
+check(log == ["AT+COPS=2", "AT+CFUN=4"], "reboot: deregistered again before the radio goes off (%r)" % log)
 rig.close()
 check(rig.modem.cfun == 1, "reboot: ...and it is still restored at the end")
 
@@ -311,6 +377,7 @@ check(bad.returncode == 2, "an --at-baud the port cannot take is refused")
 rig = Rig(args=["--at-radio", "keep"])
 rig.ask({"op": "power_up"})
 check(not any(c.startswith("AT+CFUN") for c in rig.modem.log), "--at-radio keep: no CFUN at all")
+check(not any(c.startswith("AT+COPS") for c in rig.modem.log), "--at-radio keep: no deregistration either")
 rig.close()
 
 # --- no card in that modem -----------------------------------------------------------

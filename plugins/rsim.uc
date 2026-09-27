@@ -39,7 +39,39 @@ function helper_found()
 // changes (docs/plan.md §3.3). The router's key lives here; `wwandctl rsim
 // ssh-key` creates it.
 const SSH_KEY_DIR = '/etc/wwand/rsim';
+// rspro: a card in an osmo-remsim SIM bank; the helper is the remsim client
+// and reaches the server itself, so it is never run over SSH
 const LOCAL_READER = /^((phoenix|pcsc|at|bt):.|wbsm:)/;
+const RSPRO_READER = /^rspro:(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(:[0-9]{1,5})?(\/[0-9]{1,5}:[0-9]{1,5})?$/;
+
+// the numbers too, as rsim-card checks them: a port 1..65535, an id or a
+// slot 0..65535 — a value it refuses would fail every start of the reader
+function port_ok(v)
+{
+	return match(v ?? '', /^[0-9]{1,5}$/) && +v >= 1 && +v <= 65535;
+}
+
+function rspro_ok(r)
+{
+	let m = match(r ?? '', RSPRO_READER);
+
+	if (!m)
+		return false;
+	if (m[2] && !port_ok(substr(m[2], 1)))
+		return false;
+
+	return !m[3] || length(filter(split(substr(m[3], 1), ':'), (x) => +x > 65535)) == 0;
+}
+
+// <client id>[:<slot>]
+function rspro_client_ok(v)
+{
+	return !!match(v ?? '', /^[0-9]{1,5}(:[0-9]{1,5})?$/) && length(filter(split(v, ':'), (x) => +x > 65535)) == 0;
+}
+
+// wwand-rsim-provider's module: installed or not, for the status (whether
+// another router can be served)
+const PROVIDER_PATH = '/usr/share/ucode/wwand/ctl/rsim_provider.uc';
 // a modem's card on another wwand router: `wwand:<modem>` or
 // `wwand:iccid:<ICCID>` — only over SSH (here it is `modem:<name>`)
 const WWAND_READER = /^wwand:([A-Za-z0-9_]+|iccid:[0-9A-Fa-f]{18,20})$/;
@@ -231,7 +263,10 @@ const HELPER_TIMEOUT_MS = 15000;
 // connects and waits for the phone to grant SIM access — which may ask its
 // user — before the first power-up can be answered. A card on another wwand
 // router (wwand:) likewise: SSH, then that router's SIM Access link and the
-// park of its radio.
+// park of its radio. A SIM bank (rspro:) too: the mapping over REST, the
+// remsim-server's answer, then the bankd and its ATR. And another modem's AT
+// port (at:): its open deregisters that modem from the network (AT+COPS=2,
+// the network's detach) before its radio goes off.
 const BT_FIRST_TIMEOUT_MS = 60000;
 
 // A card lent to another router (`wwandctl rsim proxy`, run here over SSH):
@@ -311,10 +346,13 @@ function bytes(h)
 // network) as the plugin options a modem would carry, so a modem can say
 // `option rsim '<name>'` instead of spelling the reader out — and the reader
 // is defined once, however often it is moved between modems.
-//   type    wbsm | phoenix | pcsc | at | bt | modem | wwand
+//   type    wbsm | phoenix | pcsc | at | bt | modem | wwand | rspro
 //   device  tty (phoenix, at), reader name/index (pcsc), USB serial (wbsm),
 //           the phone's Bluetooth address (bt), the modem or iccid:<ICCID>
-//           on the other router (wwand)
+//           on the other router (wwand), the remsim-server[:port] (rspro)
+//   bank    (rspro) <bank>:<slot>: the helper maps that slot to us while
+//           it runs; unset: whatever the server's operator mapped to client
+//   client  (rspro) our <client id>[:<slot>] at the server, default 0:0
 //   host    user@host: the reader is on that machine, reached over SSH
 //   donor   (type modem) the modem that lends its card; donor_mode sap|apdu
 //           (unset: SIM Access, APDU over AT+CSIM on a donor without QMI UIM)
@@ -345,6 +383,15 @@ function reader_options(r)
 
 		spec = sprintf('ssh:%s:wwand:%s', r.host, r.device);
 	}
+	else if (t == 'rspro') {
+		// a card in an osmo-remsim SIM bank, the server reached directly
+		spec = 'rspro:' + (r.device ?? '') + (length(r.bank ?? '') ? '/' + r.bank : '');
+
+		if (!length(r.device ?? '') || !rspro_ok(spec))
+			return { error: 'a SIM bank needs `option device` (the remsim-server, host[:port]) and optionally `option bank` (<bank>:<slot>)' };
+		if (length(r.host ?? ''))
+			return { error: 'a SIM bank is reached directly, not over SSH (`option host` is not for it)' };
+	}
 	else if (t == 'wbsm' || t == 'pcsc' || t == 'phoenix' || t == 'at' || t == 'bt') {
 		if (t == 'phoenix' && !length(r.device ?? ''))
 			return { error: 'a Phoenix reader needs `option device` (its serial port)' };
@@ -371,6 +418,7 @@ function reader_options(r)
 		rsim_clock: r.clock, rsim_mode: r.mode, rsim_reset: r.reset, rsim_detect: r.detect,
 		rsim_at_radio: r.radio, rsim_at_baud: r.baud,
 		rsim_bt_channel: r.channel, rsim_bt_security: r.security, rsim_bt_apdu: r.apdu,
+		rsim_rspro_client: r.client, rsim_rspro_rest_port: r.rest_port,
 		rsim_ssh_port: r.port, rsim_ssh_key: r.key, rsim_ssh_helper: r.helper,
 		rsim_donor_mode: r.donor_mode, rsim_donor_slot: r.donor_slot,
 		rsim_donor_cond: r.donor_cond, rsim_donor_apdu: r.donor_apdu,
@@ -417,7 +465,7 @@ function cfg_of(ext)
 		// a modem's card on ANOTHER wwand router, lent by its wwand-rsim
 		proxy = (substr(remote.reader, 0, 6) == 'wwand:');
 	}
-	else if (!match(r, LOCAL_READER))
+	else if (!match(r, LOCAL_READER) && !rspro_ok(r))
 		return null;
 
 	let slot = +(ext.rsim_slot ?? 1);
@@ -443,6 +491,8 @@ function cfg_of(ext)
 		bt_channel: (+ext.rsim_bt_channel >= 1 && +ext.rsim_bt_channel <= 30) ? +ext.rsim_bt_channel : null,
 		bt_security: (ext.rsim_bt_security == 'high') ? 'high' : null,
 		bt_apdu: (ext.rsim_bt_apdu == '7816') ? '7816' : null,
+		rspro_client: rspro_client_ok(ext.rsim_rspro_client) ? ext.rsim_rspro_client : null,
+		rspro_rest_port: port_ok(ext.rsim_rspro_rest_port) ? +ext.rsim_rspro_rest_port : null,
 		// a modem's card on another wwand router: lent the way a donor here
 		// lends it (the same options), by `wwandctl rsim proxy` over there
 		proxy: proxy ? {
@@ -520,6 +570,15 @@ function helper_argv(cfg, path, sys)
 			push(argv, '--bt-security', cfg.bt_security);
 		if (cfg.bt_apdu != null)
 			push(argv, '--bt-apdu', cfg.bt_apdu);
+	}
+
+	// a SIM bank: who we are at the remsim-server, and its REST port for
+	// the mapping the helper makes when the spec names a bank slot
+	if (substr(reader, 0, 6) == 'rspro:') {
+		if (cfg.rspro_client != null)
+			push(argv, '--rspro-client', cfg.rspro_client);
+		if (cfg.rspro_rest_port != null)
+			push(argv, '--rspro-rest-port', sprintf('%d', cfg.rspro_rest_port));
 	}
 
 	if (!cfg.ssh)
@@ -1998,7 +2057,9 @@ function create(deps)
 
 				s.atr = res.atr;
 				then();
-			}, (substr(cfg.local_reader ?? '', 0, 3) == 'bt:' || cfg.proxy) ? BT_FIRST_TIMEOUT_MS : null);
+			}, (index([ 'bt:', 'at:' ], substr(cfg.local_reader ?? '', 0, 3)) >= 0 ||
+			    substr(cfg.local_reader ?? '', 0, 6) == 'rspro:' || cfg.proxy)
+				? BT_FIRST_TIMEOUT_MS : null);
 		};
 
 		let offer = () => {
@@ -2667,6 +2728,9 @@ function create(deps)
 					lendable: !refused,
 					lend_why: refused,
 					lend_hold: !!lend_hold[ref],
+					// whether another router can be served at all: the
+					// proxy is package wwand-rsim-provider's
+					lend_provider: !!fs.access(PROVIDER_PATH),
 					enabled: !!cfg,
 					reader_name: cfg?.reader_name ?? ext?.rsim ?? null,
 					reader: cfg?.reader ?? null,
@@ -2743,6 +2807,9 @@ return {
 	sfi_access: sfi_access,
 	csim_answer: csim_answer,
 	ssh_split: ssh_split,
+	rspro_ok: rspro_ok,
+	rspro_client_ok: rspro_client_ok,
+	port_ok: port_ok,
 	SSH_KEY_DIR: SSH_KEY_DIR,
 	segments: segments,
 	hexs: hexs,
@@ -2750,7 +2817,7 @@ return {
 
 	name: 'rsim',
 	options: [ 'rsim_reader', 'rsim_slot', 'rsim_clock', 'rsim_reset', 'rsim_detect', 'rsim_mode', 'rsim_at_radio', 'rsim_at_baud',
-	           'rsim_bt_channel', 'rsim_bt_security', 'rsim_bt_apdu', 'rsim_sap_auto',
+	           'rsim_bt_channel', 'rsim_bt_security', 'rsim_bt_apdu', 'rsim_sap_auto', 'rsim_rspro_client', 'rsim_rspro_rest_port',
 	           'rsim_ssh_port', 'rsim_ssh_key', 'rsim_ssh_helper', 'rsim_donor_mode', 'rsim_donor_slot', 'rsim_donor_cond', 'rsim_donor_apdu',
 	           // a named SIM reader (config wwand_simreader) instead of the above
 	           'rsim' ],

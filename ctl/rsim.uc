@@ -97,6 +97,10 @@ function reader_text(i)
 	add(i.clock_khz ? sprintf('%d kHz, %s reset', i.clock_khz, i.reset_line ?? '?') : null);
 	add(i.operator ? sprintf('%s%s', i.operator, i.rat ? ' ' + i.rat : '') : null);
 	add(i.iccid ? 'ICCID ' + i.iccid : null);
+	// a SIM bank: the server, the slot it gave us, who we are there
+	add(i.server ? sprintf('remsim-server %s%s', i.server, i.server_version ? ' (' + (i.server_software ?? '') + ' ' + i.server_version + ')' : '') : null);
+	add(i.bank ? sprintf('bank slot %s%s', i.bank, i.bankd ? ' at ' + i.bankd : '') : null);
+	add(i.server && i.client ? 'as client ' + i.client : null);
 	add(i.by_id);
 
 	return length(parts) ? join(' · ', parts) : (i.backend ?? '?');
@@ -321,6 +325,8 @@ function reader_where(r)
 	return (r.type == 'modem')
 		? sprintf('modem %s lends its card (%s)', r.donor ?? '?',
 		          (index([ 'sap', 'apdu' ], r.donor_mode) >= 0) ? r.donor_mode : 'auto')
+		: (r.type == 'rspro')
+		? sprintf('SIM bank at %s, %s', r.device ?? '?', length(r.bank ?? '') ? 'slot ' + r.bank : 'as mapped to client ' + (r.client ?? '0:0'))
 		: sprintf('%s%s%s', r.type ?? '?', length(r.device ?? '') ? ' ' + r.device : '',
 		          length(r.host ?? '') ? ' on ' + r.host : '');
 }
@@ -351,7 +357,140 @@ function list_readers(ctx)
 		printf('%s\n', l);
 }
 
+// ---- this router's SIMs -------------------------------------------------------
+//
+// Its modems' cards as rows: for a SIM sponsor here, and — with
+// wwand-rsim-provider (ctl/rsim_provider.uc, `wwandctl rsim proxy`) — for
+// another router that borrows one over SSH.
+
+// an ICCID in any spelling (trailing F of a 19-digit one, lower case,
+// blanks) -> its digits; the SIM inventory's rule (siminventory.uc)
+function norm_iccid(v)
+{
+	if (type(v) != 'string')
+		return null;
+
+	let d = replace(uc(replace(v, /[ \t-]/g, '')), /F+$/, '');
+
+	return match(d, /^[0-9]{18,20}$/) ? d : null;
+}
+
+// The wwand_sim settings for a card, by ICCID: what the other router needs to
+// use it (APN, PDP type, login). The PIN itself is not passed on — only
+// whether one is set: the card's owner types it into the other router.
+function sim_config(sims, iccid)
+{
+	let id = norm_iccid(iccid);
+
+	for (let sec in (sims ?? [])) {
+		if (!id || norm_iccid(sec.iccid) != id)
+			continue;
+
+		return {
+			name: sec['.name'], apn: sec.apn ?? null, pdp_type: sec.pdp_type ?? null,
+			auth: sec.auth ?? null, username: sec.username ?? null,
+			password: (sec.password != null) ? true : null,
+			pin: (sec.pincode != null && sec.pincode != ''),
+		};
+	}
+
+	return null;
+}
+
+function wwand_sims()
+{
+	let out = [];
+	let c = libuci.cursor();
+
+	c.load('network');
+	c.foreach('network', 'wwand_sim', (sec) => { push(out, sec); });
+
+	return out;
+}
+
+// The cards of this router's modems, one row each, as `rsim-card --list`
+// writes them (rsim-card appends these to its own list when it finds
+// wwand-rsim here): the ones another router can borrow, and why not the
+// others. `call(method, args)` -> answer or null.
+// what wwand knows about one of its modems, as the fields of a list row or
+// an info event: who it is, which network it is on
+function modem_meta(m)
+{
+	let reg = m?.registration;
+
+	return {
+		modem_manufacturer: m?.manufacturer ?? null, modem_model: m?.model ?? null,
+		modem_revision: m?.revision ?? null, modem_imei: m?.imei ?? null,
+		modem_state: m?.state ?? null, rat: m?.rat ?? null,
+		operator: reg?.plmn?.description ?? null,
+		plmn: (reg?.plmn?.mcc != null)
+			? sprintf('%03d', reg.plmn.mcc) + sprintf((reg.plmn.mnc_digits == 3) ? '%03d' : '%02d', reg.plmn.mnc) : null,
+	};
+}
+
+function lend_rows(call, sims)
+{
+	let inv = call('sim_inventory', {});
+	let mods = call('status', {})?.modems ?? {};
+	let rows = [];
+
+	for (let c in (inv?.cards ?? [])) {
+		// a card here but in a reader is not a modem's to lend
+		if (!c.present || c.reader || !c.modem)
+			continue;
+
+		let why = null, sap = null;
+
+		if (!c.active)
+			why = sprintf('not the card %s runs on — only that one can be lent', c.modem);
+		else {
+			let r = call('modem_plugin_status', { modem: c.modem, plugin: 'rsim', op: 'lend_check' });
+
+			why = (r == null) ? 'wwand does not answer'
+				: (r.ok === false) ? sprintf('cannot ask its modem (%s)', r.error ?? '?')
+				: r.why;
+			sap = r?.sap ?? null;
+		}
+
+		push(rows, {
+			backend: 'wwand', spec: 'wwand:iccid:' + c.iccid, device: c.modem, modem: c.modem,
+			slot: c.slot ?? null, iccid: c.iccid, imsi: c.imsi ?? null, eid: c.eid ?? null,
+			profile: c.profile?.name ?? null, lendable: !why, why: why,
+			// the ways it can be lent: SIM Access when its UIM has it
+			modes: (sap === true) ? [ 'sap', 'apdu' ] : (sap === false) ? [ 'apdu' ] : null,
+			config: sim_config(sims, c.iccid),
+			...modem_meta(mods[c.modem]),
+			// its modem's own ports there: a scan from another router marks
+			// them (an at: reader on one would take the card from under wwand)
+			modem_ports: { at: mods[c.modem]?.at_tty ?? null, gps: mods[c.modem]?.gps_port ?? null,
+			               diag: mods[c.modem]?.diag_port ?? null },
+		});
+	}
+
+	return rows;
+}
+
+// the provider side, when its package is installed: null otherwise
+const PROVIDER_PKG = 'wwand-rsim-provider';
+
+function provider()
+{
+	try {
+		return require('wwand.ctl.rsim_provider');
+	}
+	catch (e) {
+		// not installed is null; installed but broken (a failed upgrade)
+		// is that error, not "install it" advice
+		if (match(e?.message ?? '', /could be found|No module named/))
+			return null;
+		die(sprintf('wwandctl rsim: %s is installed but does not load: %s', PROVIDER_PKG, e?.message ?? e));
+	}
+}
+
 // `rsim scan [user@host] [--json]`: what a machine offers as a card source —
+// or `rsim scan --rspro <server>[:port] [--rest-port N]`: the slots of an
+// osmo-remsim SIM bank, from its server's REST API (RSPRO itself has no
+// message to list them) —
 // PC/SC readers (with or without a card), Smartmouse USB readers, serial
 // ports that look like a Phoenix adapter or a modem's AT port, paired phones
 // (Bluetooth SIM Access; whether a phone offers it is what BlueZ last read
@@ -413,6 +552,8 @@ function ssh_diagnose(lines, host, key_exists)
 		return sprintf('%s does not accept this router\'s key — `wwandctl rsim ssh-key %s` prints the line for its authorized_keys', host, host);
 	if (match(all, /Host key verification failed|IDENTIFICATION HAS CHANGED|[Hh]ost key mismatch|fingerprint/))
 		return sprintf('the host key of %s changed (reinstalled?) — remove its old entry from /root/.ssh/known_hosts', host);
+	if (match(all, /wwand-rsim-provider is not installed/))
+		return sprintf('%s has wwand but not wwand-rsim-provider — its modems\' cards are lent to other routers only with it (`apk add wwand-rsim-provider` there)', host);
 	if (match(all, /rsim-card: (command )?not found|rsim-card: No such file|exec: rsim-card/))
 		return sprintf('rsim-card is not installed on %s, or not in the PATH of that user — `apk add rsim-card` (OpenWrt), or option helper with its path', host);
 	if (match(all, /Connection refused|No route to host|[Tt]imed out|Could not resolve|Name or service not known|Network is unreachable|Error connecting|Connection closed/))
@@ -426,7 +567,24 @@ function scan(ctx, args, sys)
 {
 	let rsim = require('wwand.plugins.rsim');
 	let json_out = index(args, '--json') >= 0;
-	let host = filter(args, (a) => a != '--json')[0];
+	let rest = filter(args, (a) => a != '--json');
+	let rspro = null, rest_port = null;
+	let i = index(rest, '--rspro');
+
+	if (i >= 0) {
+		rspro = rest[i + 1];
+		splice(rest, i, 2);
+		i = index(rest, '--rest-port');
+		if (i >= 0) {
+			rest_port = rest[i + 1];
+			splice(rest, i, 2);
+		}
+		if (!rsim.rspro_ok('rspro:' + (rspro ?? '')) || index(rspro ?? '', '/') >= 0 || length(rest) ||
+		    (rest_port != null && !rsim.port_ok(rest_port)))
+			die('usage: wwandctl rsim scan --rspro <server>[:port] [--rest-port N] [--json]');
+	}
+
+	let host = rest[0];
 	let run = sys?.run ?? ((cmd) => {
 		let p = fs.popen(cmd, 'r');
 		let out = p ? p.read('all') : null;
@@ -445,6 +603,11 @@ function scan(ctx, args, sys)
 		argv = rsim.helper_argv({ reader: '--list', local_reader: '--list',
 		                          ssh: { dest: host, helper: 'rsim-card' } }, null, sys?.ssh_sys);
 	}
+	else if (rspro != null) {
+		argv = [ sys?.helper ?? rsim.helper_found(), '--list', '--rspro-server', rspro ];
+		if (rest_port != null)
+			push(argv, '--rspro-rest-port', rest_port);
+	}
 	else
 		argv = [ sys?.helper ?? rsim.helper_found(), '--list' ];
 
@@ -456,11 +619,33 @@ function scan(ctx, args, sys)
 	let rows = parsed.rows, done = parsed.done;
 
 	// this router's own modems: here a card of one is lent to another modem
-	// as a SIM sponsor (modem:<name>), not through the proxy
+	// as a SIM sponsor (modem:<name>), not through the proxy — which needs
+	// no wwand-rsim-provider here, so without it the cards come from wwand
+	// directly instead of from rsim-card's list
+	if (host == null && rspro == null && done?.wwand_provider === false && !length(filter(rows, (r) => r.backend == 'wwand'))) {
+		// its own ubus connection: wwandctl's call gives up the whole
+		// command on a failed call, lend_rows takes null as "no answer"
+		let lr = sys?.lend_rows ?? (() => {
+			let conn = libubus.connect(null, 30);
+
+			return lend_rows((m, a) => conn?.call('wwand', m, a ?? {}), wwand_sims());
+		});
+
+		for (let r in lr())
+			push(rows, r);
+	}
 	if (host == null)
 		for (let r in rows)
 			if (r.backend == 'wwand')
 				r.spec = 'modem:' + r.modem;
+
+	// a wwand router without wwand-rsim-provider: its modems' cards are not
+	// lent to another router — only an AT port of one, through rsim-card
+	let no_provider = (done?.wwand_provider === false)
+		? (host ? sprintf('%s is a wwand router without %s: its modems\' cards are not offered to other routers (only through an AT port) — install %s there to lend them',
+		                  host, PROVIDER_PKG, PROVIDER_PKG)
+		        : sprintf('%s is not installed: this router\'s modem cards are lent to its own modems only, not to other routers', PROVIDER_PKG))
+		: null;
 
 	if (done == null) {
 		let r = { ok: false, error: sprintf('no answer from rsim-card --list%s', host ? ' on ' + host : ' (package rsim-card)') };
@@ -484,19 +669,35 @@ function scan(ctx, args, sys)
 		return 1;
 	}
 
+	// the SIM bank's server could not be asked: rsim-card said why
+	if (rspro != null && done.error) {
+		if (json_out)
+			printf('%J\n', { ok: false, server: rspro, error: done.error });
+		else
+			printf('remsim-server %s: %s\n', rspro, done.error);
+		return 1;
+	}
+
 	if (json_out) {
-		printf('%J\n', { ok: true, host: host, backends: split(done.backends ?? '', ','), readers: rows,
-		                 note: done.note ?? null, bt_adapters: done.bt_adapters ?? null });
+		printf('%J\n', { ok: true, host: host, server: rspro, backends: split(done.backends ?? '', ','), readers: rows,
+		                 note: done.note ?? null, bt_adapters: done.bt_adapters ?? null,
+		                 wwand_provider: done.wwand_provider ?? null, provider_hint: no_provider });
 		return 0;
 	}
 
-	printf('backends in this rsim-card%s: %s\n', host ? ' on ' + host : '', done.backends ?? '?');
+	if (rspro != null)
+		printf('SIM bank slots at remsim-server %s:\n', rspro);
+	else
+		printf('backends in this rsim-card%s: %s\n', host ? ' on ' + host : '', done.backends ?? '?');
 
 	if (done.note)
 		printf('note: %s\n', done.note);
 
 	if (done.bt_adapters)
 		printf('bluetooth adapters: %s\n', done.bt_adapters);
+
+	if (no_provider)
+		printf('note: %s\n', no_provider);
 
 	if (!length(rows))
 		printf('no reader or port found\n');
@@ -514,6 +715,9 @@ function scan(ctx, args, sys)
 					r.config.apn ? sprintf(', apn %s', r.config.apn) : '',
 					r.config.pin ? ', PIN set' : '') : '',
 				r.lendable ? '' : sprintf(' — not now: %s', r.why ?? '?'))
+			: (r.backend == 'rspro') ? sprintf('SIM bank %s slot %s%s, %s', r.bank ?? '?', r.slot ?? '?',
+				r.name ? sprintf(' ("%s")', r.name) : '',
+				r.mapped_to ? sprintf('mapped to client %s%s', r.mapped_to, r.map_state ? ' (' + r.map_state + ')' : '') : 'free')
 			: (r.backend == 'bt') ? sprintf('phone "%s" over Bluetooth, %s', r.name ?? '?',
 				(r.sap === true) ? 'offers SIM Access'
 				: (r.sap === false) ? 'SIM Access NOT offered (not supported, or off on the phone)'
@@ -525,7 +729,8 @@ function scan(ctx, args, sys)
 		printf('%-34s %s%s\n', length(r.spec ?? '') ? (host ? sprintf('ssh:%s:', host) : '') + r.spec : r.device, what,
 		       r.in_use ? sprintf(' — IN USE: %s', r.in_use) : '');
 
-		let meta = reader_text({ ...r, name: (r.backend == 'bt') ? null : r.name, reader_name: null });
+		let meta = (r.backend == 'rspro') ? r.backend
+			: reader_text({ ...r, name: (r.backend == 'bt') ? null : r.name, reader_name: null });
 
 		if (meta != (r.backend ?? '?'))
 			printf('%-34s   %s\n', '', meta);
@@ -547,6 +752,19 @@ function test_source(ctx, args, sys)
 	let rsim = require('wwand.plugins.rsim');
 	let json_out = index(args, '--json') >= 0;
 	let rest = filter(args, (a) => a != '--json');
+	// a SIM bank: who to be at its server, and its REST port — as the
+	// reader will be, or the test maps and connects with the defaults
+	let rspro_opt = {};
+
+	for (let k in [ 'client', 'rest-port' ]) {
+		let i = index(rest, '--rspro-' + k);
+
+		if (i >= 0) {
+			rspro_opt[k] = rest[i + 1];
+			splice(rest, i, 2);
+		}
+	}
+
 	let target = rest[0];
 	let host = rest[1];
 	let out = (r) => {
@@ -575,8 +793,10 @@ function test_source(ctx, args, sys)
 		return o;
 	});
 
-	if (!length(target ?? '') || (host != null && !match(host, /^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$/))) {
-		warn('usage: wwandctl rsim test <reader spec | /dev/tty…> [user@host] [--json]\n');
+	if (!length(target ?? '') || (host != null && !match(host, /^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$/)) ||
+	    (rspro_opt.client != null && !rsim.rspro_client_ok(rspro_opt.client)) ||
+	    (rspro_opt['rest-port'] != null && !rsim.port_ok(rspro_opt['rest-port']))) {
+		warn('usage: wwandctl rsim test <reader spec | /dev/tty…> [user@host] [--rspro-client ID[:SLOT]] [--rspro-rest-port N] [--json]\n');
 		return 2;
 	}
 
@@ -585,7 +805,8 @@ function test_source(ctx, args, sys)
 	// off and back is for a session, and not every modem takes the way back
 	// over AT (an E392 refused CFUN=1 and needed a reset, HW-seen on 245)
 	let argv_of = (spec) => rsim.helper_argv({ reader: spec, local_reader: spec, ssh: ssh,
-	                                           at_radio: (substr(spec, 0, 3) == 'at:') ? 'keep' : null },
+	                                           at_radio: (substr(spec, 0, 3) == 'at:') ? 'keep' : null,
+	                                           rspro_client: rspro_opt.client, rspro_rest_port: rspro_opt['rest-port'] },
 	                                         sys?.helper ?? (host ? null : rsim.helper_found()), sys?.ssh_sys);
 	let spec = target;
 
@@ -612,8 +833,16 @@ function test_source(ctx, args, sys)
 					return out({ ok: false, spec: spec, error: sprintf('%s is a port of wwand modem %s — not tested (use modem:%s)', dev, name, name) });
 	}
 
-	if (!match(spec, /^((phoenix|pcsc|at|bt):.|wbsm:)/))
-		return out({ ok: false, spec: spec, error: 'not a reader spec (phoenix:, wbsm:, pcsc:, at:, bt:)' });
+	// a SIM bank's slot: the helper maps it for the test and unmaps it at
+	// the end (as client 0:0 — the default of a session too)
+	let bank = (substr(spec, 0, 6) == 'rspro:');
+
+	if (bank && host)
+		return out({ ok: false, spec: spec, error: 'a SIM bank is reached from here, not over SSH' });
+	if (bank && !rsim.rspro_ok(spec))
+		return out({ ok: false, spec: spec, error: 'not a SIM bank spec (rspro:<server>[:port][/<bank>:<slot>])' });
+	if (!bank && !match(spec, /^((phoenix|pcsc|at|bt):.|wbsm:)/))
+		return out({ ok: false, spec: spec, error: 'not a reader spec (phoenix:, wbsm:, pcsc:, at:, bt:, rspro:)' });
 
 	// power_up, status, then end of input: rsim-card hands the card back
 	let text = run(join(' ', map(argv_of(spec), rsim.shq)), '{"op":"power_up"}\n{"op":"status"}\n');
@@ -832,379 +1061,32 @@ function use_reader(ctx, modem, args, sys)
 		               st?.last_error ? sprintf(': %s', st.last_error) : '') });
 }
 
-// ---- this router's SIMs for another router -----------------------------------
-//
-// Another router's wwand-rsim (`rsim_reader 'ssh:<user>@<here>:wwand:<modem>'`
-// or `wwand:iccid:<ICCID>`) runs `wwandctl rsim proxy` here over SSH. The
-// proxy speaks rsim-card's line protocol on stdin/stdout and hands every
-// request to the rsim plugin in THIS daemon (modem_plugin lend_*), which
-// lends the card the way a local SIM sponsor does: over the SIM Access
-// Profile or APDU by APDU, with the radio parked meanwhile. Only the daemon
-// can do that — it holds the modem — so the proxy is a relay and nothing more.
-
-// an ICCID in any spelling (trailing F of a 19-digit one, lower case,
-// blanks) -> its digits; the SIM inventory's rule (siminventory.uc)
-function norm_iccid(v)
-{
-	if (type(v) != 'string')
-		return null;
-
-	let d = replace(uc(replace(v, /[ \t-]/g, '')), /F+$/, '');
-
-	return match(d, /^[0-9]{18,20}$/) ? d : null;
-}
-
-// The wwand_sim settings for a card, by ICCID: what the other router needs to
-// use it (APN, PDP type, login). The PIN itself is not passed on — only
-// whether one is set: the card's owner types it into the other router.
-function sim_config(sims, iccid)
-{
-	let id = norm_iccid(iccid);
-
-	for (let sec in (sims ?? [])) {
-		if (!id || norm_iccid(sec.iccid) != id)
-			continue;
-
-		return {
-			name: sec['.name'], apn: sec.apn ?? null, pdp_type: sec.pdp_type ?? null,
-			auth: sec.auth ?? null, username: sec.username ?? null,
-			password: (sec.password != null) ? true : null,
-			pin: (sec.pincode != null && sec.pincode != ''),
-		};
-	}
-
-	return null;
-}
-
-function wwand_sims()
-{
-	let out = [];
-	let c = libuci.cursor();
-
-	c.load('network');
-	c.foreach('network', 'wwand_sim', (sec) => { push(out, sec); });
-
-	return out;
-}
-
-// the proto-wwand interfaces, for the settings a modem dials with
-function wwand_ifaces()
-{
-	let out = [];
-	let c = libuci.cursor();
-
-	c.load('network');
-	c.foreach('network', 'interface', (sec) => {
-		if (sec.proto == 'wwand')
-			push(out, sec);
-	});
-
-	return out;
-}
-
-// What a lent card is dialled with here, for the router that borrows it —
-// which keeps it as its own wwand_sim for that card (the plugin's
-// sim_upsert): this router's wwand_sim of the card, or else the connection
-// of the modem's interface. The password goes too: that router is given the
-// card itself, over the same SSH link. null when there is no APN to pass on.
-function lend_settings(sims, ifaces, iccid, modem)
-{
-	let pick = (sec, source) => (sec?.apn != null && sec.apn != '') ? {
-		apn: sec.apn, pdp_type: sec.pdp_type ?? null, auth: sec.auth ?? null,
-		username: sec.username ?? null, password: sec.password ?? null, source: source,
-	} : null;
-	let id = norm_iccid(iccid);
-
-	for (let sec in (sims ?? []))
-		if (id && norm_iccid(sec.iccid) == id)
-			return pick(sec, 'sim');
-
-	for (let sec in (ifaces ?? []))
-		if (sec.modem == modem && pick(sec, 'interface'))
-			return pick(sec, 'interface');
-
-	return null;
-}
-
-// The cards of this router's modems, one row each, as `rsim-card --list`
-// writes them (rsim-card appends these to its own list when it finds
-// wwand-rsim here): the ones another router can borrow, and why not the
-// others. `call(method, args)` -> answer or null.
-// what wwand knows about one of its modems, as the fields of a list row or
-// an info event: who it is, which network it is on
-function modem_meta(m)
-{
-	let reg = m?.registration;
-
-	return {
-		modem_manufacturer: m?.manufacturer ?? null, modem_model: m?.model ?? null,
-		modem_revision: m?.revision ?? null, modem_imei: m?.imei ?? null,
-		modem_state: m?.state ?? null, rat: m?.rat ?? null,
-		operator: reg?.plmn?.description ?? null,
-		plmn: (reg?.plmn?.mcc != null)
-			? sprintf('%03d', reg.plmn.mcc) + sprintf((reg.plmn.mnc_digits == 3) ? '%03d' : '%02d', reg.plmn.mnc) : null,
-	};
-}
-
-function lend_rows(call, sims)
-{
-	let inv = call('sim_inventory', {});
-	let mods = call('status', {})?.modems ?? {};
-	let rows = [];
-
-	for (let c in (inv?.cards ?? [])) {
-		// a card here but in a reader is not a modem's to lend
-		if (!c.present || c.reader || !c.modem)
-			continue;
-
-		let why = null, sap = null;
-
-		if (!c.active)
-			why = sprintf('not the card %s runs on — only that one can be lent', c.modem);
-		else {
-			let r = call('modem_plugin_status', { modem: c.modem, plugin: 'rsim', op: 'lend_check' });
-
-			why = (r == null) ? 'wwand does not answer'
-				: (r.ok === false) ? sprintf('cannot ask its modem (%s)', r.error ?? '?')
-				: r.why;
-			sap = r?.sap ?? null;
-		}
-
-		push(rows, {
-			backend: 'wwand', spec: 'wwand:iccid:' + c.iccid, device: c.modem, modem: c.modem,
-			slot: c.slot ?? null, iccid: c.iccid, imsi: c.imsi ?? null, eid: c.eid ?? null,
-			profile: c.profile?.name ?? null, lendable: !why, why: why,
-			// the ways it can be lent: SIM Access when its UIM has it
-			modes: (sap === true) ? [ 'sap', 'apdu' ] : (sap === false) ? [ 'apdu' ] : null,
-			config: sim_config(sims, c.iccid),
-			...modem_meta(mods[c.modem]),
-			// its modem's own ports there: a scan from another router marks
-			// them (an at: reader on one would take the card from under wwand)
-			modem_ports: { at: mods[c.modem]?.at_tty ?? null, gps: mods[c.modem]?.gps_port ?? null,
-			               diag: mods[c.modem]?.diag_port ?? null },
-		});
-	}
-
-	return rows;
-}
-
-// the modem a target names: a modem, or iccid:<ICCID> — the modem that RUNS
-// on that card now
-function lend_target(call, target)
-{
-	if (substr(target ?? '', 0, 6) == 'iccid:') {
-		let id = norm_iccid(substr(target, 6));
-
-		if (!id)
-			return { error: sprintf('%s is not an ICCID', substr(target, 6)) };
-
-		for (let c in (call('sim_inventory', {})?.cards ?? []))
-			if (c.iccid == id && c.present && c.active && c.modem && !c.reader)
-				return { modem: c.modem };
-
-		return { error: sprintf('no modem here runs on the card %s', id) };
-	}
-
-	if (!match(target ?? '', /^[A-Za-z0-9_]+$/))
-		return { error: 'usage: wwandctl rsim proxy <modem | iccid:ICCID>' };
-
-	if (!call('status', {})?.modems?.[target])
-		return { error: sprintf('no modem %s here', target) };
-
-	return { modem: target };
-}
-
-// One lend, request by request. `call` as above; o: { target, mode, slot,
-// apdu, cond, client, pid }.
-function proxy_session(call, o)
-{
-	let modem = null, id = null, ended = null;
-	let plugin = (op, args) => call('modem_plugin', { modem: modem, plugin: 'rsim', op: op, args: args });
-	let io_err = (why) => {
-		ended ??= why;
-		return { ok: false, error: 'io', detail: why };
-	};
-
-	return {
-		// null, or why the card cannot be had
-		open: () => {
-			let t = lend_target(call, o.target);
-
-			if (t.error)
-				return t.error;
-
-			modem = t.modem;
-
-			let r = plugin('lend_open', { mode: o.mode, slot: o.slot, apdu: o.apdu, cond: o.cond,
-			                              client: o.client, pid: o.pid });
-
-			if (r == null)
-				return 'wwand does not answer (is it running?)';
-			if (r.ok === false)
-				return sprintf('%s cannot lend its card: %s', modem,
-					(r.error == 'invalid_op' || r.error == 'no_such_plugin')
-						? 'wwand-rsim here is too old or not loaded' : (r.detail ?? r.error ?? '?'));
-
-			id = r.id;
-			return null;
-		},
-
-		// one request line -> the answer object
-		line: (line) => {
-			let req = null;
-
-			try { req = json(line); } catch (e) { req = null; }
-
-			if (type(req) != 'object' || type(req.op) != 'string')
-				return { ok: false, error: 'bad_request', detail: 'not a request object with an op' };
-
-			let r = plugin('lend_call', { id: id, req: req });
-
-			if (r == null)
-				return io_err('wwand does not answer');
-			if (r.ok === false)
-				return io_err(sprintf('the lend is gone (%s)', r.error ?? '?'));
-			if (r.ended)
-				return io_err(sprintf('the card went home: %s', r.why ?? '?'));
-
-			return r.answer ?? io_err('no answer');
-		},
-
-		ended: () => ended,
-		modem: () => modem,
-
-		close: () => {
-			if (id != null)
-				plugin('lend_close', { id: id });
-			id = null;
-		},
-	};
-}
-
-// `rsim proxy <modem | iccid:ICCID> [--mode sap|apdu|auto] [--slot N]
-// [--apdu qmi|at] [--cond N]` — or `--list`. sys (tests): { call, read_line,
-// write, pid, client, sims }.
+// `rsim proxy …` without wwand-rsim-provider: said in the words the other
+// router's diagnosis looks for (ssh_diagnose)
 function proxy(ctx, args, sys)
 {
-	let o = { target: null, mode: 'auto', slot: null, apdu: null, cond: null };
-	let list = false;
+	let p = sys?.provider ?? provider();
 
-	for (let i = 0; i < length(args); i++) {
-		let a = args[i];
-
-		if (a == '--list')
-			list = true;
-		else if (a == '--mode' && index([ 'sap', 'apdu', 'auto' ], args[i + 1]) >= 0)
-			o.mode = args[++i];
-		else if (a == '--slot' && match(args[i + 1] ?? '', /^[1-5]$/))
-			o.slot = +args[++i];
-		else if (a == '--apdu' && index([ 'qmi', 'at' ], args[i + 1]) >= 0)
-			o.apdu = args[++i];
-		else if (a == '--cond' && match(args[i + 1] ?? '', /^([0-9]+|none)$/))
-			o.cond = args[++i];
-		else if (o.target == null && substr(a, 0, 1) != '-')
-			o.target = a;
-		else {
-			warn('usage: wwandctl rsim proxy <modem | iccid:ICCID> [--mode sap|apdu|auto] [--slot N] [--apdu qmi|at] [--cond N] | --list\n');
-			return 2;
-		}
-	}
-
-	// its own connection: a lend's first answer may take longer than
-	// wwandctl's default wait, and a failed call must end the lend cleanly
-	// instead of the process
-	let call = sys?.call;
-
-	if (!call) {
-		let conn = libubus.connect(null, 90);
-
-		if (!conn) {
-			warn('wwandctl rsim proxy: no ubus\n');
-			return 1;
-		}
-		call = (m, a) => conn.call('wwand', m, a ?? {});
-	}
-
-	let write = sys?.write ?? ((l) => { print(l, '\n'); fs.stdout.flush(); });
-
-	if (list) {
-		for (let r in lend_rows(call, sys?.sims ?? wwand_sims()))
-			write(sprintf('%J', r));
-		return 0;
-	}
-
-	// the far end's address, for the status here ("lends its card to ...")
-	let peer = split(getenv('SSH_CLIENT') ?? getenv('SSH_CONNECTION') ?? '', ' ')[0];
-
-	o.client = sys?.client ?? (length(peer) ? peer : 'another router');
-	o.pid = sys?.pid ?? +(fs.readlink('/proc/self') ?? 0);
-
-	if (!(o.pid > 0)) {
-		warn('wwandctl rsim proxy: cannot tell its own pid (/proc/self), which the lend is watched by\n');
+	if (!p) {
+		warn(sprintf('wwandctl rsim proxy: %s is not installed here — this router\'s modem cards are not lent to other routers\n',
+			PROVIDER_PKG));
 		return 1;
 	}
 
-	// A dropped SSH link closes stdin: that ends the loop below and hands the
-	// card back, instead of the hang-up killing us with the card still lent.
-	// Before the lend is opened: a hang-up during the open must not leave one.
-	if (!sys) {
-		signal('SIGHUP', 'ignore');
-		signal('SIGPIPE', 'ignore');
-	}
-
-	let s = proxy_session(call, o);
-	let why = s.open();
-
-	if (why) {
-		warn(sprintf('wwandctl rsim proxy: %s\n', why));
-		return 1;
-	}
-
-	warn(sprintf('wwandctl rsim proxy: %s lends its card (%s)\n', s.modem(), o.mode));
-
-	// like rsim-card after its open: what the other router is using — this
-	// router, its modem, the card
-	{
-		let m = call('status', {})?.modems?.[s.modem()];
-		let host = trim(fs.readfile('/proc/sys/kernel/hostname') ?? '');
-
-		write(sprintf('%J', { event: 'info', backend: 'wwand', reader: s.modem(), host: length(host) ? host : null,
-		                      mode: o.mode, iccid: m?.iccid ?? null, imsi: m?.imsi ?? null, ...modem_meta(m),
-		                      sim: lend_settings(sys?.sims ?? wwand_sims(), sys?.ifaces ?? wwand_ifaces(),
-		                                         m?.iccid ?? ((substr(o.target, 0, 6) == 'iccid:') ? substr(o.target, 6) : null),
-		                                         s.modem()) }));
-	}
-
-	let read_line = sys?.read_line ?? (() => fs.stdin.read('line'));
-	let line;
-
-	while (length(line = read_line() ?? '')) {
-		if (!length(trim(line)))
-			continue;
-
-		write(sprintf('%J', s.line(line)));
-
-		if (s.ended())
-			break;
-	}
-
-	s.close();
-
-	if (s.ended())
-		warn(sprintf('wwandctl rsim proxy: %s\n', s.ended()));
-
-	return s.ended() ? 1 : 0;
+	return p.proxy(ctx, args, sys);
 }
 
 return {
 	qnvfr_value: qnvfr_value,
 	proxy: proxy,
+	provider: provider,
+	PROVIDER_PKG: PROVIDER_PKG,
 	test_source: test_source,
-	proxy_session: proxy_session,
+	norm_iccid: norm_iccid,
+	wwand_sims: wwand_sims,
 	modem_meta: modem_meta,
 	lend_rows: lend_rows,
 	sim_config: sim_config,
-	lend_settings: lend_settings,
 	use_reader: use_reader,
 	scan: scan,
 	scan_parse: scan_parse,
@@ -1226,7 +1108,10 @@ return {
 		'rsim ssh-key [user@host]              the router\'s key, and the restricted authorized_keys line for each machine',
 		'rsim readers                          the SIM readers defined (config wwand_simreader) and who uses them',
 		'rsim scan [user@host] [--json]        the readers and ports a machine offers (here, or a SIM host over SSH)',
+		'rsim scan --rspro SERVER[:PORT] [--rest-port N] [--json]',
+		'                                      the slots of an osmo-remsim SIM bank (its server\'s REST API)',
 		'rsim test <spec|/dev/tty…> [user@host] [--json]  open ONE source, power its card up, report, hand it back',
+		'                                      (a SIM bank: [--rspro-client ID[:SLOT]] [--rspro-rest-port N])',
 		'rsim [modem] use <reader|off> [--wait S] [--json]  run the modem on that reader\'s card (or its own again); --wait until it does',
 		'rsim [modem] probe                    what this modem\'s UIM offers for lending its card (read-only)',
 		'rsim [modem] donor-test [sap|apdu] [qmi|at]  lend its card once: ATR + SELECT MF, then hand it back',
