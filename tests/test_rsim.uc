@@ -1393,6 +1393,22 @@ let donor_plugin = (o) => rsim.create({
 	run_for(50);
 }
 
+// a lent card: the target's client first — without one the sponsor is not
+// touched (no park, no connect), where it used to be on every retry
+{
+	let t = { now: 1000 };
+	let donor = sap_donor([]);
+	let radio = [];
+	let p = donor_plugin({ t: t, donor: donor, radio: radio,
+		qmi_client: (ref, schema, cb) => (ref == 'm1') ? cb(null, donor) : cb({ error: 'unsupported' }, null) });
+
+	p.tick('m0', { rsim_reader: 'modem:m1' });
+	run_for(200);
+	eq([ radio, length(donor.sent) ], [ [], 0 ], 'no client on the target: the sponsor is left alone');
+	p.stop();
+	run_for(50);
+}
+
 // --- a modem that is not ready yet --------------------------------------------------
 {
 	let t = { now: 1000 };

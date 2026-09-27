@@ -1954,85 +1954,105 @@ function create(deps)
 			// overridden (found by audit, 2026-09-27).
 		}
 
-		s.rpc = cfg.donor ? donor_card(deps, cfg.donor.ref, cfg.donor, on_card_event, on_card_exit, log)
-		                  : helper_rpc(open, helper_argv(cfg, helper_path(), deps.ssh_sys), on_card_event, on_card_exit, log);
-
-		if (!s.rpc)
-			return fail(s, sprintf('cannot start %s', helper_path()));
-
-		// The card first: a reader without a card must not take the modem's
-		// own SIM away, which connection-available does.
-		s.rpc.call({ op: 'power_up' }, (err, res) => {
-			if (s.state == 'failed')
+		// Three steps: the modem's UIM Remote client, the card from the
+		// source, the offer to the modem.
+		let with_client = (then) => deps.qmi_client(ref, UIMRMT, (qerr, c) => {
+			if (s.state == 'failed' || sessions[ref] != s) {
+				if (c)
+					deps.qmi_release(ref, c);
 				return;
+			}
 
-			// A helper that exits before answering never reached a card: the
-			// reader is missing, busy or not permitted (its own message is
-			// in the log). Only an answer without an ATR means "no card".
-			if (err?.error == 'helper_exit' || err?.error == 'timeout')
-				return fail(s, sprintf('cannot use the reader %s (%s; the helper\'s reason is in the log)',
-					cfg.reader, err.error));
+			if (qerr && index([ 'not_ready', 'no_modem', 'cancelled' ], qerr.error) >= 0)
+				return soft(s, sprintf('the modem is not ready for a UIM Remote client (%s)', qerr.error));
 
-			if (err || !bytes(res?.atr))
-				return fail(s, sprintf('no card in %s (%s)', cfg.reader, err?.error ?? 'no ATR'));
+			if (qerr)
+				return fail(s, (qerr.error == 'service_unavailable')
+					? 'the modem does not offer UIM Remote — switch it on with `wwandctl rsim enable` and reset the modem'
+					: sprintf('no UIM Remote client (%s)', qerr.error ?? '?'));
 
-			s.atr = res.atr;
+			s.client = c;
+			then();
+		});
 
-			deps.qmi_client(ref, UIMRMT, (qerr, c) => {
-				if (s.state == 'failed' || sessions[ref] != s) {
-					if (c)
-						deps.qmi_release(ref, c);
+		let with_card = (then) => {
+			s.rpc = cfg.donor ? donor_card(deps, cfg.donor.ref, cfg.donor, on_card_event, on_card_exit, log)
+			                  : helper_rpc(open, helper_argv(cfg, helper_path(), deps.ssh_sys), on_card_event, on_card_exit, log);
+
+			if (!s.rpc)
+				return fail(s, sprintf('cannot start %s', helper_path()));
+
+			s.rpc.call({ op: 'power_up' }, (err, res) => {
+				if (s.state == 'failed')
 					return;
-				}
 
-				if (qerr && index([ 'not_ready', 'no_modem', 'cancelled' ], qerr.error) >= 0)
-					return soft(s, sprintf('the modem is not ready for a UIM Remote client (%s)', qerr.error));
+				// A helper that exits before answering never reached a card: the
+				// reader is missing, busy or not permitted (its own message is
+				// in the log). Only an answer without an ATR means "no card".
+				if (err?.error == 'helper_exit' || err?.error == 'timeout')
+					return fail(s, sprintf('cannot use the reader %s (%s; the helper\'s reason is in the log)',
+						cfg.reader, err.error));
 
-				if (qerr)
-					return fail(s, (qerr.error == 'service_unavailable')
-						? 'the modem does not offer UIM Remote — switch it on with `wwandctl rsim enable` and reset the modem'
-						: sprintf('no UIM Remote client (%s)', qerr.error ?? '?'));
+				if (err || !bytes(res?.atr))
+					return fail(s, sprintf('no card in %s (%s)', cfg.reader, err?.error ?? 'no ATR'));
 
-				s.client = c;
-				wire(s);
+				s.atr = res.atr;
+				then();
+			}, (substr(cfg.local_reader ?? '', 0, 3) == 'bt:' || cfg.proxy) ? BT_FIRST_TIMEOUT_MS : null);
+		};
 
-				// NO RESET first. The service's RESET handler runs its own
-				// disconnect callback on the calling client, which takes that
-				// client out of its registry — the next EVENT then finds no
-				// client and fails with QMI_ERR_INTERNAL (HW-observed on the
-				// RG650E, 2026-09-26: error 3 on connection-available right
-				// after RESET). What a previous client of ours left behind is
-				// cleared when its CID is released, which runs the same
-				// disconnect.
-				event(s, EV_CONN_AVAILABLE, null, (e) => {
-					// stopped while the offer was on its way: its answer
-					// must neither revive the session nor clear its backoff
-					if (s.state == 'failed' || sessions[ref] != s)
-						return;
+		let offer = () => {
+			wire(s);
 
-					if (e?.error == 'cancelled')
-						return soft(s, 'the modem tore the client down during the offer');
+			// NO RESET first. The service's RESET handler runs its own
+			// disconnect callback on the calling client, which takes that
+			// client out of its registry — the next EVENT then finds no
+			// client and fails with QMI_ERR_INTERNAL (HW-observed on the
+			// RG650E, 2026-09-26: error 3 on connection-available right
+			// after RESET). What a previous client of ours left behind is
+			// cleared when its CID is released, which runs the same
+			// disconnect.
+			s.offered = true;
+			event(s, EV_CONN_AVAILABLE, null, (e) => {
+				// stopped while the offer was on its way: its answer
+				// must neither revive the session nor clear its backoff
+				if (s.state == 'failed' || sessions[ref] != s)
+					return;
 
-					if (e)
-						return fail(s, sprintf('the modem refused the remote card: %J', e));
+				if (e?.error == 'cancelled')
+					return soft(s, 'the modem tore the client down during the offer');
 
-					delete notes[ref]?.soft;
+				if (e)
+					return fail(s, sprintf('the modem refused the remote card: %J', e));
 
-					s.state = 'waiting';
-					// the failure count is NOT cleared here: a reader that
-					// offers and then fails every time would never back off.
-					// A session that has worked for a minute clears it (tick).
-					note(ref, { retry_at: null, last_error: null });
-					log('notice', sprintf('rsim %s: remote card offered to the modem (slot %d, reader %s, ATR %s)',
-						ref, cfg.slot, cfg.reader, s.atr));
+				delete notes[ref]?.soft;
 
-					// Nothing more until the modem connects (CONNECT_IND):
-					// then the card is powered and its ATR goes as card-reset.
-					// That is the sequence proven on the RG650E (2026-09-26);
-					// a card-inserted here, without the ATR, is refused.
-				});
+				s.state = 'waiting';
+				// the failure count is NOT cleared here: a reader that
+				// offers and then fails every time would never back off.
+				// A session that has worked for a minute clears it (tick).
+				note(ref, { retry_at: null, last_error: null });
+				log('notice', sprintf('rsim %s: remote card offered to the modem (slot %d, reader %s, ATR %s)',
+					ref, cfg.slot, cfg.reader, s.atr));
+
+				// Nothing more until the modem connects (CONNECT_IND):
+				// then the card is powered and its ATR goes as card-reset.
+				// That is the sequence proven on the RG650E (2026-09-26);
+				// a card-inserted here, without the ATR, is refused.
 			});
-		}, (substr(cfg.local_reader ?? '', 0, 3) == 'bt:' || cfg.proxy) ? BT_FIRST_TIMEOUT_MS : null);
+		};
+
+		// A reader here: the card first — without one, the modem is not even
+		// asked for the service. A LENT card (a sponsor here, a modem of
+		// another router): the client first — getting one costs nothing,
+		// while the lending parks the lender's radio, and a start that then
+		// found no client (an MBIM modem whose QMI passthrough was not up)
+		// did that on every retry for nothing (HW-seen on the GL-X3000,
+		// 2026-09-27).
+		if (cfg.donor || cfg.proxy)
+			with_client(() => with_card(offer));
+		else
+			with_card(() => with_client(offer));
 	};
 
 	// polite: tell the modem the card is gone and the connection with it, so
@@ -2060,6 +2080,13 @@ function create(deps)
 				deps.sim_changed?.(s.ref, 'remote SIM off, own card back');
 			}
 		};
+
+		// a client that never offered a card (the source failed first):
+		// nothing to tell the modem, only its CID to give back
+		if (c && !c.destroyed && !s.offered) {
+			deps.qmi_release(s.ref, c);
+			c = null;
+		}
 
 		if (c && !c.destroyed) {
 			stopping[s.ref] = s;

@@ -230,8 +230,8 @@ a modem refuses 4. Two modems must never register with one card.
 ## What works
 
 HW-tested on OpenWrt routers — MikroTik Chateau 5G (RG650E-EU, 245),
-Zyxel NR7101 (RG502Q, 242), Cudy LT300 v3 (MeiG SLM770A-R, 3.113) — and a
-Linux PC as SIM host, 2026-09-26/27. *Works* means the modem read the card,
+Zyxel NR7101 (RG502Q, 242), Cudy LT300 v3 (MeiG SLM770A-R, 3.113), GL.iNet
+GL-X3000 (RM520N-GL, 3.93) — and a Linux PC as SIM host, 2026-09-26/27. *Works* means the modem read the card,
 authenticated with it and registered; *card only* that the card was read
 and used but the network refused the subscription (an inactive SIM).
 
@@ -247,6 +247,7 @@ enable --reset`):
 | | Galaxy S20 FE over Bluetooth SAP, via a PC | card only (inactive SIM) |
 | | Galaxy A5 (2016) over Bluetooth SAP, via a PC | card only (inactive SIM) |
 | Quectel RM520N-GL (MBIM, GL-X3000) | Smartmouse USB on a PC over SSH, through the QMI-over-MBIM passthrough | card only (a test card without service there; 431 commands, identity read) |
+| | the Chateau's Huawei E392 over SSH, APDU over QMI UIM | works (registered, connected with the card's own APN; no data with that SIM's plan) |
 
 An MBIM modem is a client through its QMI-over-MBIM passthrough (wwand's
 `qmi_client` there): on the RM520N the UIM Remote indications come over it,
