@@ -409,6 +409,18 @@ function fake_ctx(start)
 	   'scan of another router: the ports its wwand uses are marked, from its own list');
 }
 
+// --- readers: what each named reader is ------------------------------------------------
+{
+	eq(ctl.reader_where({ type: 'modem', donor: 'm1' }), 'modem m1 lends its card (auto)',
+	   'readers: a sponsor without donor_mode is automatic, as the plugin runs it (not sap)');
+	eq(ctl.reader_where({ type: 'modem', donor: 'm1', donor_mode: 'apdu' }), 'modem m1 lends its card (apdu)',
+	   'readers: a configured donor_mode is shown as it is');
+	eq(ctl.reader_where({ type: 'modem', donor: 'm1', donor_mode: 'bogus' }), 'modem m1 lends its card (auto)',
+	   'readers: an unknown donor_mode is automatic, as the plugin treats it');
+	eq(ctl.reader_where({ type: 'bt', device: 'AA:BB', host: 'root@pc' }), 'bt AA:BB on root@pc',
+	   'readers: another kind, its device and host');
+}
+
 // --- SSH: the restricted authorized_keys line, and what went wrong -----------------
 {
 	let hosts = ctl.ssh_hosts({

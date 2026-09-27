@@ -313,6 +313,18 @@ function ssh_key(args, run)
 	       'rsim-card must be in that user\'s PATH. Check with: wwandctl rsim scan <user@host>\n');
 }
 
+// What a named reader is, in one phrase. A sponsor's mode unset is 'auto'
+// (plugins/rsim.uc donor_mode): SIM Access where the donor has it, APDU where
+// not — printing 'sap' for it would name a mode that may never be used.
+function reader_where(r)
+{
+	return (r.type == 'modem')
+		? sprintf('modem %s lends its card (%s)', r.donor ?? '?',
+		          (index([ 'sap', 'apdu' ], r.donor_mode) >= 0) ? r.donor_mode : 'auto')
+		: sprintf('%s%s%s', r.type ?? '?', length(r.device ?? '') ? ' ' + r.device : '',
+		          length(r.host ?? '') ? ' on ' + r.host : '');
+}
+
 // The named readers and which modem names each (option rsim). A reader is
 // used by one modem at a time; a second one naming it waits.
 function list_readers(ctx)
@@ -326,10 +338,7 @@ function list_readers(ctx)
 			push(users[m.rsim] ??= [], m['.name']);
 	});
 	c.foreach('network', 'wwand_simreader', (r) => {
-		let where = (r.type == 'modem')
-			? sprintf('modem %s lends its card (%s)', r.donor ?? '?', r.donor_mode ?? 'sap')
-			: sprintf('%s%s%s', r.type ?? '?', length(r.device ?? '') ? ' ' + r.device : '',
-			          length(r.host ?? '') ? ' on ' + r.host : '');
+		let where = reader_where(r);
 
 		push(rows, sprintf('%-14s%s · %s', r['.name'], where,
 			users[r['.name']] ? 'used by ' + join(', ', users[r['.name']]) : 'not assigned'));
@@ -1199,6 +1208,7 @@ return {
 	use_reader: use_reader,
 	scan: scan,
 	scan_parse: scan_parse,
+	reader_where: reader_where,
 	ssh_key: ssh_key,
 	ssh_hosts: ssh_hosts,
 	authorized_line: authorized_line,

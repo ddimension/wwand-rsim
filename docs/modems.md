@@ -4,8 +4,11 @@ wwand-rsim has two sides, and they differ a lot in what hardware they take:
 
 - **The client** — the modem that runs on a remote card. It needs a way for
   the host to feed it a SIM. wwand-rsim implements exactly one: Qualcomm's
-  **QMI UIM Remote** service (UIMRMT, QMI service 0x32), switched on with a
-  Quectel EFS item. **Today that means a Quectel modem.**
+  **QMI UIM Remote** service (UIMRMT, QMI service 0x32). The client code is
+  vendor-neutral; switching the service on is not — wwand-rsim can write
+  that EFS item on Quectel only. **HW-verified clients are Quectel**; another
+  vendor's Qualcomm modem needs UIM Remote already on in its firmware
+  (untested, tbd).
 - **The card source** — where the card is: a reader, a phone, another modem.
   That side is wide open (see [howto.md](howto.md)); a Huawei, MeiG or any
   modem with `AT+CSIM` can lend its card.
@@ -23,14 +26,15 @@ answer `AT+QNVFR` — i.e. anything but Quectel (`ctl/rsim.uc`,
 | Modem | Control | Status | Evidence |
 |---|---|---|---|
 | Quectel RG650E-EU | QMI | **supported** — registers and carries data on a remote card | HW-tested on a MikroTik Chateau 5G, 2026-09-26/27 (README, *What works*) |
-| Quectel RM520N-GL | MBIM, through wwand's QMI-over-MBIM passthrough | **supported** — card read, identity read (431 commands); the test card had no service there | HW-tested on a GL-X3000, 2026-09-26/27 |
+| Quectel RM520N-GL | MBIM, through wwand's QMI-over-MBIM passthrough | **supported** — registered and connected on the Chateau's Huawei E392 card over SSH (APDU; no data with that SIM's plan); with a Smartmouse USB test card: card only (identity read, 431 commands, no service there) | HW-tested on a GL-X3000, 2026-09-26/27 (README, *What works*) |
 | Quectel RG502Q | QMI | switch present (read `00`), **not tested as a client** (tested as a lender) | HW-read on a Zyxel NR7101, 2026-09-26 |
 | other Quectel (Qualcomm-based) | QMI, or MBIM with the passthrough | **untested** — expected to work if the firmware carries the EFS item | — |
 
 Not a client, by design of the current implementation: NCM modems (no QMI at
-all, e.g. the MeiG SLM770A), MBIM modems without the QMI passthrough, and
-Qualcomm modems of other vendors (UIM Remote may be there, but wwand-rsim has
-no way to switch it on — see below).
+all, e.g. the MeiG SLM770A) and MBIM modems without the QMI passthrough.
+Qualcomm modems of other vendors are untested: the client side would run on
+them as it is, but only where their firmware has UIM Remote on already —
+wwand-rsim has no way to switch it on there (see below).
 
 ## Clients: other vendors and approaches — tbd
 

@@ -5,11 +5,13 @@ for, the pieces involved, the configuration, how to check it, and its limits.
 The reference for every option is the [README](../README.md); which modems can
 run on a remote card at all is in [modems.md](modems.md).
 
-> **The client — the modem that runs on the remote card — has to be a
-> Quectel modem** with Qualcomm's QMI UIM Remote service switched on
-> (`wwandctl rsim MODEM enable --reset`). The card *sources* below are not
-> limited that way: a phone, a reader, a Huawei or MeiG modem can all lend a
-> card. See [modems.md](modems.md).
+> **The client — the modem that runs on the remote card — needs Qualcomm's
+> QMI UIM Remote service switched on.** HW-verified clients are Quectel,
+> where `wwandctl rsim MODEM enable --reset` switches it on; on another
+> vendor's Qualcomm modem it has to be on in the firmware already
+> (wwand-rsim cannot switch it there) — untested, tbd. The card *sources*
+> below are not limited that way: a phone, a reader, a Huawei or MeiG modem
+> can all lend a card. See [modems.md](modems.md).
 
 Contents:
 
@@ -426,8 +428,10 @@ config wwand_simreader 'usbstick'
 ```
 
 Spelled out: `option rsim_reader 'at:/dev/ttyUSB2'` (`rsim_at_radio`,
-`rsim_at_baud`). The device has to be a character device under `/dev`;
-rsim-card refuses anything else.
+`rsim_at_baud`). The device has to be a serial port (a character device
+that is a tty); rsim-card refuses anything else. Through a restricted key
+(`rsim-card --serve`) it must moreover be a path under `/dev` resolving to
+`/dev/tty*`, `/dev/rfcomm*` or `/dev/pts/*`.
 
 What happens: at open, a diagnostic port is refused unopened, `AT+CSIM` is
 probed once (a modem that refuses it is refused with the reason), the radio
@@ -503,9 +507,12 @@ Spelled out: `option rsim_reader 'modem:wwmodem1'` (`rsim_donor_mode`,
 
 **Quectel as SAP sponsor:** the UIM refuses SIM Access (`ACCESS_DENIED`)
 until the EFS item `/nv/item_files/modem/qmi/uim/sap_security_restrictions`
-is `00` (HW-observed on the RG650E, 2026-09-26). wwand-rsim writes it in the
-modem's AT init when it differs — Quectel only, one modem reset — unless the
-sponsor's `wwand_modem` has `option rsim_sap_auto '0'`. By hand:
+is `00` (HW-observed on the RG650E, 2026-09-26). Once wwand-rsim is
+installed, it writes it in the AT init of **every** Quectel modem on QMI or
+MBIM — not only sponsors — when it differs, followed by one modem reset
+(skipped where the modem's UIM is known to lack SIM Access). A modem that
+must not get it (and not be reset for it): `option rsim_sap_auto '0'` on its
+`wwand_modem`. By hand:
 
 ```sh
 wwandctl rsim wwmodem1 sap-switch          # read it
@@ -606,7 +613,7 @@ On A:
 
 ```sh
 wwandctl rsim scan root@router2.lan
-# ssh:root@router2.lan:wwand:wwmodem0  SIM 8949… in modem wwmodem0 — wwand_sim …, apn …
+# ssh:root@router2.lan:wwand:iccid:8949…  SIM 8949… in modem wwmodem0 — wwand_sim …, apn …
 wwandctl rsim wwmodem0
 ```
 
