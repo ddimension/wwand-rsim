@@ -72,6 +72,10 @@ class Rig:
         self.proc.stdin.write(text.encode() + b"\n")
         self.proc.stdin.flush()
         ans = self.line(timeout)
+        # the info event after the open is news, not an answer
+        while ans is not None and '"event":"info"' in ans:
+            self.info = json.loads(ans)
+            ans = self.line(timeout)
         return json.loads(ans) if ans is not None else None
 
     def req(self, timeout=5.0, **kw):
@@ -119,8 +123,9 @@ def scenario_main():
     rig = Rig()
     try:
         st = rig.req(op="status")
-        check(st == {"ok": True, "present": False, "powered": False, "backend": "phoenix",
-                     "reader": os.ttyname(rig.slave), "atr": None}, "status before power_up: %r" % st)
+        core = {k: st.get(k) for k in ("ok", "present", "powered", "backend", "reader", "atr")} if st else None
+        check(core == {"ok": True, "present": False, "powered": False, "backend": "phoenix",
+                       "reader": os.ttyname(rig.slave), "atr": None}, "status before power_up: %r" % st)
         a = rig.tpdu("A0A40000023F00")
         check(a == {"ok": False, "error": "not_powered"}, "tpdu unpowered: %r" % a)
 
@@ -200,8 +205,13 @@ def scenario_main():
         check(ok_data(a, "9F17"), "after reset: %r" % a)
 
         st = rig.req(op="status")
-        check(st == {"ok": True, "present": True, "powered": True, "backend": "phoenix",
-                     "reader": os.ttyname(rig.slave), "atr": ATR}, "status powered: %r" % st)
+        core = {k: st.get(k) for k in ("ok", "present", "powered", "backend", "reader", "atr")} if st else None
+        check(core == {"ok": True, "present": True, "powered": True, "backend": "phoenix",
+                       "reader": os.ttyname(rig.slave), "atr": ATR}, "status powered: %r" % st)
+        # and what is known about the reader: how the card answered
+        check(st.get("clock_khz") == 3579 and st.get("baud") == 9621 and st.get("reset_line") == "rts"
+              and st.get("convention") == "direct", "status: the reader's details (%r)" % st)
+        check(getattr(rig, "info", {}).get("backend") == "phoenix", "an info event after the open")
         a = rig.req(op="power_down")
         check(a == {"ok": True}, "power_down: %r" % a)
         time.sleep(0.1)

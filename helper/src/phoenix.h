@@ -66,6 +66,9 @@ struct phx_io_ops {
 	/* whatever was received and not read yet is discarded */
 	void (*flush_input)(struct phx_io *io);
 	void (*close)(struct phx_io *io);
+	/* optional: what the system knows about the port (sysfs, USB) as
+	 * fields of the JSON object being written */
+	void (*info)(struct phx_io *io, struct jw *w);
 };
 
 struct phx_io {

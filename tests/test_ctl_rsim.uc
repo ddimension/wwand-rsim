@@ -29,6 +29,29 @@ let ctl = require('wwand.ctl.rsim');
 	   [ 'last error', 'no card (retry in 30 s)' ], 'status: the error and when it tries again');
 }
 
+{
+	eq(ctl.status_lines({ enabled: false, lent_to: { to: '10.0.0.2', remote: true, mode: 'sap', commands: 3 }, lend_hold: false }),
+	   [ [ 'remote SIM', 'not configured on this modem (option rsim, or rsim_reader)' ],
+	     [ 'lends card', 'to 10.0.0.2 (another router, SIM Access, radio off) · 3 commands' ] ],
+	   'status: a card lent to another router');
+	eq(ctl.status_lines({ enabled: false, lend_hold: true })[1][0], 'lending', 'status: lending stopped here');
+	eq(ctl.reader_text({ backend: 'bt', name: 'Galaxy', alias: 'My Galaxy', kind: 'smartphone', vendor: 'Samsung',
+	                     key: 'authenticated', channel: 8 }),
+	   '"My Galaxy" (smartphone) · Samsung · authenticated pairing · channel 8', 'reader: a phone in one line');
+	eq(ctl.reader_text({ backend: 'wwand', modem_manufacturer: 'Quectel', modem_model: 'RG502Q', modem_revision: 'R11',
+	                     host: 'nr7101', operator: 'Telekom.de', rat: '5G', iccid: '8949' }),
+	   'Quectel RG502Q · fw R11 · on nr7101 · Telekom.de 5G · ICCID 8949', 'reader: another router\'s modem');
+	eq(ctl.reader_text({ backend: 'phoenix', usb_manufacturer: 'Silicon Labs', usb_product: 'CP2102', usb_serial: '0001',
+	                     usb_path: '1-1.2', clock_khz: 3579, reset_line: 'rts', by_id: '/dev/serial/by-id/x' }),
+	   'Silicon Labs CP2102 · serial 0001 · USB 1-1.2 · 3579 kHz, rts reset · /dev/serial/by-id/x', 'reader: a Phoenix on USB');
+	let sl = ctl.status_lines({ enabled: true, reader: 'ssh:root@b:wwand:m0', slot: 1, state: 'powered',
+	                            reader_info: { backend: 'wwand', modem_model: 'RG502Q', host: 'b' } });
+	eq(sl[1], [ 'reader', 'RG502Q · on b' ], 'status: the reader in use, from its info event');
+	eq(ctl.modem_meta({ manufacturer: 'Quectel', model: 'RG650E-EU', revision: 'R01', imei: '86', state: 'READY', rat: 'LTE',
+	                    registration: { plmn: { mcc: 262, mnc: 1, mnc_digits: 2, description: 'Telekom.de' } } }).plmn,
+	   '26201', 'modem meta: the PLMN spelled with its digits');
+}
+
 // --- enable / disable, through a scripted AT port ----------------------------------
 function fake_ctx(start)
 {
@@ -285,6 +308,188 @@ function fake_ctx(start)
 	ran = [];
 	out = '';
 	eq(ctl.scan({}, [ '--json' ], sys), 1, 'scan: no answer (no helper) is a failure, not an empty list');
+}
+
+// --- proxy: this router's cards for another router ---------------------------------
+{
+	const ICC = '89490200001022832490';
+	let calls = [];
+	let lend = { ended: false };
+	let inv = { cards: [
+		{ iccid: ICC, present: true, active: true, modem: 'm1', slot: 1, imsi: '262011234567890' },
+		{ iccid: '89882390001186977790', present: true, active: false, modem: 'm1', slot: 2 },
+		{ iccid: '89000000000000000001', present: true, active: true, reader: 'sm', modem: null },
+		{ iccid: '89000000000000000002', present: false, active: false, modem: 'm2' },
+	] };
+	let call = (m, a) => {
+		push(calls, [ m, a?.op ?? null, a?.args ?? null ]);
+		if (m == 'sim_inventory')
+			return inv;
+		if (m == 'status')
+			return { modems: { m1: {}, m2: {} } };
+		if (m == 'modem_plugin_status')
+			return { ok: true, lendable: true, why: null };
+		if (m != 'modem_plugin')
+			return null;
+		if (a.op == 'lend_open')
+			return (a.modem == 'm2') ? { ok: false, error: 'busy', detail: 'its card is lent to x' } : { ok: true, id: 'L1' };
+		if (a.op == 'lend_call')
+			return lend.ended ? { ok: true, ended: true, why: 'the donor m1 ended the SIM Access link' }
+				: { ok: true, answer: (a.args.req.op == 'tpdu') ? { ok: true, data: '9000' } : { ok: true, atr: '3B00' } };
+		if (a.op == 'lend_close')
+			return { ok: true, closed: true };
+		return null;
+	};
+	let sims = [ { '.name': 'work', iccid: ICC + 'F', apn: 'internet.work', pdp_type: 'ipv4v6', pincode: '1234', password: 's' } ];
+
+	// the list: lendable active cards, the others with why; settings by ICCID
+	let rows = ctl.lend_rows(call, sims);
+
+	eq(length(rows), 2, 'proxy list: the cards in this router\'s modems (not a reader\'s, not a gone one)');
+	eq([ rows[0].spec, rows[0].modem, rows[0].lendable, rows[0].imsi ], [ 'wwand:iccid:' + ICC, 'm1', true, '262011234567890' ],
+	   'proxy list: the active card, lendable, as wwand:iccid:');
+	eq(rows[0].config, { name: 'work', apn: 'internet.work', pdp_type: 'ipv4v6', auth: null, username: null, password: true, pin: true },
+	   'proxy list: its wwand_sim settings (matched with the trailing F), the PIN and password only as "set"');
+	eq([ rows[1].lendable, index(rows[1].why, 'only that one') >= 0 ], [ false, true ], 'proxy list: an inactive slot\'s card, and why not');
+
+	// a session: open by ICCID, relay, close
+	let out = [];
+	let lines = [ '{"op":"power_up"}', '', '{"op":"tpdu","data":"A0A40000023F00"}', 'garbage' ];
+	let sys = { call: call, pid: 4711, client: '10.0.0.2', sims: sims,
+	            read_line: () => length(lines) ? shift(lines) + '\n' : null, write: (l) => push(out, json(l)) };
+
+	eq(ctl.proxy({}, [ 'iccid:' + ICC, '--mode', 'apdu', '--slot', '1' ], sys), 0, 'proxy: a clean end is 0');
+	eq([ out[0].event, out[0].backend, out[0].reader ], [ 'info', 'wwand', 'm1' ], 'proxy: first an info event, like rsim-card');
+	eq(out[0].sim, { apn: 'internet.work', pdp_type: 'ipv4v6', auth: null, username: null, password: 's', source: 'sim' },
+	   'proxy: ...with the card\'s wwand_sim settings, the password included (the other router keeps them)');
+	eq(ctl.lend_settings([], [ { proto: 'wwand', modem: 'm2', apn: 'x' }, { proto: 'wwand', modem: 'm1', apn: 'internet.m1', auth: 'pap' } ], ICC, 'm1'),
+	   { apn: 'internet.m1', pdp_type: null, auth: 'pap', username: null, password: null, source: 'interface' },
+	   'proxy: no wwand_sim for the card: the modem\'s interface');
+	eq(ctl.lend_settings([], [ { proto: 'wwand', modem: 'm1' } ], ICC, 'm1'), null, 'proxy: no APN anywhere: nothing');
+	eq(slice(out, 1), [ { ok: true, atr: '3B00' }, { ok: true, data: '9000' }, { ok: false, error: 'bad_request', detail: 'not a request object with an op' } ],
+	   'proxy: every request answered, one line each');
+	let open = filter(calls, (c) => c[1] == 'lend_open')[0];
+
+	eq(open[2], { mode: 'apdu', slot: 1, apdu: null, cond: null, client: '10.0.0.2', pid: 4711 },
+	   'proxy: the ICCID\'s modem is asked to lend, with mode, slot, who and its pid');
+	eq(calls[length(calls) - 1][1], 'lend_close', 'proxy: at the end of stdin the card is handed back');
+
+	// the lend ends on the other side: the proxy says so and ends with 1
+	calls = [];
+	out = [];
+	lend.ended = true;
+	lines = [ '{"op":"tpdu","data":"A0A40000023F00"}', '{"op":"status"}' ];
+	eq(ctl.proxy({}, [ 'm1' ], sys), 1, 'proxy: a lend that ended is exit 1 (the helper exit the other router knows)');
+	eq([ length(out), out[1].error ], [ 2, 'io' ], 'proxy: ...after answering the request in flight with an error');
+
+	// refusals, before any line is read
+	lines = [ '{"op":"power_up"}' ];
+	eq(ctl.proxy({}, [ 'm2' ], sys), 1, 'proxy: a modem that cannot lend now');
+	eq(ctl.proxy({}, [ 'm9' ], sys), 1, 'proxy: no such modem');
+	eq(ctl.proxy({}, [ 'iccid:89000000000000000009' ], sys), 1, 'proxy: no modem runs on that card');
+	eq(ctl.proxy({}, [ 'm1', '--mode', 'x' ], sys), 2, 'proxy: a bad option');
+	eq(ctl.proxy({}, [ 'm1' ], { ...sys, pid: 0 }), 1, 'proxy: without its pid it does not open a lend');
+	eq(length(lines), 1, 'proxy: ...none of them read a request');
+
+	out = [];
+	eq(ctl.proxy({}, [ '--list' ], sys), 0, 'proxy --list');
+	eq(length(out), 2, 'proxy --list: one JSON line per card');
+
+	// the scan shows them, and here they are sponsors (modem:)
+	let sl = join('\n', [ sprintf('%J', rows[0]), '{"done":true,"backends":"phoenix,at,wwand"}' ]) + '\n';
+	let printed = ctl.scan_parse(sl, null);
+
+	eq(printed.rows[0].backend, 'wwand', 'scan: the cards of wwand\'s modems come through rsim-card --list');
+	let far = ctl.scan_parse(join('\n', [
+		'{"backend":"tty","spec":"at:/dev/ttyUSB2","device":"/dev/ttyUSB2","hint":"at"}',
+		'{"backend":"tty","spec":"at:/dev/ttyUSB1","device":"/dev/ttyUSB1","hint":"at"}',
+		'{"backend":"wwand","spec":"wwand:iccid:8949","modem":"wwmodem0","modem_ports":{"at":"/dev/ttyUSB2","gps":null,"diag":null}}',
+		'{"done":true}' ]) + '\n', null);
+	eq([ far.rows[0].in_use, far.rows[1].in_use ], [ 'AT port of wwand modem wwmodem0 there', null ],
+	   'scan of another router: the ports its wwand uses are marked, from its own list');
+}
+
+// --- SSH: the restricted authorized_keys line, and what went wrong -----------------
+{
+	let hosts = ctl.ssh_hosts({
+		phone: { type: 'bt', device: 'AA:BB:CC:DD:EE:FF', host: 'root@pc.lan' },
+		sm: { type: 'wbsm', host: 'root@pc.lan' },
+		b: { type: 'wwand', device: 'iccid:89490200001022832490', host: 'root@simrouter' },
+		local: { type: 'pcsc' },
+		sponsor: { type: 'modem', donor: 'm1' },
+	}, { m0: { rsim_reader: 'ssh:rsim@pc.lan:at:/dev/ttyUSB2' }, m1: { rsim_reader: 'phoenix:/dev/ttyUSB0' } });
+
+	eq(hosts, { 'root@pc.lan': [ 'bt:AA:BB:CC:DD:EE:FF', 'wbsm:' ], 'root@simrouter': [ 'wwand:iccid:89490200001022832490' ],
+	            'rsim@pc.lan': [ 'at:/dev/ttyUSB2' ] },
+	   'ssh: per machine the readers it is asked for, from named readers and spelled-out ones');
+	eq(ctl.authorized_line('ssh-ed25519 AAAAC3x wwand-rsim\n', hosts['root@pc.lan']),
+	   'command="rsim-card --serve \'bt:AA:BB:CC:DD:EE:FF\' \'wbsm:\'",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAAC3x wwand-rsim',
+	   'ssh: the key restricted to rsim-card --serve for those readers');
+	eq(ctl.authorized_line('k', [ 'pcsc:SCM SCR 3310 [CCID Interface] 00 00', 'at:/dev/tty*' ]),
+	   'command="rsim-card --serve \'pcsc:SCM SCR 3310 \\[CCID Interface\\] 00 00\' \'at:/dev/tty\\*\'",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding k',
+	   'ssh: a reader name\'s [ ] * stay literal (fnmatch there)');
+	ok(index(ctl.authorized_line('k', [ 'wbsm:' ], '/home/u/.local/bin/rsim-card'), 'command="\'/home/u/.local/bin/rsim-card\' --serve \'wbsm:\'"') == 0,
+	   'ssh: rsim-card outside the PATH: the reader\'s helper path in command=');
+	ok(index(ctl.ssh_diagnose([ 'root@pc.lan: Permission denied (publickey).' ], 'root@pc.lan', true), 'authorized_keys') >= 0,
+	   'ssh: a key not accepted — where it goes');
+	ok(index(ctl.ssh_diagnose([], 'root@pc.lan', false), 'ssh-key root@pc.lan') >= 0, 'ssh: no key yet — how to make one');
+	ok(index(ctl.ssh_diagnose([ 'sh: rsim-card: not found' ], 'root@pc.lan', true), 'apk add rsim-card') >= 0,
+	   'ssh: rsim-card missing there');
+	ok(index(ctl.ssh_diagnose([ 'rsim-card --serve: this reader is not served to this key: pcsc:0 — this key is for wwand-rsim only' ], 'root@pc.lan', true), 'restricted') >= 0,
+	   'ssh: a restricted key that does not allow it');
+	ok(index(ctl.ssh_diagnose([ 'Host key verification failed.' ], 'root@pc.lan', true), 'known_hosts') >= 0, 'ssh: a changed host key');
+	ok(index(ctl.ssh_diagnose([ 'dbclient: Connection to root@pc.lan:22 exited: Error connecting: Connection refused' ], 'root@pc.lan', true), 'cannot be reached') >= 0,
+	   'ssh: not reachable');
+	eq(ctl.ssh_diagnose([ 'something else' ], 'h', true), null, 'ssh: nothing fits, no guess');
+	// ucode resolves a name where the function using it is compiled: every
+	// helper ssh_key calls must be declared above it (HW-found on 245)
+	let src = require('fs').readfile(sourcepath(0, true) + '/../ctl/rsim.uc') ?? '';
+
+	for (let f in [ 'readers_now', 'modems_now', 'ssh_hosts', 'authorized_line' ])
+		ok(index(src, 'function ' + f + '(') >= 0 && index(src, 'function ' + f + '(') < index(src, 'function ssh_key('),
+		   sprintf('ssh-key: %s is declared before ssh_key', f));
+	eq(ctl.scan_parse('Warning: Permanently added\n{"done":true}\n', null).noise, [ 'Warning: Permanently added' ],
+	   'scan: what the far side said besides JSON is kept for the diagnosis');
+}
+
+// --- test: ONE named source, opened like a session; the scan never does it --------
+{
+	let ran = [];
+	let answers = {};
+	let sys = {
+		helper: '/usr/bin/rsim-card',
+		status: () => ({ modems: { m0: { at_tty: '/dev/ttyUSB2' } } }),
+		ssh_sys: { flavor: 'dropbear', exists: () => true },
+		run: (cmd, input) => { push(ran, [ cmd, input ]); for (let k, v in answers) if (index(cmd, k) >= 0) return v; return ''; },
+	};
+
+	answers["'--list'"] = join('\n', [
+		'{"backend":"tty","spec":"at:/dev/ttyACM0","device":"/dev/ttyACM0","by_id":"/dev/serial/by-id/usb-SAMSUNG-if01","hint":"at"}',
+		'{"backend":"tty","spec":"phoenix:/dev/ttyUSB0","device":"/dev/ttyUSB0","hint":"phoenix"}',
+		'{"backend":"tty","spec":"","device":"/dev/ttyUSB8","hint":"diag","role":"diag"}',
+		'{"done":true}' ]) + '\n';
+	answers["'at:/dev/ttyACM0'"] = 'rsim-card: /dev/ttyACM0: the modem refuses AT+CSIM (ERROR) — its card cannot be used this way\n';
+	answers["'wbsm:'"] = join('\n', [
+		'{"event":"info","backend":"phoenix","reader":"wbsm:","usb_product":"Smartmouse USB"}',
+		'{"ok":true,"atr":"3B9E96"}',
+		'{"ok":true,"present":true,"powered":true,"backend":"phoenix","reader":"wbsm:","atr":"3B9E96","clock_khz":3580}' ]) + '\n';
+
+	eq(ctl.test_source({}, [ 'wbsm:', '--json' ], sys), 0, 'test: a reader that works is 0');
+	eq(ran[0][1], '{"op":"power_up"}\n{"op":"status"}\n', 'test: power-up and status, then its end of input hands the card back');
+	eq(ctl.test_source({}, [ '/dev/serial/by-id/usb-SAMSUNG-if01', '--json' ], sys), 1, 'test: a port named by its stable name');
+	ok(index(ran[length(ran) - 1][0], "'at:/dev/ttyACM0'") >= 0, 'test: ...is what the scan says it is (a modem port: at:)');
+	ok(index(ran[length(ran) - 1][0], "'--at-radio' 'keep'") >= 0, 'test: ...and its radio is left as it is');
+	eq(ctl.test_source({}, [ 'at:/dev/ttyUSB2' ], sys), 1, 'test: a port of wwand\'s own modem is refused');
+	eq(length(filter(ran, (r) => index(r[0], 'ttyUSB2') >= 0)), 0, 'test: ...without being opened');
+	eq(ctl.test_source({}, [ '/dev/ttyS9' ], sys), 1, 'test: a device the scan does not know is not guessed at');
+	let before = length(ran);
+
+	eq(ctl.test_source({}, [ '/dev/ttyUSB8' ], sys), 1, 'test: a diagnostic port is refused');
+	eq(length(ran), before + 1, 'test: ...after the (passive) scan, without opening it');
+	eq(ctl.test_source({}, [ 'at:/dev/ttyACM0', 'root@h;x' ], sys), 2, 'test: a host is user@host');
+	ran = [];
+	ctl.test_source({}, [ 'bt:34:82:C5:58:C9:21', 'root@simhost' ], sys);
+	ok(index(ran[0][0], 'root@simhost') >= 0 && index(ran[0][0], "'bt:34:82:C5:58:C9:21'") >= 0, 'test: on another machine, over SSH');
 }
 
 done('test_ctl_rsim');

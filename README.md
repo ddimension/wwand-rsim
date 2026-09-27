@@ -6,8 +6,9 @@ the modem side is Qualcomm's QMI UIM Remote service, the card side a local
 reader — a Phoenix/Smartmouse USB-serial reader driven directly, or any PC/SC
 (CCID) reader.
 
-Status: implemented and host-tested; not yet run on hardware. See
-[docs/plan.md](docs/plan.md).
+Status: in use on hardware — see [What works](#what-works) for the modems,
+readers, phones and sponsors it has run with, and the workarounds for them.
+Design notes: [docs/plan.md](docs/plan.md).
 
 ## Parts
 
@@ -92,6 +93,33 @@ RAM: a pairing is gone after a reboot unless that directory is kept.
 A dropped link (phone out of range, SIM access switched off on the phone)
 ends the helper; the modem gets its own SIM back and the plugin tries again.
 
+**A modem's card on another wwand router:** `ssh:<user>@<host>:wwand:<modem>`,
+or `wwand:iccid:<ICCID>` to name the card rather than the modem it sits in.
+There the plugin runs `wwandctl rsim proxy <modem|iccid:ICCID>` instead of
+rsim-card: a relay that speaks rsim-card's protocol on stdin/stdout and
+hands each request to the rsim plugin in THAT router's daemon, which lends
+the card the way a SIM sponsor on one router does — over the SIM Access
+Profile (default) or APDU by APDU (`rsim_donor_mode apdu`, with
+`rsim_donor_slot`, `rsim_donor_apdu`, `rsim_donor_cond` as for a sponsor).
+Its radio is parked for as long as the card is lent, its interfaces are
+refused (`radio_held`), and its status page says to whom. The card goes
+home when the proxy ends: at the end of stdin (a dropped SSH link
+included), or — killed hard — when the daemon there sees its process gone
+(within 10 s). A modem there that uses a remote card itself, lends its card
+to a modem there, or is configured as a sponsor there is not lent. This
+needs wwand-rsim on that router (the proxy is part of it); a router with
+only rsim-card has no modems to lend. As a named reader: `option type
+'wwand'`, `option host`, `option device '<modem>|iccid:<ICCID>'`, and the
+`donor_*` options.
+
+`rsim-card --list` on a router with wwand-rsim adds its modems' cards
+(`wwandctl rsim proxy --list`): each with its ICCID, IMSI, modem and slot,
+whether it can be lent now (only the card a modem runs on; why not
+otherwise), and the `wwand_sim` settings that router has for it — APN, PDP
+type, login; the PIN and password only as "set", never their values. So
+`wwandctl rsim scan user@host` shows them from the other side; here they
+appear as `modem:<name>` (a sponsor on this router).
+
 **What is there to use:** `wwandctl rsim scan` lists what this router
 offers as a card source — PC/SC readers (with or without a card), Smartmouse
 USB readers, serial ports that look like a Phoenix adapter or a modem's AT
@@ -102,6 +130,24 @@ modems are marked (an `at:` reader there would take the card from under
 wwand; that is the `modem` kind). `wwandctl rsim scan user@simhost` asks a
 SIM host over SSH the same. Underneath: `rsim-card --list`, JSON lines,
 which only looks: nothing is sent to a port.
+
+**SSH, restricted to what wwand-rsim needs:** `wwandctl rsim ssh-key
+[user@host]` creates the router's key and prints, per machine the
+configuration reaches over SSH, the line for its `authorized_keys`:
+
+```
+command="rsim-card --serve 'bt:AA:BB:CC:DD:EE:FF' 'wwand:iccid:8949…'",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding ssh-ed25519 AAAA… wwand-rsim
+```
+
+`rsim-card --serve` runs only wwand-rsim's own calls — rsim-card for the
+readers listed (fnmatch patterns; none: any), its `--list`, and on a wwand
+router `wwandctl rsim proxy` for `wwand:<modem>` / `wwand:iccid:<ICCID>`
+targets listed — split into words and exec'd, never through a shell. It is
+part of rsim-card, so it works on a PC with nothing but rsim-card as well as
+on a wwand router. `wwandctl rsim scan user@host` says what is wrong when a
+machine does not answer: no key yet, key not accepted (and the line to put
+there), a restricted key that does not allow the call, rsim-card missing,
+a changed host key, not reachable.
 
 **A reader on another machine:** `rsim_reader 'ssh:<user>@<host>:<reader>'`
 runs the helper there over SSH, e.g. `ssh:rsim@pc.lan:wbsm:`. On the router,
@@ -116,7 +162,11 @@ modem on the router lend its SIM — over the SIM Access Profile
 (`rsim_donor_mode sap`, the donor hands its card over; Quectel needs
 `wwandctl rsim DONOR sap-enable`), or APDU by APDU while the card stays with
 the donor (`rsim_donor_mode apdu`, over QMI UIM or `AT+CSIM`,
-`rsim_donor_apdu auto|qmi|at`). A modem configured as another's donor keeps
+`rsim_donor_apdu auto|qmi|at`). Unset (the default, *automatic* in LuCI):
+SIM Access where the donor has it, APDU where it has not — a donor without
+QMI UIM (an NCM modem) lends over `AT+CSIM`, and one whose SIM Access is
+known to hang (Huawei E392), or has not answered a connect once, lends
+APDU by APDU. A modem configured as another's donor keeps
 its radio off, link or not — wwand refuses its interfaces (`radio_held`) and
 parks any registration of it — and gets it back when that configuration is
 removed, as its own `option lowpower` allows. `rsim_donor_slot` names the donor's physical slot (default: the
@@ -128,9 +178,113 @@ card and lend the other (HW-checked on a Quectel RG502Q and RG650E,
 can lend its card.
 
 **LuCI:** `luci-app-wwand-rsim` — Network → Remote SIM sets all of this per
-modem.
+modem, and more:
+- **Status**, every 5 s: per modem the card in use, the remote SIM (reader,
+  state, since when, ATR, commands and last SW, the last error and when it is
+  retried), and whom it lends its own card to (a modem here or another
+  router, how, since when, commands) — or why it cannot lend it. Buttons:
+  *Restart*, *Take back* (ends lending to another router and stops it until
+  *Allow lending*), *Probe* (what its UIM offers for lending).
+- **Find SIM sources**: the scan of this router or of `user@host` — readers,
+  serial ports, paired phones, and the cards of a wwand router's modems with
+  the settings it has for them — each with *Add*, which creates the SIM
+  reader for it (a card of a modem here as a SIM sponsor).
+- **SSH setup**: the router's key (*Create key* when there is none), and per
+  machine the restricted `authorized_keys` line with a *Test* that shows what
+  is wrong and what to do.
+
+`wwandctl rsim MODEM take-back` / `lend-allow` do the same as the buttons;
+`wwandctl rsim` shows the lending too.
 
 Removing `rsim_reader` gives the modem its own SIM back.
+
+**The lender's settings come along:** a card borrowed from another wwand
+router, or from a sponsor here, brings the settings its owner dials it with
+— that router's `wwand_sim` for the ICCID, or else the APN, PDP type and
+login of the modem's interface. They are kept here as the card's own
+`wwand_sim` (`wwsim_<ICCID>`, `option origin 'rsim'`), so the next dial with
+that card uses them, now and after a restart. A `wwand_sim` you wrote for
+the card is never touched; removing the `origin` line makes one of these
+yours.
+
+**While a card is lent, its modem's radio is off, the SIM left on** — on
+every path: QMI `LOW_POWER`, MBIM radio state off, `AT+CFUN=4` on an NCM
+modem and on an AT port (rsim-card; read back, parked again if something
+switches it on, put back as it was at the end). `CFUN=0` is used only where
+a modem refuses 4. Two modems must never register with one card.
+
+## What works
+
+HW-tested on OpenWrt routers — MikroTik Chateau 5G (RG650E-EU, 245),
+Zyxel NR7101 (RG502Q, 242), Cudy LT300 v3 (MeiG SLM770A-R, 3.113) — and a
+Linux PC as SIM host, 2026-09-26/27. *Works* means the modem read the card,
+authenticated with it and registered; *card only* that the card was read
+and used but the network refused the subscription (an inactive SIM).
+
+**Clients — a modem that runs on a remote card** (QMI UIM Remote; Qualcomm
+modems, the service switched on in the firmware — Quectel: `wwandctl rsim
+enable --reset`):
+
+| Modem | Card from | Result |
+|---|---|---|
+| Quectel RG650E-EU (QMI) | NR7101's RG502Q over SSH, SIM Access | works, data |
+| | Cudy's MeiG SLM770A over SSH, APDU over `AT+CSIM` | works, data (IPv4) |
+| | Huawei E392 on the same router, APDU over QMI UIM | works (registered; no data with that SIM's plan) |
+| | Galaxy S20 FE over Bluetooth SAP, via a PC | card only (inactive SIM) |
+| | Galaxy A5 (2016) over Bluetooth SAP, via a PC | card only (inactive SIM) |
+
+Not a client: NCM and MBIM-only modems (no QMI UIM Remote); other Qualcomm
+modems are untested.
+
+**Providers — where a card can come from:**
+
+| Kind | Tested with | State |
+|---|---|---|
+| `wbsm:` WB Electronics Smartmouse USB | on a PC (Vodafone card) | works (card read; that SIM is inactive) |
+| `phoenix:` Phoenix serial reader | simulated card only | not HW-tested |
+| `pcsc:` PC/SC reader | simulated card only | not HW-tested |
+| `bt:` phone, SIM Access Profile | Galaxy S20 FE, Galaxy A5 (2016) | works (root, the init network namespace) |
+| `at:` a modem wwand does not manage | Huawei E392 PC UI port, Samsung S20 USB modem | both refuse `AT+CSIM` (CME 4 / Samsung's AT lock) — refused at open, with the reason |
+| `modem:` sponsor on this router | Huawei E392 (QMI) | works, APDU (automatic) |
+| `wwand:` modem on another wwand router | Quectel RG502Q (SIM Access), MeiG SLM770A-R on NCM (APDU over `AT+CSIM`) | works |
+
+**Workarounds** — each found on the hardware above, each covered by a test:
+
+- *Phones (SAP):* the connect asks for 1024-byte messages and steps down
+  (512, 300, 276, 261) when refused — Samsung's SAP takes only 261 at first.
+  A `CONNECT_RESP` arriving late is ignored; an ATR response without an ATR
+  is asked again (a phone whose SIM is not ready); the phone's
+  `DISCONNECT_RESP` often comes late and is waited for 2 s, not required.
+  Bluetooth sockets exist only in the init network namespace: on a PC in a
+  container, run rsim-card through `nsenter -t 1 -n`.
+- *Quectel as sponsor (SIM Access):* SAP needs the EFS item
+  `…/uim/sap_security_restrictions` = 00; wwand-rsim writes it in the
+  modem's AT init (idempotent, one modem reset). The connect's condition
+  TLV is refused as malformed by some firmware (`rsim_donor_cond none`); a
+  sponsor busy with a data session (QMI 52) has its radio parked and is
+  asked once more.
+- *Huawei E392 as sponsor:* its SIM Access takes the card and never answers
+  the connect (the modem then needs a reset) — so APDU by default. Its QMI
+  UIM does not pass SEARCH RECORD or file access by short file identifier
+  (QMI error 3); the card's answer `6A81` (function not supported) goes back
+  instead of an I/O error, and the client falls back to SELECT + READ.
+- *APDU sponsors:* a UIM that refuses `SEND_APDU` (QMI 71/82/94) is used
+  over `AT+CSIM`; one without QMI UIM (NCM) over `AT+CSIM` from the start.
+  The ATR is the minimal `3B00` there — AT has no command for the card's.
+- *Sponsor start:* a lending waits until the sponsor's services are up; a
+  daemon restart no longer makes the first attempt fail for good.
+- *Card change on the client:* the identity is read from the card, never
+  from the firmware's cache (`GET_IMSI` answers the previous card's IMSI for
+  a while — which matched the previous card's `wwand_sim`, PIN and APN).
+- *AT ports (`at:`):* nothing is sent at scan time. At open: a diagnostic
+  port (by the interface's name or Huawei's protocol byte) is refused
+  unopened, `AT+CSIM` is probed once and a modem that refuses it is refused
+  with the reason (Samsung's `PACM` lock named as such), the radio is parked
+  with `CFUN=4` and read back — not parked, not lent.
+- *Slow links:* a command through a remote AT sponsor takes about 1 s (the
+  Cudy: SSH, a small CPU, `AT+CSIM`); a client reads ~150–250 commands
+  before it registers, so the first registration takes 2–3 minutes. The
+  first answer of a Bluetooth or proxy source may take 60 s.
 
 ## A SIM host: only the reader tool
 

@@ -95,6 +95,27 @@ uloop.init();
 	eq([ rbt.rsim_reader, rbt.rsim_bt_channel ], [ 'ssh:u@pc.lan:bt:00:11:22:aa:bb:cc', '8' ], 'reader bt: a named phone on a SIM host');
 	ok(index(rsim.reader_options({ type: 'bt', device: 'phone' }).error ?? '', 'Bluetooth address') >= 0,
 	   'reader bt: a device that is no address, refused');
+
+	// a modem's card on another wwand router, lent by its wwand-rsim
+	let pc = rsim.cfg_of({ rsim_reader: 'ssh:root@simhost:wwand:wwmodem0' });
+
+	eq([ pc?.local_reader, pc?.proxy ], [ 'wwand:wwmodem0', { mode: 'auto', slot: null, cond: null, apdu: null } ],
+	   'cfg wwand: a modem on another router, its proxy decides how by default');
+	eq(rsim.helper_argv(pc, '/x', { flavor: 'dropbear', exists: () => true })[8],
+	   "'wwandctl' 'rsim' 'proxy' 'wwmodem0'", 'cfg wwand: over SSH, the proxy there instead of rsim-card (no --mode: it decides)');
+	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: 'ssh:root@simhost:wwand:wwmodem0', rsim_donor_mode: 'sap' }),
+	                   '/x', { flavor: 'dropbear', exists: () => true })[8],
+	   "'wwandctl' 'rsim' 'proxy' 'wwmodem0' '--mode' 'sap'", 'cfg wwand: SIM Access set explicitly, passed on');
+	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: 'ssh:root@simhost:wwand:iccid:89490200001022832490',
+	                                  rsim_donor_mode: 'apdu', rsim_donor_slot: '2', rsim_donor_apdu: 'at', rsim_ssh_helper: '/opt/x' }),
+	                   '/x', { flavor: 'dropbear', exists: () => true })[8],
+	   "'wwandctl' 'rsim' 'proxy' 'iccid:89490200001022832490' '--mode' 'apdu' '--slot' '2' '--apdu' 'at'",
+	   'cfg wwand: by ICCID, with the sponsor options; the rsim-card path does not apply');
+	eq(rsim.cfg_of({ rsim_reader: 'wwand:wwmodem0' }), null, 'cfg wwand: only over SSH (here it is modem:<name>)');
+	eq(rsim.cfg_of({ rsim_reader: 'ssh:root@simhost:wwand:m0;reboot' }), null, 'cfg wwand: a modem name is a name');
+	eq(rsim.reader_options({ type: 'wwand', host: 'root@simhost', device: 'iccid:89490200001022832490', donor_mode: 'apdu' }).rsim_reader,
+	   'ssh:root@simhost:wwand:iccid:89490200001022832490', 'reader wwand: a named one');
+	ok(index(rsim.reader_options({ type: 'wwand', device: 'm0' }).error ?? '', 'host') >= 0, 'reader wwand: needs its host');
 	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: 'phoenix:/dev/ttyUSB0', rsim_clock: '6000', rsim_reset: 'rts_inv' }), '/x'),
 	   [ '/x', 'phoenix:/dev/ttyUSB0', '--clock', '6000', '--reset', 'rts_inv' ],
 	   'cfg: Phoenix options reach the helper');
@@ -223,7 +244,8 @@ let card_model = () => ({
 });
 
 let changes = [];
-let mk = (reader, client_of, t) => rsim.create({
+let mk = (reader, client_of, t, more) => rsim.create({
+	...(more ?? {}),
 	log: (l, m) => null,
 	sim_changed: (ref, why) => push(changes, why),
 	open_helper: reader.open_helper,
@@ -486,8 +508,8 @@ function sap_donor(log)
 	});
 	let ext = { rsim_reader: 'modem:m1' };
 
-	eq(rsim.cfg_of(ext).donor, { ref: 'm1', mode: 'sap', slot: null, cond: null, apdu: 'auto' },
-	   'donor: SIM Access Profile by default, the slot the donor runs on');
+	eq(rsim.cfg_of(ext).donor, { ref: 'm1', mode: 'auto', slot: null, cond: null, apdu: 'auto' },
+	   'donor: SIM Access Profile by default (auto), the slot the donor runs on');
 
 	p.tick('m0', ext);
 	run_for(1200);
@@ -560,14 +582,41 @@ function sap_donor(log)
 	run_for(50);
 	eq(length(filter(donor.sent, (x) => x.name == 'SAP_CONNECTION' && x.args.conn.op == 1)), n,
 	   'donor: an unanswered connect is not retried on its own — each retry costs the donor its registration');
-	ok(index(p.status('m0', { rsim_reader: 'modem:m1' })?.text ?? '', 'rsim_donor_mode apdu') >= 0,
-	   'donor: ...and the status says what to use instead');
+	ok(index(p.status('m0', { rsim_reader: 'modem:m1' })?.text ?? '', 'APDU mode from now on') >= 0,
+	   'donor: ...and the status says it lends in APDU mode from now on');
 
 	p.ops.restart('m0', {}, {}, () => null);
 	p.tick('m0', { rsim_reader: 'modem:m1' });
 	run_for(50);
-	ok(length(filter(donor.sent, (x) => x.name == 'SAP_CONNECTION' && x.args.conn.op == 1)) > n,
-	   'donor: `wwandctl rsim restart` tries again');
+	eq(length(filter(donor.sent, (x) => x.name == 'SAP_CONNECTION' && x.args.conn.op == 1)), n,
+	   'donor: `wwandctl rsim restart` does not try SIM Access on it again (auto: APDU now)');
+
+	// SIM Access set explicitly: the old way — say what to use, retry on restart
+	let p2 = rsim.create({
+		log: (l, m) => null, sim_changed: () => null,
+		modem_of: (ref) => ({ modem: modem_obj(ref) }),
+		qmi_client: (ref, schema, cb) => cb(null, (ref == 'm1') ? donor : fake_client()),
+		qmi_release: (ref, c) => { c.released = true; },
+		now: () => t.now,
+	});
+	let ext2 = { rsim_reader: 'modem:m1', rsim_donor_mode: 'sap' };
+
+	p.stop();
+	run_for(50);
+	p2.tick('m0', ext2);
+	run_for(50);
+	ok(index(p2.status('m0', ext2)?.text ?? '', 'rsim_donor_mode apdu') >= 0,
+	   'donor, SIM Access set: the status says what to use instead');
+
+	let n2 = length(filter(donor.sent, (x) => x.name == 'SAP_CONNECTION' && x.args.conn.op == 1));
+
+	p2.ops.restart('m0', {}, {}, () => null);
+	p2.tick('m0', ext2);
+	run_for(50);
+	ok(length(filter(donor.sent, (x) => x.name == 'SAP_CONNECTION' && x.args.conn.op == 1)) > n2,
+	   'donor, SIM Access set: `wwandctl rsim restart` tries again');
+	p2.stop();
+	run_for(50);
 }
 
 // The donor ends the link while an answer is still on its way: the late
@@ -1013,6 +1062,7 @@ let donor_plugin = (o) => rsim.create({
 	modem_radio: (ref, on, cb) => { push(o.radio ?? [], [ ref, on ]); if (o.mods?.[ref]) o.mods[ref].lowpower_parked = !on; cb?.(null); },
 	sim_slots: o.sim_slots,
 	modem_sections: o.modem_sections ?? (() => ({})),
+	pid_alive: o.pid_alive,
 	now: () => o.t.now,
 });
 
@@ -1153,6 +1203,134 @@ let donor_plugin = (o) => rsim.create({
 	run_for(50);
 	eq(radio, [ [ 'm1', false ], [ 'm1', true ] ], 'AT donor: the link ends on its restart and the radio is woken, client or not');
 	ok(old != null, 'AT donor: (the old object was replaced)');
+}
+
+// a donor without QMI UIM (NCM) and no mode set: SIM Access is not there,
+// so it lends in APDU mode over AT+CSIM; SIM Access set explicitly is refused
+{
+	for (let mode in [ null, 'sap' ]) {
+		let t = { now: 1000 };
+		let target = fake_client();
+		let radio = [];
+		let sent = [];
+		let mods = { m1: { state: 'READY', lowpower_parked: false,
+		                   at: { send: (c, cb) => { push(sent, c); cb(null, { lines: [ '+CSIM: 4,"9000"' ] }); } } } };
+		let p = donor_plugin({ t: t, target: target, radio: radio, mods: mods,
+			qmi_client: (ref, schema, cb) => (ref == 'm1') ? cb({ error: 'unsupported' }, null) : cb(null, target) });
+		let ext = { rsim_reader: 'modem:m1', rsim_donor_mode: mode };
+
+		p.tick('m0', ext);
+		run_for(200);
+
+		let st;
+
+		p.ops.status('m0', ext, {}, (e, r) => { st = r; });
+
+		if (mode == null) {
+			eq(radio, [ [ 'm1', false ] ], 'NCM donor, auto: its radio is parked (APDU mode)');
+			eq(target.events(), [ 1 ], 'NCM donor, auto: the card is offered to the target modem');
+			eq(st.reader_info?.mode, 'apdu', 'NCM donor, auto: the status says APDU, not the configured auto');
+
+			target.fire('CONNECT_IND', { slot: 1 });
+			run_for(50);
+			target.fire('APDU_IND', { slot: 1, apdu_id: 5, command: rsim.bytes('00A40004023F00') });
+			run_for(50);
+
+			let ans = filter(target.sent, (x) => x.name == 'APDU');
+
+			eq(sent, [ 'AT+CSIM=14,"00A40004023F00"' ], 'NCM donor, auto: the command goes over AT+CSIM');
+			eq(rsim.hexs(ans[0]?.args?.response), '9000', 'NCM donor, auto: ...and its answer back to the target');
+		}
+		else {
+			eq(sent, [], 'NCM donor, SIM Access set: nothing sent over AT');
+			ok(index(st.last_error ?? '', 'no UIM client') >= 0,
+			   sprintf('NCM donor, SIM Access set: refused with the reason (%s)', st.last_error));
+		}
+	}
+}
+
+// an E392 hangs on a SIM Access connect: by default it lends in APDU mode,
+// and never gets a connect; SIM Access set explicitly is still tried
+{
+	for (let mode in [ null, 'sap' ]) {
+		let t = { now: 1000 };
+		let target = fake_client();
+		let donor = apdu_donor();
+		let mods = { m1: { state: 'READY', lowpower_parked: false, info: { model: 'E392' } } };
+		let p = donor_plugin({ t: t, donor: donor, target: target, radio: [], mods: mods });
+		let ext = { rsim_reader: 'modem:m1', rsim_donor_mode: mode };
+
+		p.tick('m0', ext);
+		run_for(300);
+
+		let connects = filter(donor.sent, (x) => x.name == 'SAP_CONNECTION' && x.args?.conn?.op == 1);
+
+		if (mode == null) {
+			eq(length(connects), 0, 'E392, auto: no SIM Access connect is sent');
+			eq(target.events(), [ 1 ], 'E392, auto: its card is offered in APDU mode');
+		}
+		else
+			eq(length(connects), 1, 'E392, SIM Access set: it is asked all the same');
+
+		p.stop();
+		run_for(50);
+	}
+}
+
+// a sponsor still coming up (a daemon restart): nothing is started until it
+// is ready — started early, its park had no client and refused for good
+{
+	let t = { now: 1000 };
+	let target = fake_client();
+	let donor = apdu_donor();
+	let radio = [];
+	let mods = { m0: { state: 'READY' }, m1: { state: 'INIT_SERVICES', lowpower_parked: false } };
+	let p = donor_plugin({ t: t, donor: donor, target: target, radio: radio, mods: mods });
+	let ext = { rsim_reader: 'modem:m1', rsim_donor_mode: 'apdu' };
+
+	p.tick('m0', ext);
+	run_for(100);
+	eq([ radio, target.events() ], [ [], [] ], 'sponsor not ready: nothing started, nothing parked');
+
+	mods.m1.state = 'READY';
+	t.now += 20;
+	p.tick('m0', ext);
+	run_for(100);
+	eq([ radio, target.events() ], [ [ [ 'm1', false ] ], [ 1 ] ], 'sponsor ready: parked, and its card offered');
+	p.stop();
+	run_for(50);
+}
+
+// an SFI access the donor's UIM refuses as an internal error (E392): the
+// card's answer 6A81, not an I/O error that makes the target reset the card
+{
+	let t = { now: 1000 };
+	let target = fake_client();
+	let donor = fake_client({ answer: (name, a) =>
+		(name == 'GET_ATR') ? { atr: rsim.bytes(ATR) }
+		: (name == 'SEND_APDU') ? (((a.apdu[1] == 0xB0 && (a.apdu[2] & 0x80)) || a.apdu[1] == 0xA2) ? { __err: { error: 'qmi', code: 3 } } : { response: rsim.bytes('9000') })
+		: {} });
+	let p = donor_plugin({ t: t, donor: donor, target: target, radio: [] });
+	let ext = { rsim_reader: 'modem:m1', rsim_donor_mode: 'apdu' };
+
+	p.tick('m0', ext);
+	run_for(100);
+	target.fire('CONNECT_IND', { slot: 1 });
+	run_for(50);
+	target.fire('APDU_IND', { slot: 1, apdu_id: 7, command: rsim.bytes('00B0830004') });
+	run_for(50);
+	target.fire('APDU_IND', { slot: 1, apdu_id: 8, command: rsim.bytes('00B0000004') });
+	run_for(50);
+	target.fire('APDU_IND', { slot: 1, apdu_id: 9, command: rsim.bytes('00A2010403FFFFFF') });
+	run_for(50);
+
+	let ans = map(filter(target.sent, (x) => x.name == 'APDU'), (x) => rsim.hexs(x.args?.response));
+
+	eq(ans, [ '6A81', '9000', '6A81' ], 'refused by the donor\'s UIM (SFI read, SEARCH RECORD): answered 6A81; a plain read goes through');
+	eq(rsim.sfi_access(rsim.bytes('00B2010C00')), true, 'sfi_access: READ RECORD with an SFI in P2');
+	eq(rsim.sfi_access(rsim.bytes('00B2010400')), false, 'sfi_access: READ RECORD of the current EF');
+	p.stop();
+	run_for(50);
 }
 
 // --- a modem that is not ready yet --------------------------------------------------
@@ -1418,6 +1596,265 @@ let donor_plugin = (o) => rsim.create({
 	secs = { m0: {}, m1: {} };
 	t.now++;
 	eq(p.radio_hold('m1', {}), null, 'config hold: configured away, the hold goes');
+}
+
+// --- the AT init step that allows a Qualcomm modem to lend its card over SAP --------
+{
+	let t = { now: 100 };
+	let p = donor_plugin({ t: t, target: fake_client(), donor: fake_client() });
+	let q = { protocol: 'qmi', manufacturer: 'Quectel', model: 'RG502Q-EA' };
+	let st = p.at_init('m1', {}, q);
+
+	eq(length(st), 1, 'sap init: a Qualcomm (QMI) modem from Quectel gets the step');
+	eq([ st[0].check, st[0].set, st[0].reset ],
+	   [ 'AT+QNVFR="/nv/item_files/modem/qmi/uim/sap_security_restrictions"',
+	     'AT+QNVFW="/nv/item_files/modem/qmi/uim/sap_security_restrictions",00', true ],
+	   'sap init: read the EFS item, write 00 only when it differs, then one reset');
+	ok(match('+QNVFR: 00', regexp(st[0].want)) && match('+QNVFR: "00"', regexp(st[0].want)) && !match('+QNVFR: 01', regexp(st[0].want)),
+	   'sap init: "already set" is 00, quoted or not, and nothing else');
+	eq(length(p.at_init('m1', {}, { ...q, protocol: 'mbim' })), 1, 'sap init: MBIM too (Qualcomm with the QMI passthrough)');
+	eq(p.at_init('m1', {}, { ...q, protocol: 'ncm' }), [], 'sap init: not an NCM modem (not Qualcomm UIM)');
+	eq(p.at_init('m1', {}, { protocol: 'qmi', manufacturer: 'Huawei Technologies Co., Ltd.' }), [],
+	   'sap init: a Qualcomm modem of a vendor whose EFS command is unknown: nothing (no failing command every start)');
+	eq(p.at_init('m1', { rsim_sap_auto: '0' }, q), [], 'sap init: off with rsim_sap_auto 0');
+
+	// a UIM without the SIM Access service (error 71): left out once known
+	let mods = { m1: { state: 'READY' } };
+	let p2 = donor_plugin({ t: t, target: fake_client(), mods: mods,
+		qmi_client: (ref, schema, cb) => cb(null, fake_client({ answer: () => ({ __err: { error: 'qmi', code: 71 } }) })) });
+
+	p2.tick('m1', {});
+	run_for(50);
+	eq(p2.at_init('m1', {}, q), [], 'sap init: a UIM that has no SAP is left out');
+}
+
+// --- what the reader is: the helper's info event, kept for the status ------------
+{
+	let t = { now: 3000 };
+	let reader = fake_reader(card_model());
+	let p = mk(reader, (ref, schema, cb) => cb(null, fake_client()), t);
+
+	p.tick('m0', EXT);
+	run_for(50);
+	reader.on_line('{"event":"info","backend":"phoenix","reader":"/dev/ttyUSB0","usb_product":"CP2102","clock_khz":3579}');
+
+	let st = null;
+
+	p.ops.status('m0', EXT, {}, (e, r) => { st = r; });
+	eq(st?.reader_info, { backend: 'phoenix', reader: '/dev/ttyUSB0', usb_product: 'CP2102', clock_khz: 3579 },
+	   'info: the reader\'s info event is kept for the status');
+	ok(st?.state != 'failed', 'info: ...and is not taken for an answer');
+	p.stop();
+	run_for(50);
+}
+
+// the lending router's settings for its card: kept here as the card's
+// wwand_sim (sim_upsert, origin rsim), and not in the status
+{
+	let t = { now: 3000 };
+	let reader = fake_reader(card_model());
+	let ups = [];
+	let p = mk(reader, (ref, schema, cb) => cb(null, fake_client()), t,
+		{ sim_upsert: (iccid, f, origin) => { push(ups, [ iccid, f, origin ]); return { written: true, section: 'wwsim_' + iccid }; } });
+
+	p.tick('m0', EXT);
+	run_for(50);
+	reader.on_line('{"event":"info","backend":"wwand","reader":"m1","iccid":"89882390001760008921","sim":{"apn":"apn.global-m2m.net","pdp_type":null,"auth":"both","username":"gdsp","password":"gdsp","source":"sim"}}');
+
+	let st = null;
+
+	p.ops.status('m0', EXT, {}, (e, r) => { st = r; });
+	eq(ups, [ [ '89882390001760008921', { apn: 'apn.global-m2m.net', pdp_type: null, auth: 'both', username: 'gdsp', password: 'gdsp' }, 'rsim' ] ],
+	   'lender settings: kept as the card\'s wwand_sim, origin rsim');
+	eq(st?.reader_info?.sim, null, 'lender settings: ...not in the status (the password)');
+	eq(st?.reader_info?.iccid, '89882390001760008921', 'lender settings: (the rest of the info is kept)');
+
+	// no APN: nothing to keep
+	reader.on_line('{"event":"info","backend":"wwand","reader":"m1","iccid":"89882390001760008921","sim":null}');
+	eq(length(ups), 1, 'lender settings: none sent, nothing written');
+	p.stop();
+	run_for(50);
+}
+
+// a modem here lending its card: its interface's settings, when the card
+// has no wwand_sim of its own
+{
+	let t = { now: 1000 };
+	let target = fake_client();
+	let ups = [];
+	let mods = { m1: { state: 'READY', lowpower_parked: false, info: { iccid: '8949020000102283249' } } };
+	let p = rsim.create({
+		log: (l, m) => null, sim_changed: () => null,
+		modem_of: (ref) => ({ modem: mods[ref] ?? modem_obj(ref) }),
+		qmi_client: (ref, schema, cb) => cb(null, (ref == 'm1') ? apdu_donor() : target),
+		qmi_release: () => null,
+		modem_radio: (ref, on, cb) => cb?.(null),
+		modem_sections: () => ({}),
+		iface_sections: () => [ { '.name': 'wan_m1', proto: 'wwand', modem: 'm1', apn: 'internet.telekom', auth: 'none' } ],
+		sim_upsert: (iccid, f, origin) => { push(ups, [ iccid, f.apn, f.auth, origin ]); return { written: false, reason: 'unchanged' }; },
+		now: () => t.now,
+	});
+
+	p.tick('m0', { rsim_reader: 'modem:m1', rsim_donor_mode: 'apdu' });
+	run_for(50);
+	eq(ups, [ [ '8949020000102283249', 'internet.telekom', 'none', 'rsim' ] ],
+	   'local donor: the settings of its interface are kept for the card');
+	p.stop();
+	run_for(50);
+}
+
+// --- a card lent to another router (wwandctl rsim proxy) -------------------------
+{
+	let t = { now: 1000 };
+	let donor_log = [];
+	let donor = sap_donor(donor_log);
+	let radio = [];
+	let alive = true;
+	let secs = { m0: {}, m1: {} };
+	let p = donor_plugin({ t: t, target: fake_client(), donor: donor, radio: radio,
+	                       modem_sections: () => secs, pid_alive: (pid) => alive });
+	let op = (name, ref, args) => {
+		let res = null;
+
+		p.ops[name](ref, {}, args, (e, r) => { res = e ? { err: e } : r; });
+		run_for(700);
+		return res;
+	};
+
+	eq(op('lend_check', 'm1'), { lendable: true, why: null, sap: null }, 'lend: a modem\'s card can be lent (SIM Access not asked yet)');
+
+	let o = op('lend_open', 'm1', { mode: 'sap', client: '10.0.0.2', pid: 4711 });
+
+	ok(o?.id, 'lend: opened, an id');
+	eq(p.radio_hold('m1', {}), 'its card is lent to 10.0.0.2', 'lend: the radio is held while lent');
+	ok(length(filter(radio, (x) => x[0] == 'm1' && !x[1])), 'lend: ...and parked');
+	ok(index(p.status('m1', {})?.text ?? '', 'lends its card to 10.0.0.2 (SIM Access') == 0, 'lend: the status says to whom');
+
+	let a = op('lend_call', 'm1', { id: o.id, req: { op: 'power_up' } });
+
+	eq(a?.answer?.atr, ATR, 'lend: power_up through the lent card, its ATR');
+	a = op('lend_call', 'm1', { id: o.id, req: { op: 'tpdu', data: 'A0A40000023F00' } });
+	eq(a?.answer, { ok: true, data: '9F17' }, 'lend: a command, the card\'s answer');
+	eq(op('lend_call', 'm1', { id: o.id, req: 'x' })?.answer?.error, 'bad_request', 'lend: not a request');
+	let st = op('status', 'm1');
+
+	eq([ st?.enabled, st?.lent_to?.to, st?.lent_to?.remote, st?.lent_to?.mode, st?.lent_to?.commands ],
+	   [ false, '10.0.0.2', true, 'sap', 1 ], 'lend: the status op says whom the card is lent to (LuCI shows it)');
+	eq(op('lend_call', 'm0', { id: o.id, req: { op: 'status' } })?.err?.error, 'no_such_lend',
+	   'lend: an id is only good for its modem');
+
+	eq(op('lend_open', 'm1', { client: 'x' })?.err?.detail, 'its card is lent to 10.0.0.2', 'lend: one at a time');
+	eq(op('lend_check', 'm1')?.lendable, false, 'lend: ...and the check says so');
+
+	// a modem here that wants the same card as a sponsor waits
+	secs = { m0: { rsim_reader: 'modem:m1' }, m1: {} };
+	t.now++;
+	p.tick('m0', { rsim_reader: 'modem:m1' });
+	run_for(20);
+	ok(index(p.status('m0', { rsim_reader: 'modem:m1' })?.text ?? '', 'lent to 10.0.0.2') >= 0,
+	   'lend: a modem here that wants the card waits, and says why');
+	secs = { m0: {}, m1: {} };
+	t.now++;
+
+	// the proxy dies hard: the next tick sends the card home
+	alive = false;
+	t.now += 10;
+	p.tick('m1', {});
+	run_for(700);
+	eq(op('lend_call', 'm1', { id: o.id, req: { op: 'status' } }), { ended: true, why: 'the proxy process is gone' },
+	   'lend: a proxy that is gone ends the lend, and a late call hears why');
+	let last = filter(donor.sent, (x) => x.name == 'SAP_CONNECTION');
+
+	eq(last[length(last) - 1]?.args?.conn?.op, 0, 'lend: ...the SIM Access link is ended');
+	eq(p.radio_hold('m1', {}), null, 'lend: ...and the radio is free again');
+	ok(length(filter(radio, (x) => x[0] == 'm1' && x[1])), 'lend: ...and woken');
+
+	// taken back here: ended, and not lent again until allowed
+	let o4 = op('lend_open', 'm1', { mode: 'apdu', client: '10.0.0.4', pid: 77 });
+
+	eq(op('lend_end', 'm1'), { ended: true, held: true }, 'take back: the lend ends');
+	eq(op('lend_call', 'm1', { id: o4.id, req: { op: 'status' } }), { ended: true, why: 'taken back here' },
+	   'take back: the proxy hears why');
+	ok(index(op('lend_open', 'm1', { client: 'x', pid: 78 })?.err?.detail ?? '', 'stopped here') >= 0,
+	   'take back: the other router\'s retry is refused');
+	eq([ op('status', 'm1')?.lend_hold, op('status', 'm1')?.lendable ], [ true, false ], 'take back: the status says so');
+	op('lend_allow', 'm1');
+	eq(op('status', 'm1')?.lendable, true, 'take back: allowed again');
+
+	// again, closed properly this time
+	alive = true;
+	let o2 = op('lend_open', 'm1', { mode: 'apdu', client: '10.0.0.3', pid: 4712 });
+
+	ok(o2?.id && o2.id != o.id, 'lend: lent again, a new id');
+	eq(op('lend_close', 'm1', { id: o2.id }), { closed: true }, 'lend: closed by the proxy');
+	eq(op('lend_call', 'm1', { id: o2.id, req: { op: 'status' } })?.err?.error, 'no_such_lend', 'lend: ...and gone');
+	eq(p.radio_hold('m1', {}), null, 'lend: ...the radio free');
+
+	// a sponsor configured for a modem here keeps its card for that one
+	secs = { m0: { rsim_reader: 'modem:m1' }, m1: {} };
+	t.now++;
+	eq(op('lend_open', 'm1', { client: 'x' })?.err?.detail, 'it is the SIM sponsor of m0',
+	   'lend: a sponsor configured here is not lent elsewhere');
+	secs = { m0: {}, m1: {} };
+	t.now++;
+
+	// a lend without the proxy's pid could not be watched: refused
+	eq(op('lend_open', 'm1', { mode: 'apdu', client: 'y' })?.err?.error, 'bad_request', 'lend: no pid, no lend');
+	eq(p.radio_hold('m1', {}), null, 'lend: ...and nothing held');
+
+	// an idle proxy that is alive keeps the card, however long
+	let o3 = op('lend_open', 'm1', { mode: 'apdu', client: 'y', pid: 99 });
+
+	t.now += 600;
+	p.tick('m1', {});
+	run_for(20);
+	ok(index(p.radio_hold('m1', {}) ?? '', 'lent to y') >= 0, 'lend: an idle proxy that is alive keeps the card');
+	op('lend_close', 'm1', { id: o3.id });
+
+	eq(p.stop(), false, 'lend: nothing left to hand back at the exit');
+}
+
+// the proxy (wwandctl rsim proxy) against the plugin, through the daemon's
+// modem_plugin envelope ({ ok: false, ...err } / { ok: true, ...res })
+{
+	let ctl = require('wwand.ctl.rsim');
+	let t = { now: 5000 };
+	let donor = sap_donor([]);
+	let radio = [];
+	let p = donor_plugin({ t: t, target: fake_client(), donor: donor, radio: radio });
+	let call = (m, a) => {
+		if (m == 'status')
+			return { modems: { m1: {} } };
+		if (m == 'sim_inventory')
+			return { cards: [ { iccid: '89490200001022832490', present: true, active: true, modem: 'm1' } ] };
+
+		let res = null;
+
+		p.ops[a.op](a.modem, {}, a.args ?? {}, (e, r) => { res = e ? { ok: false, ...e } : { ok: true, ...(r ?? {}) }; });
+		for (let i = 0; res == null && i < 40; i++)
+			run_for(50);
+		return res;
+	};
+	let lines = [ '{"op":"power_up"}', '{"op":"tpdu","data":"A0A40000023F00"}', '{"op":"power_down"}' ];
+	let out = [];
+	let rc = ctl.proxy({}, [ 'iccid:89490200001022832490' ], {
+		call: call, pid: 1, client: '10.0.0.2', sims: [],
+		read_line: () => {
+			if (length(lines) == 1)
+				push(radio, [ 'held', p.radio_hold('m1', {}) ]);
+			return length(lines) ? shift(lines) : null;
+		},
+		write: (l) => push(out, json(l)),
+	});
+
+	run_for(700);
+	eq(rc, 0, 'proxy+plugin: a whole lend, clean end');
+	eq([ out[0].event, out[0].backend, out[0].reader, out[0].iccid ], [ 'info', 'wwand', 'm1', null ],
+	   'proxy+plugin: the info event comes first, like rsim-card\'s');
+	eq(map(slice(out, 1), (x) => x.atr ?? x.data ?? x.ok), [ ATR, '9F17', true ], 'proxy+plugin: ATR, the answer, power-down');
+	eq(filter(radio, (x) => x[0] == 'held')[0][1], 'its card is lent to 10.0.0.2', 'proxy+plugin: the radio held meanwhile');
+	eq(p.radio_hold('m1', {}), null, 'proxy+plugin: ...and free afterwards');
+	ok(length(filter(radio, (x) => x[0] == 'm1' && x[1])), 'proxy+plugin: the radio woken at the end');
 }
 
 done('test_rsim');

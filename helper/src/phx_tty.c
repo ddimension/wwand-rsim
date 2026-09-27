@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "log.h"
+#include "meta.h"
 #include "phoenix.h"
 
 /*
@@ -173,6 +174,15 @@ static void tty_close(struct phx_io *io)
 	free(t);
 }
 
+static void tty_info(struct phx_io *io, struct jw *w)
+{
+	struct phx_tty *t = (struct phx_tty *)io;
+	struct tty_meta m;
+
+	if (!meta_tty_read("", t->dev, &m))
+		meta_tty_write(w, &m);
+}
+
 static const struct phx_io_ops tty_ops = {
 	.set_line = tty_set_line,
 	.set_modem = tty_set_modem,
@@ -181,6 +191,7 @@ static const struct phx_io_ops tty_ops = {
 	.read = tty_read,
 	.flush_input = tty_flush_input,
 	.close = tty_close,
+	.info = tty_info,
 };
 
 struct phx_io *phx_tty_open(const char *dev)

@@ -71,10 +71,10 @@ message(STATUS "rsim-card: Smartmouse USB (libusb) ${RSIM_LIBUSB}")
 option(WITH_BLUETOOTH "phone SIM over Bluetooth SAP (bt:)" ON)
 message(STATUS "rsim-card: Bluetooth SAP ${WITH_BLUETOOTH}")
 
-add_library(rsimcore STATIC src/atr.c src/t0.c src/json.c src/log.c src/ftdi_proto.c src/sap.c)
+add_library(rsimcore STATIC src/atr.c src/t0.c src/json.c src/log.c src/ftdi_proto.c src/sap.c src/meta.c)
 target_include_directories(rsimcore PUBLIC src)
 
-set(RSIM_SOURCES src/main.c src/phoenix.c src/phx_tty.c src/phoenix_baud.c src/atmodem.c src/scan.c)
+set(RSIM_SOURCES src/main.c src/phoenix.c src/phx_tty.c src/phoenix_baud.c src/atmodem.c src/scan.c src/serve.c)
 if(RSIM_PCSC)
 	list(APPEND RSIM_SOURCES src/pcsc.c)
 endif()
@@ -128,6 +128,9 @@ if(BUILD_TESTING)
 		set_tests_properties(e2e_at PROPERTIES TIMEOUT 180)
 		add_test(NAME scan
 			COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_scan.py $<TARGET_FILE:rsim-card>)
+		add_test(NAME serve
+			COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_serve.py $<TARGET_FILE:rsim-card>)
+		set_tests_properties(serve PROPERTIES TIMEOUT 60)
 		set_tests_properties(scan PROPERTIES TIMEOUT 60)
 		set_tests_properties(e2e_phoenix PROPERTIES TIMEOUT 120)
 		if(WITH_BLUETOOTH)

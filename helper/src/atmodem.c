@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <termios.h>
 #include <time.h>
 #include <sys/file.h>
@@ -32,6 +33,7 @@
 #include "atmodem.h"
 #include "json.h"
 #include "log.h"
+#include "meta.h"
 
 #define LINE_MAX_AT 1200	/* +CSIM with 258 bytes = 516 hex characters */
 
@@ -45,6 +47,9 @@ struct at_backend {
 	bool dirty;		/* a command timed out: its answer may still come */
 	int cfun_prev;		/* -1: not changed by us */
 	char mark[300];		/* where the mode before ours is kept */
+	/* who the modem is and which card it has, read once at the open */
+	char manuf[64], model[64], rev[96], imei[32], iccid[32];
+	long next_check;	/* the next look at the radio (at_tick) */
 	char rbuf[4096];
 	size_t rlen;
 };
@@ -217,9 +222,21 @@ static int at_cmd(struct at_backend *a, const char *cmd, const char *want, char 
 		log_dbg("at< %s", line);
 		if (!strcmp(line, "OK"))
 			return RSIM_OK;
-		if (!strcmp(line, "ERROR") || !strncmp(line, "+CME ERROR", 10) || !strncmp(line, "+CMS ERROR", 10)) {
+		/* A phone whose application side filters the AT commands meant for
+		 * its modem answers them with a refusal instead of ERROR, followed
+		 * by OK (Samsung: "PACM(AP),NOT_ALLOWED_CRO", HW-seen on a Galaxy
+		 * S20 FE, 2026-09-27) — that is no value and no success. */
+		if (strstr(line, "NOT_ALLOWED")) {
 			if (err && errcap)
-				snprintf(err, errcap, "%s", line);
+				snprintf(err, errcap, "%.*s", (int)(errcap - 1), line);
+			a->dirty = true;	/* its OK is still to come */
+			return AT_REFUSED;
+		}
+		/* "+CME Error:" too — Samsung spells it so (Galaxy S20 FE) */
+		if (!strcmp(line, "ERROR") || !strncasecmp(line, "+CME ERROR", 10) || !strncasecmp(line, "+CMS ERROR", 10)) {
+			/* an error line is short; the cut is only for the compiler */
+			if (err && errcap)
+				snprintf(err, errcap, "%.*s", (int)(errcap - 1), line);
 			return AT_REFUSED;
 		}
 		if (want && got && !strncmp(line, want, strlen(want)))
@@ -277,6 +294,65 @@ static int mark_read(const char *path)
 		fclose(f);
 	}
 	return v;
+}
+
+/* The value of a query answered with one line (+CGMI: "Quectel", or just
+ * Quectel): without prefix and quotes; "" when refused. */
+static void at_value(struct at_backend *a, const char *cmd, char *out, size_t cap)
+{
+	char got[200], *v;
+
+	out[0] = '\0';
+	if (at_cmd(a, cmd, "", got, sizeof(got), 3000, NULL, 0) != RSIM_OK || !got[0])
+		return;
+	v = got;
+	if (*v == '+' || *v == '^') {
+		char *c = strchr(v, ':');
+
+		if (c)
+			v = c + 1;
+	}
+	while (*v == ' ' || *v == '"')
+		v++;
+	snprintf(out, cap, "%.*s", (int)cap - 1, v);
+	out[strcspn(out, "\"")] = '\0';
+}
+
+/* The card's ICCID: every vendor spells the command differently; the first
+ * answer with 18..22 digits wins (a trailing F of 19-digit ones dropped). */
+static void at_iccid(struct at_backend *a)
+{
+	static const char *const cmds[] = { "AT+CCID", "AT+QCCID", "AT^ICCID?", "AT+ICCID", NULL };
+	int i;
+
+	for (i = 0; cmds[i] && !a->iccid[0]; i++) {
+		char v[64], *p;
+		size_t n;
+
+		at_value(a, cmds[i], v, sizeof(v));
+		for (p = v; *p && !(*p >= '0' && *p <= '9'); p++)
+			;
+		n = strspn(p, "0123456789Ff");
+		while (n && (p[n - 1] == 'F' || p[n - 1] == 'f'))
+			n--;
+		if (n >= 18 && n <= 22)
+			snprintf(a->iccid, sizeof(a->iccid), "%.*s", (int)n, p);
+	}
+}
+
+static void at_info(struct rsim_backend *be, struct jw *w)
+{
+	struct at_backend *a = (struct at_backend *)be;
+	struct tty_meta m;
+
+	if (!meta_tty_read("", be->reader, &m))
+		meta_tty_write(w, &m);
+	jw_opt(w, "modem_manufacturer", a->manuf);
+	jw_opt(w, "modem_model", a->model);
+	jw_opt(w, "modem_revision", a->rev);
+	jw_opt(w, "modem_imei", a->imei);
+	jw_opt(w, "iccid", a->iccid);
+	jw_str(w, "radio", a->radio_keep ? "kept" : (a->cfun_prev >= 0 ? "off while lent" : "was off already"));
 }
 
 static int at_power_up(struct rsim_backend *be, uint8_t *atr, size_t *atr_len)
@@ -367,6 +443,26 @@ static int at_transmit(struct rsim_backend *be, const uint8_t *tpdu, size_t len,
 	return RSIM_OK;
 }
 
+/* While the card is lent, the modem's radio stays off: every 10 s — the
+ * wwand plugin's tick for a QMI sponsor — it is read, and parked again when
+ * something switched it back on (a modem that restarted, a hand elsewhere). */
+static void at_tick(struct rsim_backend *be)
+{
+	struct at_backend *a = (struct at_backend *)be;
+	char c[40];
+	int mode;
+	long now = now_ms();
+
+	if (a->radio_keep || a->cfun_prev < 0 || now < a->next_check)
+		return;
+	a->next_check = now + 10000;
+	if (at_cmd(a, "AT+CFUN?", "+CFUN:", c, sizeof(c), 5000, NULL, 0) == RSIM_OK &&
+	    sscanf(c, "+CFUN: %d", &mode) == 1 && mode != 4 && mode != 0) {
+		log_warn("%s: radio is on again (CFUN=%d) while its card is lent — parking it again", be->reader, mode);
+		at_cmd(a, "AT+CFUN=4", NULL, NULL, 0, 15000, NULL, 0);
+	}
+}
+
 static int at_present(struct rsim_backend *be)
 {
 	(void)be;
@@ -379,12 +475,23 @@ static void at_close(struct rsim_backend *be)
 	char cmd[24];
 
 	if (a->cfun_prev >= 0) {
+		int tries;
+
 		snprintf(cmd, sizeof(cmd), "AT+CFUN=%d", a->cfun_prev);
-		if (at_cmd(a, cmd, NULL, NULL, 0, 15000, NULL, 0) == RSIM_OK) {
+		/* once more after a pause: a modem still settling from the park
+		 * refuses the first one. Not woken after that, the mark stays,
+		 * and the next run on this port restores it. */
+		for (tries = 0; tries < 2; tries++) {
+			if (tries)
+				usleep(2000000);
+			if (at_cmd(a, cmd, NULL, NULL, 0, 15000, NULL, 0) == RSIM_OK)
+				break;
+		}
+		if (tries < 2) {
 			log_notice("%s: radio back to CFUN=%d", a->be.reader, a->cfun_prev);
 			unlink(a->mark);
 		} else
-			log_warn("%s: could not restore CFUN=%d", a->be.reader, a->cfun_prev);
+			log_warn("%s: could not restore CFUN=%d — the next run on this port tries again", a->be.reader, a->cfun_prev);
 	}
 	close(a->fd);
 	free(a);
@@ -398,6 +505,8 @@ static const struct rsim_backend_ops AT_OPS = {
 	.transmit = at_transmit,
 	.present = at_present,
 	.close = at_close,
+	.info = at_info,
+	.tick = at_tick,
 };
 
 struct rsim_backend *atmodem_open(const struct at_cfg *cfg)
@@ -411,6 +520,17 @@ struct rsim_backend *atmodem_open(const struct at_cfg *cfg)
 		return NULL;
 	a->cfun_prev = -1;
 	a->radio_keep = cfg->radio_keep;
+	/* a diagnostic port is not spoken AT to, even when named: what it
+	 * would make of the bytes is the firmware's secret */
+	{
+		struct tty_meta m;
+
+		if (!meta_tty_read("", cfg->dev, &m) && !strcmp(meta_tty_role(&m), "diag")) {
+			log_err("%s: a diagnostic port (%s, interface %s) — not an AT port, not opened", cfg->dev, m.vid[0] ? m.vid : "?", m.ifnum);
+			free(a);
+			return NULL;
+		}
+	}
 	a->fd = open(cfg->dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
 	if (a->fd < 0) {
 		log_err("%s: %s", cfg->dev, strerror(errno));
@@ -449,13 +569,52 @@ struct rsim_backend *atmodem_open(const struct at_cfg *cfg)
 
 	/* echo off, so a command never reads as its own answer; numeric
 	 * errors, so "no card" can be told from a refused command */
-	if (at_cmd(a, "ATE0", NULL, NULL, 0, 3000, NULL, 0) != RSIM_OK) {
-		log_err("%s: no answer to AT — not a modem's AT port?", cfg->dev);
-		close(a->fd);
-		free(a);
-		return NULL;
+	{
+		char why[120] = "";
+
+		if (at_cmd(a, "ATE0", NULL, NULL, 0, 3000, why, sizeof(why)) != RSIM_OK) {
+			/* Samsung's AP-side filter: "PACM(AP),NOT_ALLOWED_CRO" or
+			 * "+CME Error:PACM(AP),UNREGISTED" */
+			if (strstr(why, "NOT_ALLOWED") || strstr(why, "PACM"))
+				log_err("%s: the device refuses AT commands for its modem on this port (%s) — a phone whose AT access is locked",
+					cfg->dev, why);
+			else
+				log_err("%s: no answer to AT — not a modem's AT port?", cfg->dev);
+			close(a->fd);
+			free(a);
+			return NULL;
+		}
 	}
 	at_cmd(a, "AT+CMEE=1", NULL, NULL, 0, 3000, NULL, 0);
+
+	/* Does this port pass APDUs at all? A phone may answer AT and CPIN yet
+	 * refuse AT+CSIM (Samsung, HW-seen on a Galaxy S20 FE, 2026-09-27): the
+	 * modem using the card would wait on commands that never go through.
+	 * SELECT MF changes nothing; any +CSIM answer (whatever its status
+	 * word) says the path works. */
+	{
+		char got[200], why[120] = "";
+		int r = at_cmd(a, "AT+CSIM=14,\"00A40004023F00\"", "+CSIM:", got, sizeof(got), 10000, why, sizeof(why));
+
+		/* refused as a COMMAND — not a card that is missing or busy (CME
+		 * 10/13/14 are the card's state, which power_up reports) */
+		int locked = (r == AT_REFUSED && (!strcmp(why, "ERROR") || strstr(why, "NOT_ALLOWED") ||
+						  !strcmp(why, "+CME ERROR: 3") || !strcmp(why, "+CME ERROR: 4")));
+
+		if (locked || (r == RSIM_OK && !got[0])) {
+			log_err("%s: the modem refuses AT+CSIM (%s) — its card cannot be used this way",
+				cfg->dev, why[0] ? why : "no +CSIM answer");
+			close(a->fd);
+			free(a);
+			return NULL;
+		}
+	}
+
+	at_value(a, "AT+CGMI", a->manuf, sizeof(a->manuf));
+	at_value(a, "AT+CGMM", a->model, sizeof(a->model));
+	at_value(a, "AT+CGMR", a->rev, sizeof(a->rev));
+	at_value(a, "AT+CGSN", a->imei, sizeof(a->imei));
+	at_iccid(a);
 
 	mark_path(cfg->dev, a->mark, sizeof(a->mark));
 	if (!cfg->radio_keep) {
@@ -501,6 +660,21 @@ struct rsim_backend *atmodem_open(const struct at_cfg *cfg)
 				return NULL;
 			}
 			int rc = at_cmd(a, "AT+CFUN=4", NULL, NULL, 0, 15000, NULL, 0);
+
+			/* confirmed, like a QMI park: the mode read back */
+			if (rc == RSIM_OK) {
+				char c2[40];
+				int now = -1;
+
+				if (at_cmd(a, "AT+CFUN?", "+CFUN:", c2, sizeof(c2), 5000, NULL, 0) != RSIM_OK ||
+				    sscanf(c2, "+CFUN: %d", &now) != 1 || now != 4) {
+					log_err("%s: AT+CFUN=4 answered OK, but the radio reads back as %d — not lending", cfg->dev, now);
+					/* whatever it did, the way back is to what it was */
+					a->cfun_prev = prev;
+					at_close(&a->be);
+					return NULL;
+				}
+			}
 
 			if (rc == RSIM_OK) {
 				a->cfun_prev = prev;

@@ -7,7 +7,8 @@
  * readers are what pcscd already knows, a Smartmouse USB is only described,
  * serial ports are read from sysfs — never written to, because one of them
  * may be the AT port of a modem in use; paired phones are what BlueZ has
- * stored about them (a phone is not called up: that would take its SIM).
+ * stored about them (a phone is not called up: that would take its SIM); on a
+ * router with wwand-rsim, the cards of its modems (wwandctl rsim proxy).
  */
 #include <dirent.h>
 #include <limits.h>
@@ -17,6 +18,7 @@
 #include <unistd.h>
 
 #include "json.h"
+#include "meta.h"
 #include "scan.h"
 #ifdef WITH_LIBUSB
 #include "wbsm.h"
@@ -27,21 +29,6 @@
 #ifdef WITH_BLUETOOTH
 #include "bt.h"
 #endif
-
-/* the first line of a sysfs attribute, "" when there is none */
-static void attr(const char *dir, const char *name, char *out, size_t cap)
-{
-	char p[PATH_MAX];
-	FILE *f;
-
-	out[0] = '\0';
-	snprintf(p, sizeof(p), "%s/%s", dir, name);
-	if (!(f = fopen(p, "r")))
-		return;
-	if (fgets(out, (int)cap, f))
-		out[strcspn(out, "\r\n")] = '\0';
-	fclose(f);
-}
 
 /* What a serial port most likely is, from its kernel driver: a USB-serial
  * adapter is what a Phoenix reader hangs on, a modem driver's port may be an
@@ -76,64 +63,41 @@ static int tty_list(const char *sysroot)
 	if (!(d = opendir(base)))
 		return 0;
 	while ((e = readdir(d))) {
-		char dev[PATH_MAX], link[PATH_MAX], real[PATH_MAX], usb[PATH_MAX];
-		char driver[64] = "", vid[8] = "", pid[8] = "", ifnum[8] = "", spec[300], ids[20];
+		struct tty_meta m;
+		char spec[300];
 		const char *hint;
-		ssize_t l;
 		struct jw w;
 
 		if (strncmp(e->d_name, "ttyUSB", 6) && strncmp(e->d_name, "ttyACM", 6))
 			continue;
-
-		/* a path that does not fit is not a port of ours to describe */
-		if (snprintf(dev, sizeof(dev), "%s/%s/device", base, e->d_name) >= (int)sizeof(dev) ||
-		    snprintf(link, sizeof(link), "%s/driver", dev) >= (int)sizeof(link))
+		if (meta_tty_read(sysroot, e->d_name, &m) < 0)
 			continue;
-		if ((l = readlink(link, real, sizeof(real) - 1)) > 0) {
-			const char *b;
-
-			real[l] = '\0';
-			b = strrchr(real, '/') ? strrchr(real, '/') + 1 : real;
-			if (strlen(b) < sizeof(driver))
-				strcpy(driver, b);
-		}
-
-		/* device -> the USB interface (ttyACM) or a port below it
-		 * (ttyUSB): the interface number is on the interface, the ids on
-		 * the USB device one or two levels up */
-		if (realpath(dev, real)) {
-			char *cut;
-
-			attr(real, "bInterfaceNumber", ifnum, sizeof(ifnum));
-			snprintf(usb, sizeof(usb), "%s", real);
-			for (int up = 0; up < 3 && !vid[0]; up++) {
-				if (!ifnum[0])
-					attr(usb, "bInterfaceNumber", ifnum, sizeof(ifnum));
-				attr(usb, "idVendor", vid, sizeof(vid));
-				attr(usb, "idProduct", pid, sizeof(pid));
-				if (!vid[0] && (cut = strrchr(usb, '/')))
-					*cut = '\0';
-			}
-		}
 
 #ifdef WITH_LIBUSB
 		/* the Smartmouse USB behind a kernel serial driver: listed as wbsm:
 		 * already, which also sets its clock and mode — its tty would only
 		 * be the same reader without them */
-		if (!strcmp(vid, "104f") && !strcmp(pid, "0002"))
+		if (!strcmp(m.vid, "104f") && !strcmp(m.pid, "0002"))
 			continue;
 #endif
-		hint = hint_of(driver);
-		snprintf(spec, sizeof(spec), "%s:/dev/%s", hint[0] ? hint : "phoenix", e->d_name);
-		snprintf(ids, sizeof(ids), "%s:%s", vid, pid);
+		/* a diagnostic port speaks no AT: listed as what it is, not as a
+		 * reader (its spec stays empty) */
+		hint = !strcmp(meta_tty_role(&m), "diag") ? "diag" : hint_of(m.driver);
+		if (!strcmp(hint, "diag"))
+			spec[0] = '\0';
+		else
+			snprintf(spec, sizeof(spec), "%s:/dev/%s", hint[0] ? hint : "phoenix", e->d_name);
 		jw_begin(&w, stdout);
 		jw_str(&w, "backend", "tty");
 		jw_str(&w, "spec", spec);
-		jw_str(&w, "device", spec + strcspn(spec, ":") + 1);
-		jw_str(&w, "driver", driver);
-		jw_str(&w, "usb", vid[0] ? ids : "");
-		jw_str(&w, "interface", ifnum);
+		{
+			char devp[80];
+
+			snprintf(devp, sizeof(devp), "/dev/%.60s", e->d_name);
+			jw_str(&w, "device", devp);
+		}
 		jw_str(&w, "hint", hint);
+		meta_tty_write(&w, &m);
 		jw_end(&w);
 		n++;
 	}
@@ -141,10 +105,51 @@ static int tty_list(const char *sysroot)
 	return n;
 }
 
+/* On a router with wwand and wwand-rsim: the cards of its modems, which
+ * another router's wwand-rsim can borrow through `wwandctl rsim proxy` — with
+ * the wwand_sim settings of each. Its lines are passed on as they are.
+ * RSIM_TEST_WWAND_LIST: the command to run instead (tests). -1 when there is
+ * no wwand-rsim here. */
+static int wwand_list(void)
+{
+	const char *cmd = getenv("RSIM_TEST_WWAND_LIST");
+	char line[8192];
+	FILE *p;
+	int n = 0;
+
+	if (!cmd) {
+		if (access("/usr/share/ucode/wwand/ctl/rsim.uc", R_OK) || access("/usr/bin/wwandctl", X_OK))
+			return -1;
+		cmd = "/usr/bin/wwandctl rsim proxy --list 2>/dev/null";
+	}
+	fflush(stdout);
+	if (!(p = popen(cmd, "r")))
+		return -1;
+	while (fgets(line, sizeof(line), p)) {
+		size_t l = strlen(line);
+
+		/* a line cut by the buffer is not passed on in pieces */
+		if (!l || line[l - 1] != '\n') {
+			int c;
+
+			while ((c = fgetc(p)) != EOF && c != '\n')
+				;
+			continue;
+		}
+		if (line[0] != '{')
+			continue;
+		fputs(line, stdout);
+		n++;
+	}
+	pclose(p);
+	fflush(stdout);
+	return n;
+}
+
 int scan_run(const char *sysroot)
 {
 	struct jw w;
-	char backends[64] = "phoenix,at", note[PATH_MAX + 80] = "";
+	char backends[64] = "phoenix,at", note[PATH_MAX + 80] = "", adapters[400] = "";
 
 #ifdef WITH_LIBUSB
 	strcat(backends, ",wbsm");
@@ -156,15 +161,18 @@ int scan_run(const char *sysroot)
 #endif
 #ifdef WITH_BLUETOOTH
 	strcat(backends, ",bt");
-	bt_list(sysroot ? sysroot : "", note, sizeof(note));
+	bt_list(sysroot ? sysroot : "", note, sizeof(note), adapters, sizeof(adapters));
 #endif
 	tty_list(sysroot ? sysroot : "");
+	if (wwand_list() >= 0)
+		strcat(backends, ",wwand");
 
 	jw_begin(&w, stdout);
 	jw_bool(&w, "done", true);
 	jw_str(&w, "backends", backends);
 	if (note[0])
 		jw_str(&w, "note", note);
+	jw_opt(&w, "bt_adapters", adapters);
 	jw_end(&w);
 	return 0;
 }

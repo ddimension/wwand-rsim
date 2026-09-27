@@ -51,4 +51,11 @@ for t in "$TESTDIR"/test_*.uc; do
 	printf '%s\n' "$out" | grep -qE '^test_[a-z_]+: [0-9]+ checks, 0 failures$' || rc=1
 done
 
+# the LuCI page, run in node against stand-ins for LuCI's modules
+if command -v node >/dev/null 2>&1; then
+	node "$TESTDIR/luci/test_rsim_js.js" || rc=1
+else
+	echo "test_rsim_js: skipped (no node)"
+fi
+
 exit $rc

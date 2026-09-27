@@ -37,6 +37,9 @@ void jw_bool(struct jw *w, const char *key, bool v);
 void jw_str(struct jw *w, const char *key, const char *s);
 void jw_hex(struct jw *w, const char *key, const uint8_t *b, size_t n);
 void jw_null(struct jw *w, const char *key);
+void jw_int(struct jw *w, const char *key, long v);
+/* a string only when there is one (NULL or "" writes nothing) */
+void jw_opt(struct jw *w, const char *key, const char *s);
 void jw_end(struct jw *w);
 
 #endif

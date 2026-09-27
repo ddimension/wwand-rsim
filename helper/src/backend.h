@@ -8,6 +8,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "json.h"
 #include "rsim.h"
 
 struct rsim_backend;
@@ -29,6 +30,15 @@ struct rsim_backend_ops {
 	 * insert/remove events are emitted) */
 	int (*present)(struct rsim_backend *be);
 	void (*close)(struct rsim_backend *be);
+	/* optional: what is known about the reader and the card, as fields of
+	 * the JSON object being written — the info event after the open and
+	 * the status answer carry them (manufacturer, USB path, ATR source,
+	 * the phone's name, the modem's identity, ...) */
+	void (*info)(struct rsim_backend *be, struct jw *w);
+	/* optional: called between requests every EVENT_POLL_MS (main.c),
+	 * for what a backend must keep in order while it serves — the AT
+	 * backend keeps the lending modem's radio off */
+	void (*tick)(struct rsim_backend *be);
 };
 
 struct rsim_backend {

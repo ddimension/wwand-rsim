@@ -22,9 +22,10 @@ struct bt_cfg {
 struct rsim_backend *bt_open(const struct bt_cfg *cfg);
 
 /* `--list`: the paired phones BlueZ knows (its storage below
- * <sysroot>/var/lib/bluetooth), one JSON line each. note gets a reason when
- * that storage exists but cannot be read. */
-int bt_list(const char *sysroot, char *note, size_t note_cap);
+ * <sysroot>/var/lib/bluetooth), one JSON line each, with what BlueZ and the
+ * kernel know about them. note gets a reason when that storage exists but
+ * cannot be read; adapters the kernel's adapters ("" when it cannot say). */
+int bt_list(const char *sysroot, char *note, size_t note_cap, char *adapters, size_t acap);
 
 /* AA:BB:CC:DD:EE:FF -> the six bytes in the order the kernel takes them
  * (least significant first); -1 when it is not an address */

@@ -139,6 +139,18 @@ void jw_hex(struct jw *w, const char *key, const uint8_t *b, size_t n)
 	fputc('"', w->f);
 }
 
+void jw_int(struct jw *w, const char *key, long v)
+{
+	jw_key(w, key);
+	fprintf(w->f, "%ld", v);
+}
+
+void jw_opt(struct jw *w, const char *key, const char *s)
+{
+	if (s && *s)
+		jw_str(w, key, s);
+}
+
 void jw_null(struct jw *w, const char *key)
 {
 	jw_key(w, key);

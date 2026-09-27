@@ -54,6 +54,13 @@ class FakeModem(threading.Thread):
         self.log.append(cmd)
         if self.echo:
             os.write(self.fd, cmd.encode() + b"\r")
+        if getattr(self, "locked", False):          # a phone that filters AT (Samsung)
+            return self.say("PACM(AP),NOT_ALLOWED_CRO", "OK")
+        if getattr(self, "samsung", False) and cmd not in ("ATE0", "AT"):
+            # Samsung's own spelling of a refusal, followed by OK
+            if cmd.startswith("AT+CSIM"):
+                return self.say("ERROR")
+            return self.say("+CME Error:PACM(AP),UNREGISTED", "OK")
         if self.urc:
             self.say("+QIND: \"csq\",20,99")
         if cmd == "ATE0":
@@ -61,12 +68,25 @@ class FakeModem(threading.Thread):
             return self.say("OK")
         if cmd in ("AT+CMEE=1", "AT"):
             return self.say("OK")
+        # who it is: plain lines like a Quectel; the ICCID only through
+        # the vendor command, with the trailing F of a 19/20-digit one
+        if cmd == "AT+CGMI":
+            return self.say("Quectel", "OK")
+        if cmd == "AT+CGMM":
+            return self.say("EG06", "OK")
+        if cmd == "AT+CGMR":
+            return self.say("EG06ELAR04A08M4G", "OK")
+        if cmd == "AT+CGSN":
+            return self.say("861234567890123", "OK")
+        if cmd == "AT+QCCID":
+            return self.say("+QCCID: 8949020000184496711F", "OK")
         if cmd == "AT+CFUN?":
             return self.say("+CFUN: %d" % self.cfun, "OK")
         if cmd.startswith("AT+CFUN="):
             if self.cfun_refuse and cmd == "AT+CFUN=4":
                 return self.say("+CME ERROR: 3")
-            self.cfun = int(cmd[8:])
+            if not getattr(self, "cfun_stuck", False):  # a modem that says OK and does not do it
+                self.cfun = int(cmd[8:])
             return self.say("OK")
         if cmd == "AT+CPIN?":
             if self.cpin_err:
@@ -119,12 +139,29 @@ class Rig:
         self.proc = subprocess.Popen(
             [BIN, "-v"] + list(args) + ["at:" + os.ttyname(self.slave)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.buf = b""
 
     def ask(self, req, timeout=15):
         self.proc.stdin.write((json.dumps(req) + "\n").encode())
         self.proc.stdin.flush()
-        r, _, _ = select.select([self.proc.stdout], [], [], timeout)
-        return json.loads(self.proc.stdout.readline()) if r else None
+        while True:
+            # our own buffer: select() on a buffered stream misses a line
+            # readline() already pulled in with the one before
+            while b"\n" not in self.buf:
+                r, _, _ = select.select([self.proc.stdout], [], [], timeout)
+                if not r:
+                    return None
+                chunk = os.read(self.proc.stdout.fileno(), 4096)
+                if not chunk:
+                    return None
+                self.buf += chunk
+            l, self.buf = self.buf.split(b"\n", 1)
+            o = json.loads(l)
+            # the info event after the open is news, not an answer
+            if o.get("event") == "info":
+                self.info = o
+                continue
+            return o
 
     def close(self):
         self.proc.stdin.close()
@@ -145,6 +182,11 @@ r = rig.ask({"op": "tpdu", "data": "00C0000024"})
 check(r and r.get("data", "").endswith("9000") and len(r["data"]) == 2 * 38, "tpdu: GET RESPONSE, 36 bytes + SW")
 st = rig.ask({"op": "status"})
 check(st and st.get("backend") == "at", "status: backend at")
+check(st.get("modem_manufacturer") == "Quectel" and st.get("modem_model") == "EG06"
+      and st.get("modem_revision") == "EG06ELAR04A08M4G" and st.get("modem_imei") == "861234567890123",
+      "status: who the modem is (%r)" % st)
+check(st.get("iccid") == "8949020000184496711", "status: its card's ICCID, through the vendor command, F dropped (%r)" % st.get("iccid"))
+check(getattr(rig, "info", {}).get("modem_model") == "EG06", "info event after the open: the same")
 rig.close()
 check(rig.modem.cfun == 1, "radio: back to the mode it had (CFUN=1) at the end")
 
@@ -197,8 +239,22 @@ rig.proc.stdin.close()                       # the first ends, restores, unlocks
 rig.proc.wait(20)
 second.stdin.write(b'{"op":"power_up"}\n')
 second.stdin.flush()
-r, _, _ = select.select([second.stdout], [], [], 20)
-ans = json.loads(second.stdout.readline()) if r else None
+ans, buf = None, b""
+deadline = time.time() + 20
+while time.time() < deadline:
+    if b"\n" not in buf:
+        r, _, _ = select.select([second.stdout], [], [], max(0.1, deadline - time.time()))
+        if not r:
+            break
+        chunk = os.read(second.stdout.fileno(), 4096)
+        if not chunk:
+            break
+        buf += chunk
+        continue
+    l, buf = buf.split(b"\n", 1)
+    ans = json.loads(l)
+    if ans.get("event") != "info":        # the info event after its open first
+        break
 check(ans and ans.get("ok"), "lock: the waiting helper takes over once the first has ended (%r)" % ans)
 check(rig.modem.cfun == 4, "lock: ...and has the radio off again")
 second.stdin.close()
@@ -266,6 +322,61 @@ rig.close()
 for f in os.listdir("/tmp"):                     # the state files of these runs
     if f.startswith("rsim-card-cfun-_dev_pts_"):
         os.unlink(os.path.join("/tmp", f))
+
+# --- the park is confirmed, like a QMI park ------------------------------------------
+rig = Rig()
+rig.modem.cfun_stuck = True
+rig.ask({"op": "power_up"}, timeout=10)
+try:
+    rig.proc.wait(10)
+except subprocess.TimeoutExpired:
+    pass
+err = rig.proc.stderr.read().decode(errors="replace")
+check(rig.proc.returncode == 1 and "reads back as 1" in err, "a park that does not hold: no lending (%r)" % err[-200:])
+
+# --- ...and kept while the card is lent: parked again when it comes back on -----------
+rig = Rig()
+rig.ask({"op": "power_up"})
+check(rig.modem.cfun == 4, "lent: parked")
+rig.modem.cfun = 1                                # a modem that restarted, a hand elsewhere
+time.sleep(12)                                    # the 10 s look
+check(rig.modem.cfun == 4, "lent: switched back on, parked again within 10 s")
+rig.close()
+check(rig.modem.cfun == 1, "the end: back to what it was")
+
+# --- AT+CSIM refused as a command: refused at the open --------------------------------
+rig = Rig(csim_err="ERROR")
+rig.ask({"op": "power_up"}, timeout=10)
+try:
+    rig.proc.wait(10)
+except subprocess.TimeoutExpired:
+    pass
+err = rig.proc.stderr.read().decode(errors="replace")
+check(rig.proc.returncode == 1 and "refuses AT+CSIM" in err, "CSIM refused: the open fails and says why (%r)" % err[-160:])
+
+# --- Samsung: "+CME Error:" (mixed case) is a refusal, not a value -----------------
+rig = Rig()
+rig.modem.samsung = True
+rig.ask({"op": "power_up"}, timeout=10)
+try:
+    rig.proc.wait(10)
+except subprocess.TimeoutExpired:
+    pass
+err = rig.proc.stderr.read().decode(errors="replace")
+check(rig.proc.returncode == 1 and "refuses AT+CSIM" in err and "PACM" not in err.split("refuses")[0][-40:],
+      "Samsung: its refusals are refusals, and the CSIM probe stops the open (%r)" % err[-200:])
+
+# --- a phone whose AT access to its modem is locked (Samsung) ---------------------
+rig = Rig()
+rig.modem.locked = True
+up = rig.ask({"op": "power_up"}, timeout=10)
+try:
+    rig.proc.wait(10)
+except subprocess.TimeoutExpired:
+    pass
+err = rig.proc.stderr.read().decode(errors="replace")
+check(rig.proc.returncode == 1 and "AT access is locked" in err,
+      "locked AT: refused at the open, said so, no card claimed (%r)" % err[-200:])
 
 print("test_e2e_at: %d checks, %d failures" % (checks, failures))
 sys.exit(1 if failures else 0)

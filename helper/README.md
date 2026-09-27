@@ -123,6 +123,21 @@ phones (device class) or devices whose stored services include SAP, with
 `"sap": true|false|null` (null: services never read); nothing is sent to a
 phone.
 
+**`--serve [SPEC...]`** is the `command=` of an `authorized_keys` line: it
+reads what the SSH client asked for from `SSH_ORIGINAL_COMMAND`, splits it
+into words as a shell would for plain and quoted words (no expansion), and
+execs it only when it is `rsim-card [options] <reader>` with a reader one of
+the SPECs matches (fnmatch; no SPECs: any), `rsim-card --list`, or
+`wwandctl rsim proxy [options] <target>` with `wwand:<target>` matching (or
+its `--list`). A second reader, `--serve` again, an option the proxy lacks,
+or anything else is refused with a message. `RSIM_TEST_SELF` /
+`RSIM_TEST_WWANDCTL`: what to exec instead, for the tests.
+
+On a router with wwand-rsim, `--list` also passes on the lines of
+`wwandctl rsim proxy --list` — the cards of its modems another router can
+borrow — and names `wwand` among the backends (`RSIM_TEST_WWAND_LIST`: the
+command to run instead, for the tests).
+
 ## Test hook
 
 `RSIM_TEST_MCTRL=<path>`: the Phoenix backend writes `RTS=0|1` / `DTR=0|1`
@@ -146,8 +161,12 @@ auto polarity, NULL bytes, ACK and ~INS both ways, 256-byte reads, 61xx/6Cxx,
 timeout, late answers, bad procedure bytes, power-down on EOF). Builds for
 aarch64 musl (OpenWrt toolchain).
 
-Not verified on hardware: the libusb FTDI transport as a whole (only its
-pure parts are unit-tested), real UART timing and parity, the termios2 rate
+Verified on hardware (2026-09-27): the Smartmouse USB (`wbsm:`, libusb
+FTDI transport) with a real card; Bluetooth SAP with a Galaxy S20 FE and a
+Galaxy A5 (2016); the AT backend's refusals (a diag port, a modem without
+`AT+CSIM`, Samsung's AT lock) — see the top-level README, *What works*.
+
+Not verified on hardware: the libusb FTDI transport's other adapters, real UART timing and parity, the termios2 rate
 on a USB-serial bridge, the modem-control lines, card-detect polarity, the PC/SC
 backend against pcscd with a card. Not implemented: T=0 character
 repetition when the *card* flags a parity error on a byte we sent (it fails

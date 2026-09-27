@@ -32,6 +32,7 @@
 #include "ftdi_usb.h"
 #include "json.h"
 #include "log.h"
+#include "meta.h"
 #include "wbsm.h"
 
 #define WBSM_VID		0x104f
@@ -178,7 +179,10 @@ int wbsm_list(void)
 			continue;
 		/* the serial needs the device opened; without permission it is
 		 * still listed, as the first one */
+		int opened = 0;
+
 		if (!libusb_open(list[i], &h)) {
+			opened = 1;
 			if (libusb_get_string_descriptor_ascii(h, d.iSerialNumber, serial, sizeof(serial)) < 0)
 				serial[0] = '\0';
 			libusb_close(h);
@@ -188,6 +192,20 @@ int wbsm_list(void)
 		jw_str(&w, "backend", "wbsm");
 		jw_str(&w, "spec", spec);
 		jw_str(&w, "serial", (const char *)serial);
+		/* sysfs by its place on the bus: descriptors without opening it */
+		{
+			uint8_t ports[8];
+			int np = libusb_get_port_numbers(list[i], ports, sizeof(ports));
+			char dir[PATH_MAX], drv[64];
+
+			if (np > 0 && !meta_usb_dir("", libusb_get_bus_number(list[i]), ports, np, dir, sizeof(dir))) {
+				meta_usb_write(&w, dir);
+				meta_usb_driver(dir, drv, sizeof(drv));
+				/* ftdi_sio bound: rsim-card detaches it while it runs */
+				jw_opt(&w, "kernel_driver", drv);
+			}
+		}
+		jw_bool(&w, "access", opened);
 		jw_end(&w);
 		found++;
 	}

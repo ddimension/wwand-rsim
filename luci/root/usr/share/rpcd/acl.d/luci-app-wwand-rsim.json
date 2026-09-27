@@ -9,10 +9,16 @@
 				]
 			},
 			"file": {
-				"/etc/wwand/rsim/id_dropbear.pub": [ "read" ],
-				"/etc/wwand/rsim/id_ed25519.pub": [ "read" ]
+				"/etc/wwand/rsim/id_dropbear.pub": [
+					"read"
+				],
+				"/etc/wwand/rsim/id_ed25519.pub": [
+					"read"
+				]
 			},
-			"uci": [ "network" ]
+			"uci": [
+				"network"
+			]
 		},
 		"write": {
 			"ubus": {
@@ -20,7 +26,23 @@
 					"modem_plugin"
 				]
 			},
-			"uci": [ "network" ]
+			"uci": [
+				"network"
+			],
+			"file": {
+				"/usr/bin/wwandctl rsim scan --json": [
+					"exec"
+				],
+				"/usr/bin/wwandctl rsim scan * --json": [
+					"exec"
+				],
+				"/usr/bin/wwandctl rsim ssh-key": [
+					"exec"
+				],
+				"/usr/bin/wwandctl rsim test * --json": [
+					"exec"
+				]
+			}
 		}
 	}
 }

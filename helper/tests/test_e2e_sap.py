@@ -96,6 +96,9 @@ class Phone(threading.Thread):
                 if s.get("refuse"):
                     self.send(msg(0x01, (0x01, u8(0x01))))
                     continue
+                if s.get("fail_above") and size > s["fail_above"]:
+                    self.send(msg(0x01, (0x01, u8(0x01))))   # Samsung: plain failure
+                    continue
                 if s.get("max") and size != s["max"]:
                     self.send(msg(0x01, (0x01, u8(0x02)), (0x00, struct.pack(">H", s["max"]))))
                     continue
@@ -149,12 +152,24 @@ class Helper:
                                   env=dict(os.environ, RSIM_TEST_SAP_SOCK=sock,
                                            RSIM_TEST_SAP_TIMEOUT_MS="1500"))
         self.events = []
+        self.buf = b""
 
     def line(self, timeout=10):
-        r, _, _ = select.select([self.p.stdout], [], [], timeout)
-        if not r:
-            return None
-        l = self.p.stdout.readline()
+        # our own buffer: select() on a buffered stream misses a second line
+        # that readline() already pulled in with the first
+        deadline = time.time() + timeout
+        while b"\n" not in self.buf:
+            left = deadline - time.time()
+            if left <= 0:
+                return None
+            r, _, _ = select.select([self.p.stdout], [], [], left)
+            if not r:
+                return None
+            chunk = os.read(self.p.stdout.fileno(), 4096)
+            if not chunk:
+                return None
+            self.buf += chunk
+        l, self.buf = self.buf.split(b"\n", 1)
         return json.loads(l) if l.strip() else None
 
     def ask(self, req, timeout=10):
@@ -164,12 +179,18 @@ class Helper:
             o = self.line(timeout)
             if o is None or "event" not in o:
                 return o
+            if o["event"] == "info":
+                self.info = o
+                continue
             self.events.append(o["event"])
 
     def event(self, timeout=5):
         if self.events:
             return self.events.pop(0)
         o = self.line(timeout)
+        while o and o.get("event") == "info":
+            self.info = o
+            o = self.line(timeout)
         return o.get("event") if o else None
 
     def end(self, timeout=10):
@@ -202,6 +223,10 @@ with tempfile.TemporaryDirectory() as tmp:
     check(ph.ids()[:2] == [0x00, 0x00] and struct.unpack(">H", ph.got[1][1][0x00])[0] == 512,
           "CONNECT_REQ again with the phone's size")
     check(0x0B not in ph.ids(), "a SIM the phone reports reset is on: no POWER_SIM_ON")
+    inf = getattr(h, "info", {})
+    check(inf.get("backend") == "bt" and inf.get("reader") == ADDR and inf.get("max_msg") == 512
+          and inf.get("apdu_format") == "gsm" and inf.get("sim") == "accessible",
+          "info event after the open: the link as it stands (%r)" % inf)
     r = h.ask({"op": "tpdu", "data": "A0A40000023F00"})
     check(r and r.get("data") == "9F17", "tpdu: the answer as it is (%r)" % r)
     check(ph.got[-1][0] == 0x05 and ph.got[-1][1].get(0x04) == bytes.fromhex("A0A40000023F00"),
@@ -220,6 +245,16 @@ with tempfile.TemporaryDirectory() as tmp:
     rc = h.end()
     ph.closed.wait(5)
     check(rc == 0 and ph.ids()[-2:] == [0x09, 0x02], "end of stdin: SIM off, DISCONNECT_REQ, exit 0 (%r %r)" % (rc, ph.ids()))
+
+    # --- a phone that fails too large a size instead of naming its own (Samsung) ---
+    ph, path = run(tmp, "s", fail_above=261)
+    h = Helper(path)
+    r = h.ask({"op": "power_up"})
+    sizes = [struct.unpack(">H", p[0x00])[0] for m, p in ph.got if m == 0x00]
+    check(r and r.get("ok") and sizes == [1024, 512, 300, 276, 261],
+          "a plain failure is asked again, smaller, down to 261 (%r %r)" % (r, sizes))
+    check(getattr(h, "info", {}).get("max_msg") == 261, "...and 261 is what it runs with")
+    h.end()
 
     # --- CommandAPDU7816 ------------------------------------------------------
     ph, path = run(tmp, "b")

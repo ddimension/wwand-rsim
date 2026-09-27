@@ -422,6 +422,24 @@ static void ph_close(struct rsim_backend *be)
 	free(p);
 }
 
+static void ph_info(struct rsim_backend *be, struct jw *w)
+{
+	struct phoenix *p = (struct phoenix *)be;
+	static const char *const resets[] = { "rts", "rts_inv", "dtr", "dtr_inv" };
+
+	jw_int(w, "clock_khz", (long)p->cfg.clock_khz);
+	if (p->baud)
+		jw_int(w, "baud", (long)p->baud);
+	/* what the card answered to, once one did */
+	if (p->polarity_known)
+		jw_str(w, "reset_line", resets[(p->reset_dtr ? 2 : 0) + (p->reset_inv ? 1 : 0)]);
+	if (p->echo >= 0)
+		jw_bool(w, "echo", p->echo == 1);
+	jw_str(w, "convention", p->inverse ? "inverse" : "direct");
+	if (p->io->ops->info)
+		p->io->ops->info(p->io, w);
+}
+
 static const struct rsim_backend_ops phoenix_ops = {
 	.name = "phoenix",
 	.power_up = ph_power_up,
@@ -430,6 +448,7 @@ static const struct rsim_backend_ops phoenix_ops = {
 	.transmit = ph_transmit,
 	.present = ph_present,
 	.close = ph_close,
+	.info = ph_info,
 };
 
 struct rsim_backend *phoenix_open(const struct phoenix_cfg *cfg, struct phx_io *io)

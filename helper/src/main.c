@@ -22,6 +22,7 @@
 #include "log.h"
 #include "phoenix.h"
 #include "scan.h"
+#include "serve.h"
 #ifdef WITH_LIBUSB
 #include "wbsm.h"
 #endif
@@ -181,6 +182,29 @@ static void do_tpdu(struct state *st, const char *line)
 	jw_end(&w);
 }
 
+/* what is known about the reader and the card (the backend's info hook) */
+static void write_info(struct state *st, struct jw *w)
+{
+	if (st->be->ops->info)
+		st->be->ops->info(st->be, w);
+}
+
+/* Once, right after the open: the reader as the system and the backend see
+ * it (sysfs, USB, the phone, the modem), so the plugin can show what it is
+ * using before the first request. An event: a plugin that does not know it
+ * passes it over. */
+static void emit_info(struct state *st)
+{
+	struct jw w;
+
+	jw_begin(&w, stdout);
+	jw_str(&w, "event", "info");
+	jw_str(&w, "backend", st->be->ops->name);
+	jw_str(&w, "reader", st->be->reader);
+	write_info(st, &w);
+	jw_end(&w);
+}
+
 static void do_status(struct state *st)
 {
 	int present = st->be->ops->present(st->be);
@@ -198,6 +222,7 @@ static void do_status(struct state *st)
 		jw_hex(&w, "atr", st->atr, st->atr_len);
 	else
 		jw_null(&w, "atr");
+	write_info(st, &w);
 	jw_end(&w);
 }
 
@@ -259,7 +284,7 @@ static int serve(struct state *st)
 		{
 			struct timespec ts = { EVENT_POLL_MS / 1000, (EVENT_POLL_MS % 1000) * 1000000L };
 
-			r = ppoll(&pfd, 1, st->last_present >= 0 ? &ts : NULL, &wait_mask);
+			r = ppoll(&pfd, 1, (st->last_present >= 0 || st->be->ops->tick) ? &ts : NULL, &wait_mask);
 		}
 		if (r < 0) {
 			if (errno == EINTR)
@@ -268,7 +293,10 @@ static int serve(struct state *st)
 			return 1;
 		}
 		if (r == 0) {
-			poll_presence(st);
+			if (st->be->ops->tick)
+				st->be->ops->tick(st->be);
+			if (st->last_present >= 0)
+				poll_presence(st);
 			if (st->be->ended)
 				return 1;
 			continue;
@@ -313,6 +341,8 @@ static void usage(FILE *f)
 	fputs("usage: rsim-card [-v] [-s] [options] phoenix:<tty> | wbsm:[serial] | pcsc:<reader substring or index>\n"
 	      "                                    | at:<tty of a modem's AT port> | bt:<phone's address>\n"
 	      "       rsim-card --list               what this machine offers, JSON lines\n"
+	      "       rsim-card --serve [SPEC...]    the command= of an authorized_keys line: runs only\n"
+	      "                                      wwand-rsim's own calls, for the readers SPEC matches\n"
 	      "  -v, --verbose          debug logging\n"
 	      "  -s, --syslog           log to syslog as well as stderr\n"
 	      "phoenix options:\n"
@@ -377,6 +407,10 @@ int main(int argc, char **argv)
 	int bt_channel = 0, bt_high = 0, bt_7816 = 0;
 	int verbose = 0, use_syslog = 0, opt, v, ret;
 	char *end;
+
+	/* before getopt: what follows are reader patterns, not options */
+	if (argc >= 2 && !strcmp(argv[1], "--serve"))
+		return serve_run(argc - 2, argv + 2);
 
 	while ((opt = getopt_long(argc, argv, "vsh", longopts, NULL)) != -1) {
 		switch (opt) {
@@ -564,6 +598,7 @@ int main(int argc, char **argv)
 	if (!st.be)
 		return 1;
 
+	emit_info(&st);
 	ret = serve(&st);
 	if (st.be->ended)
 		log_notice("%s: the reader is gone, ending", spec);

@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <winscard.h>
+#include <reader.h>	/* SCARD_ATTR_* */
 
 #include "atr.h"
 #include "json.h"
@@ -181,6 +182,36 @@ static void pc_close(struct rsim_backend *be)
 	free(p);
 }
 
+/* A reader attribute as text (vendor, IFD type, serial): only while a card
+ * is connected, which is when pcscd answers them. */
+static void attr_str(struct pcsc *p, struct jw *w, const char *key, DWORD id)
+{
+	BYTE buf[128];
+	DWORD len = sizeof(buf) - 1;
+	size_t i;
+
+	if (!p->connected || SCardGetAttrib(p->card, id, buf, &len) != SCARD_S_SUCCESS || !len)
+		return;
+	buf[len] = '\0';
+	/* a string attribute, not a number: printable up to its NUL */
+	for (i = 0; i < len && buf[i]; i++)
+		if (buf[i] < 0x20 || buf[i] > 0x7e)
+			return;
+	jw_opt(w, key, (const char *)buf);
+}
+
+static void pc_info(struct rsim_backend *be, struct jw *w)
+{
+	struct pcsc *p = (struct pcsc *)be;
+
+	jw_str(w, "reader_name", p->reader);
+	if (p->connected)
+		jw_str(w, "protocol", p->proto == SCARD_PROTOCOL_T1 ? "T=1" : "T=0");
+	attr_str(p, w, "vendor", SCARD_ATTR_VENDOR_NAME);
+	attr_str(p, w, "ifd_type", SCARD_ATTR_VENDOR_IFD_TYPE);
+	attr_str(p, w, "ifd_serial", SCARD_ATTR_VENDOR_IFD_SERIAL_NO);
+}
+
 static const struct rsim_backend_ops pcsc_ops = {
 	.name = "pcsc",
 	.power_up = pc_power_up,
@@ -189,6 +220,7 @@ static const struct rsim_backend_ops pcsc_ops = {
 	.transmit = pc_transmit,
 	.present = pc_present,
 	.close = pc_close,
+	.info = pc_info,
 };
 
 /* spec: all digits is an index into the reader list, anything else a
@@ -299,6 +331,14 @@ int pcsc_list(void)
 		jw_str(&w, "spec", spec);
 		jw_str(&w, "name", r);
 		jw_bool(&w, "card", (st.dwEventState & SCARD_STATE_PRESENT) != 0);
+		jw_int(&w, "index", (long)idx);
+		/* the card's ATR as pcscd read it at insertion — not asked again */
+		if ((st.dwEventState & SCARD_STATE_PRESENT) && st.cbAtr)
+			jw_hex(&w, "atr", st.rgbAtr, st.cbAtr);
+		/* another program holds it (pcscd's view); unresponsive card */
+		jw_bool(&w, "in_use", (st.dwEventState & (SCARD_STATE_INUSE | SCARD_STATE_EXCLUSIVE)) != 0);
+		if (st.dwEventState & SCARD_STATE_MUTE)
+			jw_bool(&w, "mute", true);
 		jw_end(&w);
 	}
 	free(list);

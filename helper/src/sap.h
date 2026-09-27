@@ -65,6 +65,10 @@ enum { SAP_DISC_GRACEFUL = 0, SAP_DISC_IMMEDIATE = 1 };
  * with its result code: 4 + 8 + 4 + 260 = 276. A server that cannot take
  * that much cannot carry every command the modem sends. */
 #define SAP_MSG_MIN	276
+/* what a phone offers at least: Samsung's SAP RIL takes 261 (Galaxy S20 FE);
+ * every command the modem sends in practice fits (SELECT, READ/UPDATE
+ * BINARY/RECORD of up to 253 bytes, AUTHENTICATE) */
+#define SAP_MSG_LOW	261
 #define SAP_MSG_WANT	1024
 #define SAP_PARAMS_MAX	4
 

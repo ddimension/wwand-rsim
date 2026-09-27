@@ -8,6 +8,7 @@
 
 #include "ftdi_proto.h"
 #include "ftdi_usb.h"
+#include "meta.h"
 #include "log.h"
 
 /*
@@ -258,6 +259,22 @@ static void fu_close(struct phx_io *io)
 	free(f);
 }
 
+static void fu_info(struct phx_io *io, struct jw *w)
+{
+	struct ftdi_io *f = (struct ftdi_io *)io;
+	libusb_device *dev = libusb_get_device(f->h);
+	uint8_t ports[8];
+	int np = libusb_get_port_numbers(dev, ports, sizeof(ports));
+	char dir[PATH_MAX];
+
+	if (np > 0 && !meta_usb_dir("", libusb_get_bus_number(dev), ports, np, dir, sizeof(dir)))
+		meta_usb_write(w, dir);
+	/* ftdi_sio was bound and is detached while rsim-card runs */
+	jw_bool(w, "kernel_driver_detached", f->detached);
+	if (f->baud)
+		jw_int(w, "usb_uart_baud", (long)f->baud);
+}
+
 static const struct phx_io_ops ftdi_ops = {
 	.set_line = fu_set_line,
 	.set_modem = fu_set_modem,
@@ -266,6 +283,7 @@ static const struct phx_io_ops ftdi_ops = {
 	.read = fu_read,
 	.flush_input = fu_flush_input,
 	.close = fu_close,
+	.info = fu_info,
 };
 
 struct phx_io *ftdi_io_open(libusb_context *ctx, libusb_device_handle *h,

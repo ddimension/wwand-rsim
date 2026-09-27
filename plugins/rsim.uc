@@ -40,13 +40,16 @@ function helper_found()
 // ssh-key` creates it.
 const SSH_KEY_DIR = '/etc/wwand/rsim';
 const LOCAL_READER = /^((phoenix|pcsc|at|bt):.|wbsm:)/;
+// a modem's card on another wwand router: `wwand:<modem>` or
+// `wwand:iccid:<ICCID>` — only over SSH (here it is `modem:<name>`)
+const WWAND_READER = /^wwand:([A-Za-z0-9_]+|iccid:[0-9A-Fa-f]{18,20})$/;
 
 // 'ssh:user@host:reader' -> { dest, reader }, or null
 function ssh_split(r)
 {
-	let m = match(r, /^ssh:([A-Za-z0-9._-]+@[A-Za-z0-9._-]+):((phoenix|pcsc|wbsm|at|bt):.*)$/);
+	let m = match(r, /^ssh:([A-Za-z0-9._-]+@[A-Za-z0-9._-]+):((phoenix|pcsc|wbsm|at|bt|wwand):.*)$/);
 
-	return (m && match(m[2], LOCAL_READER)) ? { dest: m[1], reader: m[2] } : null;
+	return (m && (match(m[2], LOCAL_READER) || match(m[2], WWAND_READER))) ? { dest: m[1], reader: m[2] } : null;
 }
 
 // one word for the remote shell, whatever it contains (a PC/SC reader name
@@ -226,8 +229,31 @@ const HELPER_TIMEOUT_MS = 15000;
 
 // A phone's SIM over Bluetooth (bt:): the helper looks up the SAP channel,
 // connects and waits for the phone to grant SIM access — which may ask its
-// user — before the first power-up can be answered.
+// user — before the first power-up can be answered. A card on another wwand
+// router (wwand:) likewise: SSH, then that router's SIM Access link and the
+// park of its radio.
 const BT_FIRST_TIMEOUT_MS = 60000;
+
+// A card lent to another router (`wwandctl rsim proxy`, run here over SSH):
+// a proxy killed hard cannot say goodbye, so its process is watched and the
+// card goes home when it is gone. An ended lend stays readable (a late call
+// hears why) this long.
+const LEND_KEEP_S = 60;
+
+// Lending a card over the SIM Access Profile is a service of Qualcomm's UIM,
+// behind an EFS item that denies it until set (HW-observed on the RG650E,
+// 2026-09-26: SAP_CONNECTION -> ACCESS_DENIED while the item is absent). It is
+// read at modem boot, so it belongs in the AT init sequence as a SETTING
+// (written only when it differs, then one modem reset — atcmd run_sequence).
+// Only the vendor's AT command reaches EFS; Quectel's is known. Another
+// Qualcomm vendor gets nothing rather than a failing command on every start.
+const EFS_SAP = '/nv/item_files/modem/qmi/uim/sap_security_restrictions';
+const SAP_EFS_WRITERS = [
+	{ manufacturer: /quectel/i,
+	  step: { check: sprintf('AT+QNVFR="%s"', EFS_SAP), want: '^\\+QNVFR: *"?00"?[[:space:]]*$',
+	          set: sprintf('AT+QNVFW="%s",00', EFS_SAP), reset: true,
+	          note: 'SIM Access lending allowed (EFS sap_security_restrictions = 00)' } },
+];
 
 // The modem states in which its QMI services are up (modem.uc, the init
 // chain after INIT_SERVICES), so a UIM Remote client can be had.
@@ -239,6 +265,20 @@ const READY_FOR_REMOTE = [ 'SIM_UNLOCK', 'SIM_BLOCKED', 'SET_OPMODE', 'REGISTERI
 // (ISO/IEC 7816-3:2006 §10.3.3), and a remote reader adds the SSH round trip.
 // Giving up early restarts the reader in the middle of such an operation.
 const TPDU_TIMEOUT_MS = 30000;
+
+// READ/UPDATE BINARY with an SFI in P1 (b8 set), READ/UPDATE RECORD with
+// one in P2 (b8-b4 not zero) — ETSI TS 102 221 §11.1.3, 11.1.5-11.1.6
+function sfi_access(apdu)
+{
+	let ins = apdu?.[1], p1 = apdu?.[2], p2 = apdu?.[3];
+
+	if (ins == 0xB0 || ins == 0xD6)
+		return !!(p1 & 0x80);
+	if (ins == 0xB2 || ins == 0xDC)
+		return (p2 >> 3) != 0;
+
+	return false;
+}
 
 function hexs(a)
 {
@@ -271,11 +311,13 @@ function bytes(h)
 // network) as the plugin options a modem would carry, so a modem can say
 // `option rsim '<name>'` instead of spelling the reader out — and the reader
 // is defined once, however often it is moved between modems.
-//   type    wbsm | phoenix | pcsc | at | bt | modem
+//   type    wbsm | phoenix | pcsc | at | bt | modem | wwand
 //   device  tty (phoenix, at), reader name/index (pcsc), USB serial (wbsm),
-//           the phone's Bluetooth address (bt)
+//           the phone's Bluetooth address (bt), the modem or iccid:<ICCID>
+//           on the other router (wwand)
 //   host    user@host: the reader is on that machine, reached over SSH
 //   donor   (type modem) the modem that lends its card; donor_mode sap|apdu
+//           (unset: SIM Access, APDU over AT+CSIM on a donor without QMI UIM)
 // Returns the options, or { error } for a section that cannot work.
 function reader_options(r)
 {
@@ -292,6 +334,16 @@ function reader_options(r)
 			return { error: 'type modem needs `option donor`' };
 
 		spec = 'modem:' + r.donor;
+	}
+	else if (t == 'wwand') {
+		// a modem's card on another wwand router: by modem name there, or by
+		// the card's ICCID (stable when the card moves between its modems)
+		if (!length(r.host ?? ''))
+			return { error: 'a SIM on another wwand router needs `option host` (user@host)' };
+		if (!match('wwand:' + (r.device ?? ''), WWAND_READER))
+			return { error: 'a SIM on another wwand router needs `option device` (its modem there, or iccid:<ICCID>)' };
+
+		spec = sprintf('ssh:%s:wwand:%s', r.host, r.device);
 	}
 	else if (t == 'wbsm' || t == 'pcsc' || t == 'phoenix' || t == 'at' || t == 'bt') {
 		if (t == 'phoenix' && !length(r.device ?? ''))
@@ -325,6 +377,20 @@ function reader_options(r)
 	};
 }
 
+// How a sponsor lends: 'sap' or 'apdu' as configured, 'auto' when nothing
+// is — SIM Access, or APDU over AT+CSIM on a donor without QMI UIM (an NCM
+// modem), which has no SIM Access to offer
+function donor_mode(v)
+{
+	return (index([ 'sap', 'apdu' ], v) >= 0) ? v : 'auto';
+}
+
+// what a lend does now: its card knows once an 'auto' one settled
+function lend_mode(card, configured)
+{
+	return card?.mode?.() ?? configured;
+}
+
 function cfg_of(ext)
 {
 	let r = ext?.rsim_reader;
@@ -334,6 +400,7 @@ function cfg_of(ext)
 
 	let remote = null;
 	let donor = null;
+	let proxy = false;
 
 	if (substr(r, 0, 6) == 'modem:') {
 		donor = substr(r, 6);
@@ -346,6 +413,9 @@ function cfg_of(ext)
 
 		if (!remote)
 			return null;
+
+		// a modem's card on ANOTHER wwand router, lent by its wwand-rsim
+		proxy = (substr(remote.reader, 0, 6) == 'wwand:');
 	}
 	else if (!match(r, LOCAL_READER))
 		return null;
@@ -373,10 +443,18 @@ function cfg_of(ext)
 		bt_channel: (+ext.rsim_bt_channel >= 1 && +ext.rsim_bt_channel <= 30) ? +ext.rsim_bt_channel : null,
 		bt_security: (ext.rsim_bt_security == 'high') ? 'high' : null,
 		bt_apdu: (ext.rsim_bt_apdu == '7816') ? '7816' : null,
+		// a modem's card on another wwand router: lent the way a donor here
+		// lends it (the same options), by `wwandctl rsim proxy` over there
+		proxy: proxy ? {
+			mode: donor_mode(ext.rsim_donor_mode),
+			slot: (+ext.rsim_donor_slot >= 1 && +ext.rsim_donor_slot <= 5) ? +ext.rsim_donor_slot : null,
+			cond: ext.rsim_donor_cond ?? null,
+			apdu: (index([ 'qmi', 'at' ], ext.rsim_donor_apdu) >= 0) ? ext.rsim_donor_apdu : null,
+		} : null,
 		// another wwand modem lending its card (docs/plan.md §3.5)
 		donor: donor ? {
 			ref: donor,
-			mode: (ext.rsim_donor_mode == 'apdu') ? 'apdu' : 'sap',
+			mode: donor_mode(ext.rsim_donor_mode),
 			// the PHYSICAL slot, as the slot list numbers it; null: the one the
 			// donor runs on. donor_card maps it to the logical slot QMI takes.
 			slot: (+ext.rsim_donor_slot >= 1 && +ext.rsim_donor_slot <= 5) ? +ext.rsim_donor_slot : null,
@@ -392,6 +470,23 @@ function helper_argv(cfg, path, sys)
 {
 	let reader = cfg.local_reader ?? cfg.reader;
 	let argv = [ cfg.ssh ? (cfg.ssh.helper ?? 'rsim-card') : (path ?? HELPER), reader ];
+
+	// the other router's wwand lends the card: its proxy speaks the helper's
+	// protocol, so only the command differs
+	if (cfg.proxy) {
+		// no --mode: the proxy there decides (an older one: SIM Access)
+		argv = [ 'wwandctl', 'rsim', 'proxy', substr(reader, 6) ];
+
+		if (cfg.proxy.mode != 'auto')
+			push(argv, '--mode', cfg.proxy.mode);
+
+		if (cfg.proxy.slot != null)
+			push(argv, '--slot', sprintf('%d', cfg.proxy.slot));
+		if (cfg.proxy.apdu != null)
+			push(argv, '--apdu', cfg.proxy.apdu);
+		if (cfg.proxy.cond != null)
+			push(argv, '--cond', cfg.proxy.cond);
+	}
 
 	let wbsm = (substr(reader, 0, 5) == 'wbsm:');
 
@@ -582,9 +677,29 @@ function spawn_helper(argv, on_line, on_exit)
 //   with that ATR. A fallback for firmware without SAP.
 //
 // Requests are served one at a time, in order, like the helper does.
+// Donors whose SIM Access takes the card away and never answers the connect
+// (the release() comment below): by default they lend in APDU mode. A model
+// known for it, and any donor whose connect timed out once (deps.sap_wedged,
+// one per plugin instance: until the daemon restarts — the modem needs a
+// reset after it anyway).
+const SAP_WEDGES = /^E392/;
+
 function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 {
 	let sap = (dcfg.mode != 'apdu');
+	// SIM Access asked for only by default: a donor without it lends in
+	// APDU mode instead
+	let mode_auto = (index([ 'sap', 'apdu' ], dcfg.mode) < 0);
+
+	if (sap && mode_auto) {
+		let model = deps.modem_of?.(donor)?.modem?.info?.model ?? '';
+
+		if (deps.sap_wedged?.[donor] || match(model, SAP_WEDGES)) {
+			log('notice', sprintf('rsim: %s (%s) %s — lending in APDU mode', donor, length(model) ? model : '?',
+				deps.sap_wedged?.[donor] ? 'did not answer a SIM Access connect before' : 'hangs on a SIM Access connect'));
+			sap = false;
+		}
+	}
 	// the physical slot asked for (null: the active one), and the LOGICAL
 	// slot every QMI UIM request takes, resolved from the slot list first
 	let phys = dcfg.slot;
@@ -592,6 +707,8 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 	// the APDU path: QMI UIM SEND_APDU, or AT+CSIM; 'auto' starts with QMI
 	// and moves to AT when the donor has no UIM client or refuses the command
 	let via = (dcfg.apdu == 'at') ? 'at' : 'qmi';
+	// the instructions its UIM would not pass on, noted once each
+	let refused_ins = {};
 	let at_only = (dcfg.apdu == 'at');
 	let c = null, dead = false, ready = false, busy = false, atr = null;
 	let queue = [];
@@ -617,6 +734,8 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 	// up() is entered once: over SIM Access both the state indication and the
 	// status poll can report the link up
 	let upping = false;
+	// the SAP connect is asked a second time once, after a busy refusal
+	let retried_busy = false;
 
 	// The SPONSOR's side of a card change. Over SIM Access it hands its card
 	// over and gets it back: both times it runs wwand's card-change process
@@ -879,6 +998,25 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 					return at_apdu(uc(r.req.data), done);
 				}
 
+				// A command the donor's UIM refuses as an internal error (3)
+				// without it ever reaching the card: the E392 does so for a
+				// file access by short file identifier (SFI in P1 of READ/
+				// UPDATE BINARY, P2 of READ/UPDATE RECORD) and for SEARCH
+				// RECORD. Passed on as an I/O error it made the target
+				// power-cycle the card again and again, and drop its
+				// registration. The card's own answer for a command it does
+				// not do is 6A81, function not supported (ETSI TS 102 221
+				// §10.2.1.2): the terminal then SELECTs the file and asks
+				// without the SFI, or reads the records one by one.
+				if (e?.error == 'qmi' && e.code == 3) {
+					if (!refused_ins[apdu[1]]) {
+						refused_ins[apdu[1]] = true;
+						log('notice', sprintf('rsim: %s does not pass INS %02X%s (QMI error 3) — answered 6A81, function not supported',
+							donor, apdu[1], sfi_access(apdu) ? ' by SFI' : ''));
+					}
+					return done(null, { ok: true, data: '6A81' });
+				}
+
 				(e || length(d.response ?? []) < 2)
 					? done({ error: 'io', detail: e ?? (d?.long_response ? 'response too long' : 'no response') }, null)
 					: done(null, { ok: true, data: hexb(d.response) });
@@ -897,6 +1035,11 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 
 		busy = true;
 		serve(r, (err, msg) => {
+			// every command and its answer, for `set_log_level debug`
+			if (r.req.op == 'tpdu')
+				log('debug', sprintf('rsim: %s %s -> %s', donor, uc(r.req.data ?? ''),
+					err ? sprintf('%J', err) : (msg?.data ?? '?')));
+
 			busy = false;
 			reply(r, err, msg);
 			next();
@@ -965,7 +1108,8 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 
 
 	// the SAP connect proper, once the client is registered for its news
-	let connect = () => {
+	let connect;
+	connect = () => {
 		// cond 3: lend it even while the donor has a call or data session —
 		// taking it over is what was configured
 		let conn = { conn: { op: 1, slot: slot } };
@@ -982,8 +1126,33 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 			// retried automatically — each retry costs the donor its
 			// registration — until the configuration changes or
 			// `wwandctl rsim restart`.
-			if (e?.error == 'timeout')
-				return finish(sprintf('the donor %s does not answer the SIM Access connect — use rsim_donor_mode apdu', donor), true);
+			if (e?.error == 'timeout') {
+				if (mode_auto && deps.sap_wedged)
+					deps.sap_wedged[donor] = true;
+
+				return finish(sprintf('the donor %s does not answer the SIM Access connect — %s', donor,
+					mode_auto ? 'it lends in APDU mode from now on; it may need a reset first (wwandctl reset)'
+					          : 'use rsim_donor_mode apdu'), true);
+			}
+
+			// 52 DEVICE_NOT_READY (libqmi 1.38.0 qmi-errors.h:279): the
+			// donor is busy with its card — a data session. Without the
+			// condition TLV (rsim_donor_cond none, firmware that refuses it
+			// as malformed) the firmware's default refuses the link while
+			// one is up (HW-seen on an RG502Q, 2026-09-27). Park its radio,
+			// which ends the session, and ask once more.
+			if (e?.error == 'qmi' && e?.code == 52 && !parked && !retried_busy && deps.modem_radio) {
+				retried_busy = true;
+				log('notice', sprintf('rsim: %s is busy with its card — parking its radio, then asking again', donor));
+				return deps.modem_radio(donor, false, (pe) => {
+					if (dead || !c)
+						return;
+					if (pe)
+						return finish(sprintf('the donor %s refused the SIM Access link while busy, and its radio could not be parked (%J)', donor, pe));
+					parked = true;
+					uloop.timer(3000, () => (dead || !c) ? null : connect());
+				});
+			}
 
 			if (e)
 				return finish(sprintf('the donor %s refused the SIM Access link (%J)', donor, e));
@@ -1024,6 +1193,7 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 			close: () => { if (!dead) { dead = true; fail_all('closed'); sponsor_back(); } },
 			check: check,
 			busy: () => false,
+		mode: () => 'apdu',
 		};
 	}
 
@@ -1038,6 +1208,16 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 		// passthrough): the AT channel carries everything
 		if (err && !sap && dcfg.apdu != 'qmi') {
 			log('notice', sprintf('rsim: %s has no QMI UIM client (%s) — using AT+CSIM', donor, err.error ?? '?'));
+			via = 'at';
+			return up();
+		}
+
+		// ...and without it there is no SIM Access either: by default the
+		// card stays and is used through AT+CSIM (HW-seen: a MeiG SLM770A
+		// on NCM, 2026-09-27)
+		if (err && sap && mode_auto && dcfg.apdu != 'qmi') {
+			log('notice', sprintf('rsim: %s has no QMI UIM client (%s), so no SIM Access — lending in APDU mode over AT+CSIM', donor, err.error ?? '?'));
+			sap = false;
 			via = 'at';
 			return up();
 		}
@@ -1097,6 +1277,8 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 			push(queue, { req: req, cb: cb });
 			next();
 		},
+		// how it lends now: an 'auto' one settles once the donor answered
+		mode: () => sap ? 'sap' : 'apdu',
 		// hand the card back: graceful disconnect, then the client
 		close: () => {
 			if (dead)
@@ -1207,6 +1389,9 @@ function helper_rpc(open, argv, on_event, on_exit, log)
 // log — plus, for tests, open_helper (the helper channel) and now.
 function create(deps)
 {
+	// what this instance learned about its donors (donor_card)
+	deps = { ...deps, sap_wedged: {} };
+
 	let log = deps.log ?? ((l, m) => null);
 	let open = deps.open_helper ?? spawn_helper;
 	let now = deps.now ?? (() => time());
@@ -1303,6 +1488,80 @@ function create(deps)
 	let notes = {};
 	// donor links whose hand-back is still on its way
 	let draining = [];
+
+	// Cards lent to ANOTHER router: `wwandctl rsim proxy` here, run there
+	// over SSH by that router's wwand-rsim, borrows a modem's card through
+	// the same donor_card a local sponsor uses — SIM Access or APDU, the
+	// radio parked meanwhile. id -> { id, ref, card, mode, client, pid,
+	// since, commands, ended, why }
+	let lends = {};
+	let lend_seq = 0;
+	// modems whose card was taken back (LuCI, `wwandctl rsim take-back`): not
+	// lent again until allowed — else the other router's retry would take it
+	// again at once. Kept in memory: a daemon restart allows it again.
+	let lend_hold = {};
+	// per modem: does its UIM have the SIM Access service? true / false /
+	// absent (not asked yet) — asked once per modem object, cheaply (a SAP
+	// status query changes nothing), so at_init can leave out a modem that
+	// cannot lend this way. Keyed by modem, not by its object: the answer
+	// is the firmware's and holds across restarts.
+	let sap_known = {};
+	let sap_asked = {};
+	let pid_alive = deps.pid_alive ?? ((pid) => fs.access(sprintf('/proc/%d', pid)));
+
+	let lend_of = (ref) => {
+		for (let id, l in lends)
+			if (l.ref == ref && !l.ended)
+				return l;
+
+		return null;
+	};
+
+	let end_lend = (l, why) => {
+		if (l.ended)
+			return;
+
+		l.ended = now();
+		l.why = why;
+		log('notice', sprintf('rsim %s: card lent to %s comes back: %s', l.ref, l.client, why));
+		l.card.close();
+
+		// the hand-back is asynchronous: the radio stays held, the card
+		// taken, and the daemon's exit waits until it is done
+		if (l.card.busy())
+			push(draining, { ref: 'lend:' + l.id, cfg: { donor: { ref: l.ref, mode: l.mode } }, rpc: l.card });
+	};
+
+	// null, or why this modem's card cannot be lent to another router now
+	let lend_refusal = (ref) => {
+		let s = sessions[ref];
+
+		if (lend_hold[ref])
+			return 'lending was stopped here (allow it again: LuCI, or `wwandctl rsim MODEM lend-allow`)';
+
+		if (s && s.state != 'failed')
+			return 'this modem uses a remote card itself';
+
+		for (let other, os in sessions)
+			if (os.state != 'failed' && os.cfg.donor?.ref == ref)
+				return sprintf('its card is lent to %s', other);
+
+		for (let d in draining)
+			if (d.cfg.donor?.ref == ref && d.rpc.busy())
+				return 'its card is still being handed back';
+
+		let l = lend_of(ref);
+
+		if (l)
+			return sprintf('its card is lent to %s', l.client);
+
+		// a sponsor configured for a modem here keeps its card for that one
+		for (let other, sec in modem_sections())
+			if (other != ref && resolve(sec).cfg?.donor?.ref == ref)
+				return sprintf('it is the SIM sponsor of %s', other);
+
+		return null;
+	};
 
 	let stop_session;
 
@@ -1440,8 +1699,11 @@ function create(deps)
 			let ms = elapsed_ms();
 
 			if (resp == null || length(resp) < 2) {
-				log('warn', sprintf('rsim %s: apdu %d (INS %02X) failed on the card: %s', s.ref,
-					a.apdu_id, a.command[1] ?? 0, err?.error ?? 'short response'));
+				// with the reader's detail: over a lending modem that is the
+				// QMI error of its SEND_APDU, the one thing to know
+				log('warn', sprintf('rsim %s: apdu %d (INS %02X) failed on the card: %s%s (command %s)', s.ref,
+					a.apdu_id, a.command[1] ?? 0, err?.error ?? 'short response',
+					(err?.detail != null) ? sprintf(' — %J', err.detail) : '', hexs(a.command)));
 				s.client?.request('APDU', { status: 1, slot: s.cfg.slot, apdu_id: a.apdu_id },
 					() => null, { no_recovery: true });
 				event(s, EV_CARD_ERROR, { error_cause: (err?.error == 'timeout') ? ERR_TIMEOUT : ERR_UNKNOWN });
@@ -1524,6 +1786,47 @@ function create(deps)
 		});
 	};
 
+	// The settings a donor dials its card with — its interface's — when the
+	// card has no wwand_sim here. Injectable for the tests.
+	let read_ifaces = deps.iface_sections ?? (() => {
+		let out = [];
+		let c = libuci.cursor();
+
+		c.load('network');
+		c.foreach('network', 'interface', (sec) => { if (sec.proto == 'wwand') push(out, sec); });
+
+		return out;
+	});
+	let donor_settings = (donor) => {
+		for (let sec in read_ifaces())
+			if (sec.modem == donor && sec.apn != null && sec.apn != '')
+				return { apn: sec.apn, pdp_type: sec.pdp_type, auth: sec.auth,
+				         username: sec.username, password: sec.password, source: 'interface' };
+
+		return null;
+	};
+
+	// A borrowed card's settings, as the lender dials it, become this
+	// router's wwand_sim for that ICCID (origin rsim): kept for good, so the
+	// next dial with that card — now or after a restart — uses them. One the
+	// user wrote for the card is never touched (sim_upsert's rule).
+	let keep_settings = (ref, iccid, sim) => {
+		if (!deps.sim_upsert || !iccid || type(sim) != 'object' || sim.apn == null || sim.apn == '')
+			return;
+
+		let r = deps.sim_upsert(sprintf('%s', iccid), {
+			apn: sim.apn, pdp_type: sim.pdp_type, auth: sim.auth,
+			username: sim.username, password: sim.password,
+		}, 'rsim');
+
+		if (r?.written)
+			log('notice', sprintf('rsim %s: the lender\'s settings for card %s (APN %s, from its %s) kept as %s',
+				ref, iccid, sim.apn, (sim.source == 'interface') ? 'interface' : 'SIM entry', r.section));
+		else if (r?.reason == 'foreign')
+			log('debug', sprintf('rsim %s: card %s has a wwand_sim of its own here (%s) — the lender\'s settings are not used',
+				ref, iccid, r.section));
+	};
+
 	let start_session = (ref, cfg) => {
 		let s = new_session(ref, cfg);
 
@@ -1540,6 +1843,20 @@ function create(deps)
 		on_card_event = (ev) => {
 			if (s.state == 'failed')
 				return;
+
+			// what the reader is (sysfs, USB, the phone, the modem lending
+			// its card): sent once after the open, kept for the status
+			if (ev.event == 'info') {
+				let i = { ...ev };
+
+				delete i.event;
+				// the lending router's settings for the card: kept here as
+				// its wwand_sim, not in the status (the password)
+				delete i.sim;
+				s.reader_info = i;
+				keep_settings(ref, ev.iccid, ev.sim);
+				return;
+			}
 
 			if (ev.event == 'removed') {
 				log('notice', sprintf('rsim %s: card removed from the reader', ref));
@@ -1592,6 +1909,20 @@ function create(deps)
 			      : (why == 'exit') ? 'the card reader helper exited'
 			      : why, hold);
 		};
+
+		// a modem here lends its card: what is known about it is the
+		// daemon's own view of that modem
+		if (cfg.donor) {
+			let dm = deps.modem_of?.(cfg.donor.ref)?.modem;
+			let inf = dm?.info ?? {};
+
+			s.reader_info = { backend: 'donor', reader: cfg.donor.ref, mode: cfg.donor.mode,
+			                  modem_manufacturer: inf.manufacturer, modem_model: inf.model,
+			                  modem_revision: inf.revision, iccid: inf.iccid };
+			// a wwand_sim of the card already applies here as it is; if the
+			// donor dials it with its interface's settings, those
+			keep_settings(ref, inf.iccid, donor_settings(cfg.donor.ref));
+		}
 
 		s.rpc = cfg.donor ? donor_card(deps, cfg.donor.ref, cfg.donor, on_card_event, on_card_exit, log)
 		                  : helper_rpc(open, helper_argv(cfg, helper_path(), deps.ssh_sys), on_card_event, on_card_exit, log);
@@ -1671,7 +2002,7 @@ function create(deps)
 					// a card-inserted here, without the ATR, is refused.
 				});
 			});
-		}, (substr(cfg.local_reader ?? '', 0, 3) == 'bt:') ? BT_FIRST_TIMEOUT_MS : null);
+		}, (substr(cfg.local_reader ?? '', 0, 3) == 'bt:' || cfg.proxy) ? BT_FIRST_TIMEOUT_MS : null);
 	};
 
 	// polite: tell the modem the card is gone and the connection with it, so
@@ -1745,6 +2076,41 @@ function create(deps)
 
 			draining = filter(draining, (d) => d.rpc.busy());
 
+			// once per modem object: has its UIM the SIM Access service? Only
+			// a modem on its own card can lend one — and one that is being
+			// offered a remote card must hear nothing else first
+			let mo = deps.modem_of?.(ref)?.modem;
+
+			if (!cfg && !s && mo && sap_asked[ref] !== mo && mo.state == 'READY' && deps.qmi_client) {
+				sap_asked[ref] = mo;
+				deps.qmi_client(ref, { service: 0x0B, messages: UIM_SAP.messages }, (qe, qc) => {
+					if (qe || !qc)
+						return;
+					qc.request('SAP_CONNECTION', { conn: { op: 2, slot: 1 } }, (se) => {
+						deps.qmi_release(ref, qc);
+						// 71 INVALID_QMI_COMMAND: no SAP in this firmware
+						sap_known[ref] = !(se?.error == 'qmi' && se?.code == 71);
+					}, { no_recovery: true, timeout: 5000 });
+				});
+			}
+
+			// a card lent to another router: its proxy must still be there
+			for (let id, l in lends) {
+				if (l.ref != ref)
+					continue;
+
+				if (l.ended) {
+					if (now() - l.ended >= LEND_KEEP_S)
+						delete lends[id];
+					continue;
+				}
+
+				if (!pid_alive(l.pid))
+					end_lend(l, 'the proxy process is gone');
+				else
+					l.card.check();
+			}
+
 			// a hold is for the configuration that failed; a changed one
 			// (another slot, another mode) is tried afresh
 			if (!s && notes[ref]?.hold && (!cfg || notes[ref].hold_key != sprintf('%J', cfg)))
@@ -1802,6 +2168,15 @@ function create(deps)
 					return;
 				}
 
+			// nor while its card, or the one it would use, is lent to
+			// another router
+			let lent = lend_of(ref) ?? (cfg.donor ? lend_of(cfg.donor.ref) : null);
+
+			if (lent) {
+				note(ref, { conflict: sprintf('the card of %s is lent to %s', lent.ref, lent.client) });
+				return;
+			}
+
 			// a modem cannot use a card it is lending out itself
 			for (let other, os in sessions)
 				if (os.state != 'failed' && os.cfg.donor?.ref == ref) {
@@ -1831,7 +2206,37 @@ function create(deps)
 			if (!m || index(READY_FOR_REMOTE, m.state) < 0)
 				return;
 
+			// ...and so must the SPONSOR's, which is parked and lends through
+			// them: started while it is still coming up (a daemon restart),
+			// the park had no client and refused the whole lending for good
+			// (HW-seen on 245 with the E392, 2026-09-27)
+			if (cfg.donor && cfg.donor.ref != ref) {
+				let dm = deps.modem_of?.(cfg.donor.ref)?.modem;
+
+				if (!dm || index(READY_FOR_REMOTE, dm.state) < 0)
+					return;
+			}
+
 			start_session(ref, cfg);
+		},
+
+		// plugins.uc at_init: allow this modem to lend its card over the SIM
+		// Access Profile — a Qualcomm modem (QMI, or MBIM with its QMI
+		// passthrough) whose UIM is not known to lack SAP, from a vendor whose
+		// EFS command is known. Off with `option rsim_sap_auto '0'`.
+		at_init: (ref, ext, info) => {
+			if (ext?.rsim_sap_auto == '0' || ext?.rsim_sap_auto === false)
+				return [];
+			if (info?.protocol != 'qmi' && info?.protocol != 'mbim')
+				return [];
+			if (sap_known[ref] === false)
+				return [];
+
+			for (let w in SAP_EFS_WRITERS)
+				if (match(info?.manufacturer ?? '', w.manufacturer))
+					return [ { ...w.step } ];
+
+			return [];
 		},
 
 		// Why a modem's radio must stay off (plugins.uc radio_hold): it lends
@@ -1840,6 +2245,11 @@ function create(deps)
 			for (let other, os in sessions)
 				if (os.state != 'failed' && os.cfg.donor?.ref == ref)
 					return sprintf('its card is lent to %s', other);
+
+			let l = lend_of(ref);
+
+			if (l)
+				return sprintf('its card is lent to %s', l.client);
 
 			// still on its way back
 			for (let d in draining)
@@ -1887,15 +2297,26 @@ function create(deps)
 			if (rs.error)
 				return { label: 'remote SIM', text: rs.error, level: 'error' };
 
+			let l = lend_of(ref);
+
+			if (l)
+				return { label: 'SIM sponsor', level: 'ok',
+				         text: sprintf('lends its card to %s (%s, radio off)%s', l.client,
+				                       (lend_mode(l.card, l.mode) == 'apdu') ? 'APDU' : 'SIM Access',
+				                       l.commands ? sprintf(' · %d commands', l.commands) : '') };
+
 			// a modem lending its card to another one says so, whatever it
 			// is configured to use itself
 			for (let other, os in sessions)
-				if (os.state != 'failed' && os.cfg.donor?.ref == ref)
-					return { label: 'SIM sponsor', level: (os.cfg.donor.mode == 'apdu' && registered(ref)) ? 'warn' : 'ok',
+				if (os.state != 'failed' && os.cfg.donor?.ref == ref) {
+					let apdu = (lend_mode(os.rpc, os.cfg.donor.mode) == 'apdu');
+
+					return { label: 'SIM sponsor', level: (apdu && registered(ref)) ? 'warn' : 'ok',
 					         text: sprintf('lends its card to %s (%s)%s', other,
-					                       (os.cfg.donor.mode == 'apdu') ? 'APDU, radio off' : 'SIM Access',
-					                       (os.cfg.donor.mode == 'apdu' && registered(ref))
+					                       apdu ? 'APDU, radio off' : 'SIM Access',
+					                       (apdu && registered(ref))
 					                           ? ' — but it is registered on the network: its radio must stay off (take its interfaces down)' : '') };
+				}
 
 			if (!cfg)
 				return null;
@@ -1927,6 +2348,121 @@ function create(deps)
 		},
 
 		ops: {
+			// ---- lending to another router: `wwandctl rsim proxy` ----------
+			// Read-only: null, or why this modem's card cannot be lent now.
+			lend_check: (ref, ext, args, cb) => {
+				let why = lend_refusal(ref);
+
+				// how it can lend: APDU always; SIM Access when its UIM
+				// has the service (the QMI probe, once per modem object;
+				// null until asked)
+				cb(null, { lendable: !why, why: why, sap: sap_known[ref] ?? null });
+			},
+
+			// Take the card over for a proxy. args: { mode, slot, apdu,
+			// cond, client, pid }. Answers at once with the id; the first
+			// request waits until the card is ready (as with a helper).
+			lend_open: (ref, ext, args, cb) => {
+				let why = lend_refusal(ref);
+
+				if (why)
+					return cb({ error: 'busy', detail: why });
+
+				// its process is what tells a proxy that is gone from one
+				// that is idle — the only sign of life it gives
+				if (!(+args?.pid > 0))
+					return cb({ error: 'bad_request', detail: 'the proxy\'s pid is missing' });
+
+				let id = sprintf('%d-%d', now(), ++lend_seq);
+				let l = {
+					id: id, ref: ref, mode: donor_mode(args?.mode),
+					client: length(args?.client ?? '') ? sprintf('%s', args.client) : 'another router',
+					pid: +args.pid, since: now(), commands: 0, ended: null, why: null, card: null,
+				};
+
+				lends[id] = l;
+				// on_exit may come during construction (no such slot)
+				l.card = donor_card(deps, ref, {
+					mode: l.mode,
+					slot: (+args?.slot >= 1 && +args?.slot <= 5) ? +args.slot : null,
+					cond: args?.cond ?? null,
+					apdu: (index([ 'qmi', 'at' ], args?.apdu) >= 0) ? args.apdu : 'auto',
+				}, () => null, (w) => {
+					if (l.card)
+						return end_lend(l, w);
+
+					l.ended = now();
+					l.why = w;
+				}, log);
+
+				if (l.ended) {
+					delete lends[id];
+					return cb({ error: 'refused', detail: l.why });
+				}
+
+				log('notice', sprintf('rsim %s: lending the card to %s (%s)', ref, l.client,
+					{ sap: 'SIM Access', apdu: 'APDU' }[l.mode] ?? 'SIM Access, or APDU without it'));
+				cb(null, { id: id, mode: l.mode });
+			},
+
+			// One request of the helper protocol through the lent card:
+			// { id, req } -> { answer } (the helper's answer line), or
+			// { ended, why } once the card has gone home.
+			lend_call: (ref, ext, args, cb) => {
+				let l = lends[args?.id ?? ''];
+
+				if (!l || l.ref != ref)
+					return cb({ error: 'no_such_lend' });
+
+				if (l.ended)
+					return cb(null, { ended: true, why: l.why });
+
+				let req = args.req;
+
+				if (type(req) != 'object' || type(req.op) != 'string')
+					return cb(null, { answer: { ok: false, error: 'bad_request', detail: 'not a request object with an op' } });
+
+				if (req.op == 'tpdu')
+					l.commands++;
+
+				l.card.call(req, (err, msg) => {
+					if (err && l.ended)
+						return cb(null, { ended: true, why: l.why });
+
+					cb(null, { answer: err ? { ok: false, error: err.error ?? 'io', detail: err.detail } : msg });
+				});
+			},
+
+			// Take the card back from another router, and lend it no more
+			// until allowed: the other router's retry would take it again.
+			lend_end: (ref, ext, args, cb) => {
+				let l = lend_of(ref);
+
+				lend_hold[ref] = true;
+
+				if (l)
+					end_lend(l, 'taken back here');
+
+				cb(null, { ended: !!l, held: true });
+			},
+
+			lend_allow: (ref, ext, args, cb) => {
+				delete lend_hold[ref];
+				cb(null, { held: false });
+			},
+
+			// the proxy is done: the card goes home
+			lend_close: (ref, ext, args, cb) => {
+				let l = lends[args?.id ?? ''];
+
+				if (!l || l.ref != ref)
+					return cb({ error: 'no_such_lend' });
+
+				end_lend(l, 'the proxy is done');
+				delete lends[l.id];
+				cb(null, { closed: true });
+			},
+
 			// Can this modem lend its card? Takes it over through the SIM
 			// Access link (its own connection drops meanwhile), reads the ATR,
 			// sends SELECT MF, and hands it back. args: { slot, cond, mode }.
@@ -1944,6 +2480,9 @@ function create(deps)
 					if (d.cfg.donor?.ref == ref && d.rpc.busy())
 						return cb({ error: 'busy', detail: 'this modem\'s card is still being handed back' });
 
+				if (lend_of(ref))
+					return cb({ error: 'busy', detail: sprintf('this modem lends its card to %s right now', lend_of(ref).client) });
+
 				let steps = [];
 				let answered = false;
 				let card;
@@ -1955,7 +2494,7 @@ function create(deps)
 					uloop.timer(1500, () => cb(null, { ok: !err, error: err, steps: steps }));
 				};
 
-				card = donor_card(deps, ref, { mode: args?.mode ?? 'sap', slot: (args?.slot != null) ? +args.slot : null,
+				card = donor_card(deps, ref, { mode: donor_mode(args?.mode), slot: (args?.slot != null) ? +args.slot : null,
 				                               cond: args?.cond, apdu: args?.apdu ?? 'auto' },
 					() => null, (why) => { push(steps, sprintf('link ended: %s', why)); out(why); },
 					(l, m) => push(steps, m));
@@ -2050,7 +2589,27 @@ function create(deps)
 				let cfg = rs.cfg;
 				let n = notes[ref] ?? {};
 
+				// whom this modem lends its card to right now: a modem here
+				// (SIM sponsor), or another router through the proxy
+				let lent = lend_of(ref);
+				let to = null;
+
+				for (let other, os in sessions)
+					if (os.state != 'failed' && os.cfg.donor?.ref == ref)
+						to = { to: other, mode: lend_mode(os.rpc, os.cfg.donor.mode), remote: false };
+
+				if (lent)
+					to = { to: lent.client, mode: lend_mode(lent.card, lent.mode), remote: true, commands: lent.commands, since: lent.since };
+
+				let refused = lend_refusal(ref);
+
 				cb(null, {
+					lent_to: to,
+					// can another router borrow its card now, and is that
+					// stopped here
+					lendable: !refused,
+					lend_why: refused,
+					lend_hold: !!lend_hold[ref],
 					enabled: !!cfg,
 					reader_name: cfg?.reader_name ?? ext?.rsim ?? null,
 					reader: cfg?.reader ?? null,
@@ -2059,6 +2618,9 @@ function create(deps)
 					slot: cfg?.slot ?? null,
 					state: s?.state ?? (cfg ? 'idle' : 'off'),
 					atr: s?.atr ?? null,
+					// what the reader in use is (its info event)
+					reader_info: (s?.reader_info?.backend == 'donor')
+						? { ...s.reader_info, mode: lend_mode(s.rpc, s.reader_info.mode) } : (s?.reader_info ?? null),
 					apdus: s?.apdus ?? 0,
 					last_sw: s?.last_sw ?? null,
 					since: s?.since ?? null,
@@ -2078,7 +2640,7 @@ function create(deps)
 				cb(null, { restarted: true });
 			},
 		},
-		read_ops: [ 'status' ],
+		read_ops: [ 'status', 'lend_check' ],
 
 		// plugins.uc plugins_busy: a withdrawal or a hand-back still on its way
 		busy: () => {
@@ -2093,6 +2655,12 @@ function create(deps)
 		// longer instead of dropping them.
 		stop: () => {
 			let pending = false;
+
+			for (let id, l in lends)
+				if (!l.ended) {
+					end_lend(l, 'wwand stops');
+					pending = true;
+				}
 
 			for (let ref, s in sessions) {
 				pending = true;
@@ -2115,6 +2683,7 @@ return {
 	UIM_APDU: UIM_APDU,
 	reader_options: reader_options,
 	csim_cmd: csim_cmd,
+	sfi_access: sfi_access,
 	csim_answer: csim_answer,
 	ssh_split: ssh_split,
 	SSH_KEY_DIR: SSH_KEY_DIR,
@@ -2124,7 +2693,7 @@ return {
 
 	name: 'rsim',
 	options: [ 'rsim_reader', 'rsim_slot', 'rsim_clock', 'rsim_reset', 'rsim_detect', 'rsim_mode', 'rsim_at_radio', 'rsim_at_baud',
-	           'rsim_bt_channel', 'rsim_bt_security', 'rsim_bt_apdu',
+	           'rsim_bt_channel', 'rsim_bt_security', 'rsim_bt_apdu', 'rsim_sap_auto',
 	           'rsim_ssh_port', 'rsim_ssh_key', 'rsim_ssh_helper', 'rsim_donor_mode', 'rsim_donor_slot', 'rsim_donor_cond', 'rsim_donor_apdu',
 	           // a named SIM reader (config wwand_simreader) instead of the above
 	           'rsim' ],

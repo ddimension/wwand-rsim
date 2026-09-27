@@ -91,6 +91,8 @@ struct bt_backend {
 	char addr[18];
 	uint8_t apdu_param;
 	uint16_t max_msg;
+	int channel;		/* the RFCOMM channel it runs on */
+	bool secure_high;
 	int card;		/* the phone's last word: 1 usable, 0 not */
 	bool sim_on;		/* powered on at the phone */
 	bool served;		/* an ATR went out since the target last saw no card */
@@ -464,13 +466,29 @@ static int get_atr(struct bt_backend *b, uint8_t *atr, size_t *atr_len)
 {
 	struct sap_msg m;
 	const struct sap_param *a;
-	int r = request(b, SAP_TRANSFER_ATR_REQ, NULL, 0, SAP_TRANSFER_ATR_RESP, request_timeout_ms, &m);
+	int r;
 
-	if (r || (r = result(b, &m, -1)))
-		return r;
-	a = sap_get(&m, SAP_P_ATR);
+	/* A phone that says OK and sends no ATR is not ready with its SIM yet:
+	 * asked again after a moment (Galaxy A5 2016 right after the connect,
+	 * 2026-09-27) */
+	for (int tries = 0;; tries++) {
+		r = request(b, SAP_TRANSFER_ATR_REQ, NULL, 0, SAP_TRANSFER_ATR_RESP, request_timeout_ms, &m);
+		if (r || (r = result(b, &m, -1)))
+			return r;
+		a = sap_get(&m, SAP_P_ATR);
+		if (a || tries >= 4)
+			break;
+		log_dbg("bt: %s: TRANSFER_ATR_RESP without an ATR — asking again", b->addr);
+		usleep(1000 * 1000);
+	}
 	if (!a || a->len < 2 || a->len > 33) {
-		snprintf(b->be.detail, RSIM_DETAIL_MAX, "the phone sent no usable ATR");
+		char hex[2 * 40 + 1] = "";
+
+		for (int i = 0; a && i < a->len && i < 40; i++)
+			snprintf(hex + 2 * i, 3, "%02X", a->val[i]);
+		snprintf(b->be.detail, RSIM_DETAIL_MAX, a ? "the phone sent no usable ATR (%d bytes: %s%s)"
+			 : "the phone sent no usable ATR (no ATR parameter, %d parameters)",
+			 a ? (int)a->len : m.n, hex, (a && a->len > 40) ? "…" : "");
 		return RSIM_E_PROTOCOL;
 	}
 	memcpy(atr, a->val, a->len);
@@ -583,12 +601,26 @@ static void bt_close(struct rsim_backend *be)
 	struct bt_backend *b = (struct bt_backend *)be;
 	struct sap_msg m;
 
-	/* the phone gets its SIM back at once, not after a link timeout */
-	if (!b->gone && request(b, SAP_DISCONNECT_REQ, NULL, 0, SAP_DISCONNECT_RESP, 2000, &m) == RSIM_OK)
-		log_notice("bt: %s: SIM access ended, the phone has its SIM back", b->addr);
+	/* The phone gets its SIM back at once, not after a link timeout. Its
+	 * answer is not waited for long: Samsung's RIL takes ~15 s to confirm
+	 * a disconnect (adb logcat of a Galaxy S20 FE, 2026-09-27) and has
+	 * the card back regardless — no answer here is no fault. */
+	if (!b->gone && send_msg(b, SAP_DISCONNECT_REQ, NULL, 0) == RSIM_OK) {
+		long deadline = now_ms() + 2000;
+		int r;
+
+		while ((r = read_msg(b, deadline, &m)) == RSIM_OK && m.id != SAP_DISCONNECT_RESP)
+			;
+		if (r == RSIM_OK)
+			log_notice("bt: %s: SIM access ended, the phone has its SIM back", b->addr);
+		else
+			log_dbg("bt: %s: DISCONNECT_REQ sent; the phone confirms it later", b->addr);
+	}
 	close(b->fd);
 	free(b);
 }
+
+static void bt_info(struct rsim_backend *be, struct jw *w);
 
 static const struct rsim_backend_ops BT_OPS = {
 	.name = "bt",
@@ -598,17 +630,26 @@ static const struct rsim_backend_ops BT_OPS = {
 	.transmit = bt_transmit,
 	.present = bt_present,
 	.close = bt_close,
+	.info = bt_info,
 };
 
 /* CONNECT_REQ until the phone accepts a message size, then its first
  * STATUS_IND. 0, or -1 (logged). */
 static int sap_connect(struct bt_backend *b)
 {
-	uint16_t want = SAP_MSG_WANT;
+	/* The sizes asked for, largest first. A server that cannot take one
+	 * should answer "message size not supported" with its own (status 2),
+	 * but Samsung's SAP RIL answers a plain failure (status 1) to 1024 and
+	 * takes 261 at most (adb logcat of a Galaxy S20 FE, 2026-09-27:
+	 * "connectResponse: ... sapConnectRsp 1 maxMsgSize 261") — so a failure
+	 * is asked again, smaller. */
+	static const uint16_t sizes[] = { SAP_MSG_WANT, 512, 300, SAP_MSG_MIN, SAP_MSG_LOW };
+	uint16_t want = sizes[0];
+	size_t next = 1;
 	long deadline;
 	int tries;
 
-	for (tries = 0; tries < 3; tries++) {
+	for (tries = 0; tries < 8; tries++) {
 		uint8_t sz[2] = { (uint8_t)(want >> 8), (uint8_t)want };
 		struct sap_param p = { .id = SAP_P_MAX_MSG_SIZE, .len = 2, .val = sz };
 		const struct sap_param *ms;
@@ -622,8 +663,12 @@ static int sap_connect(struct bt_backend *b)
 		}
 		st = sap_get_u8(&m, SAP_P_CONNECTION_STATUS);
 		ms = sap_get(&m, SAP_P_MAX_MSG_SIZE);
+		log_dbg("bt: %s: CONNECT_REQ %u bytes -> status %d", b->addr, want, st);
 		if (st == SAP_CONN_OK || st == SAP_CONN_OK_CALL) {
 			b->max_msg = want;
+			if (want < SAP_MSG_MIN)
+				log_warn("bt: %s: the phone takes SAP messages of %u bytes: a command longer than %u bytes cannot be passed",
+					 b->addr, want, (unsigned)(want - 8));
 			if (st == SAP_CONN_OK_CALL)
 				log_notice("bt: %s: a call is going on at the phone; its SIM follows when it ends", b->addr);
 			break;
@@ -631,13 +676,20 @@ static int sap_connect(struct bt_backend *b)
 		if (st == SAP_CONN_MSGSIZE && ms && ms->len == 2) {
 			uint16_t theirs = (uint16_t)((ms->val[0] << 8) | ms->val[1]);
 
-			if (theirs >= SAP_MSG_MIN && theirs != want) {
+			if (theirs >= SAP_MSG_LOW && theirs != want) {
 				log_dbg("bt: %s: the phone takes messages of %u bytes", b->addr, theirs);
 				want = theirs;
 				continue;
 			}
-			log_err("bt: %s: the phone takes SAP messages of %u bytes only, %u needed", b->addr, theirs, SAP_MSG_MIN);
+			log_err("bt: %s: the phone takes SAP messages of %u bytes only, %u needed at least", b->addr, theirs, SAP_MSG_LOW);
 			return -1;
+		}
+		/* a failure (or "too small" to a smaller size): the next size */
+		if ((st == SAP_CONN_FAIL || st == SAP_CONN_TOOSMALL) && next < sizeof(sizes) / sizeof(sizes[0])) {
+			log_notice("bt: %s: the phone refuses SIM access with %u-byte messages (status %d) — asking with %u",
+				   b->addr, want, st, sizes[next]);
+			want = sizes[next++];
+			continue;
 		}
 		log_err("bt: %s: the phone refuses SIM access (connection status %d)", b->addr, st);
 		return -1;
@@ -709,12 +761,14 @@ struct rsim_backend *bt_open(const struct bt_cfg *cfg)
 		free(b);
 		return NULL;
 	}
+	b->channel = channel;
+	b->secure_high = cfg->secure_high;
 	log_notice("bt: %s: SIM access over channel %d, messages up to %u bytes, the SIM %s", cfg->addr,
 		   channel, b->max_msg, b->card ? "ready" : "not (yet) accessible");
 	return &b->be;
 }
 
-/* ---- --list: the paired phones ----------------------------------------- */
+/* ---- what is known about a phone: BlueZ's storage, the kernel's mgmt API -- */
 
 static int is_addr(const char *s)
 {
@@ -723,22 +777,63 @@ static int is_addr(const char *s)
 	return bt_parse_addr(s, b) == 0;
 }
 
-/* one device's BlueZ info file: name, class, services and whether it holds
- * a BR/EDR link key (paired for SAP; an LE-only bond is not) */
+/* one device's BlueZ files: <adapter>/<device>/info and <adapter>/cache/<device> */
 struct bt_dev {
-	char name[128];
+	char name[128], alias[128];
 	unsigned long cls;
 	int sap;		/* 1 offered, 0 not, -1 no service list stored */
-	int paired;
+	int sap_channel;	/* from the cached SDP record, 0 unknown */
+	int paired;		/* a BR/EDR link key (an LE-only bond is not) */
+	int key_type;		/* its Type, -1 none */
+	int pin_len;
+	int trusted, blocked;
+	char services[256];	/* short names, comma separated */
+	long vendor, product, version;	/* [DeviceID], -1 none */
+	long vendor_src;
 };
+
+static const char *uuid_name(unsigned u)
+{
+	static const struct { unsigned u; const char *n; } t[] = {
+		{ 0x1101, "SPP" }, { 0x1103, "DUN" }, { 0x1105, "OPP" }, { 0x1108, "HSP" }, { 0x110a, "A2DP-source" },
+		{ 0x110b, "A2DP-sink" }, { 0x110c, "AVRCP-target" }, { 0x110e, "AVRCP" }, { 0x1112, "HSP-AG" },
+		{ 0x1115, "PANU" }, { 0x1116, "NAP" }, { 0x111e, "HFP" }, { 0x111f, "HFP-AG" }, { 0x112d, "SAP" },
+		{ 0x112f, "PBAP" }, { 0x1132, "MAP" }, { 0x1200, "PnP" }, { 0x1800, "GAP" }, { 0x1801, "GATT" },
+		{ 0x180a, "DIS" }, { 0x180f, "Battery" },
+	};
+	size_t i;
+
+	for (i = 0; i < sizeof(t) / sizeof(t[0]); i++)
+		if (t[i].u == u)
+			return t[i].n;
+	return NULL;
+}
+
+static void add_service(struct bt_dev *d, const char *uuid)
+{
+	char n[16];
+	const char *name;
+	unsigned u;
+	size_t o = strlen(d->services);
+
+	/* 0000xxxx-0000-1000-8000-00805f9b34fb: a 16-bit one; others skipped */
+	if (strlen(uuid) < 36 || strncmp(uuid, "0000", 4) || strncasecmp(uuid + 8, "-0000-1000-8000-00805f9b34fb", 28))
+		return;
+	u = (unsigned)strtoul((char[]){ uuid[4], uuid[5], uuid[6], uuid[7], 0 }, NULL, 16);
+	if (!(name = uuid_name(u))) {
+		snprintf(n, sizeof(n), "0x%04x", u);
+		name = n;
+	}
+	if (u == SAP_UUID16)
+		d->sap = 1;
+	snprintf(d->services + o, sizeof(d->services) - o, "%s%s", o ? "," : "", name);
+}
 
 static void read_info(const char *path, struct bt_dev *d)
 {
 	char line[4096], section[32] = "";
 	FILE *f = fopen(path, "r");
 
-	memset(d, 0, sizeof(*d));
-	d->sap = -1;
 	if (!f)
 		return;
 	while (fgets(line, sizeof(line), f)) {
@@ -749,37 +844,365 @@ static void read_info(const char *path, struct bt_dev *d)
 				d->paired = 1;
 			continue;
 		}
-		if (strcmp(section, "General"))
-			continue;
-		if (!strncmp(line, "Name=", 5))
-			snprintf(d->name, sizeof(d->name), "%.*s", (int)sizeof(d->name) - 1, line + 5);
-		else if (!strncmp(line, "Class=", 6))
-			d->cls = strtoul(line + 6, NULL, 16);
-		else if (!strncmp(line, "Services=", 9)) {
-			const char *p;
+		if (!strcmp(section, "General")) {
+			if (!strncmp(line, "Name=", 5))
+				snprintf(d->name, sizeof(d->name), "%.*s", (int)sizeof(d->name) - 1, line + 5);
+			else if (!strncmp(line, "Alias=", 6))
+				snprintf(d->alias, sizeof(d->alias), "%.*s", (int)sizeof(d->alias) - 1, line + 6);
+			else if (!strncmp(line, "Class=", 6))
+				d->cls = strtoul(line + 6, NULL, 16);
+			else if (!strncmp(line, "Trusted=", 8))
+				d->trusted = !strcmp(line + 8, "true");
+			else if (!strncmp(line, "Blocked=", 8))
+				d->blocked = !strcmp(line + 8, "true");
+			else if (!strncmp(line, "Services=", 9)) {
+				char *p, *save = NULL;
 
-			d->sap = 0;
-			for (p = line + 9; *p; p += strcspn(p, ";"), p += (*p == ';'))
-				if (!strncasecmp(p, "0000112d-0000-1000-8000-00805f9b34fb", 36))
-					d->sap = 1;
+				if (d->sap < 0)
+					d->sap = 0;
+				for (p = strtok_r(line + 9, ";", &save); p; p = strtok_r(NULL, ";", &save))
+					add_service(d, p);
+			}
+		} else if (!strcmp(section, "LinkKey")) {
+			if (!strncmp(line, "Type=", 5))
+				d->key_type = atoi(line + 5);
+			else if (!strncmp(line, "PINLength=", 10))
+				d->pin_len = atoi(line + 10);
+		} else if (!strcmp(section, "DeviceID")) {
+			if (!strncmp(line, "Source=", 7))
+				d->vendor_src = strtol(line + 7, NULL, 0);
+			else if (!strncmp(line, "Vendor=", 7))
+				d->vendor = strtol(line + 7, NULL, 0);
+			else if (!strncmp(line, "Product=", 8))
+				d->product = strtol(line + 8, NULL, 0);
+			else if (!strncmp(line, "Version=", 8))
+				d->version = strtol(line + 8, NULL, 0);
 		}
 	}
 	fclose(f);
 }
 
-int bt_list(const char *sysroot, char *note, size_t note_cap)
+/* The SDP records BlueZ cached from the phone ([ServiceRecords], one hex
+ * string each): the SIM Access one names its RFCOMM channel — known without
+ * asking the phone. */
+static void read_cache(const char *path, struct bt_dev *d)
+{
+	char line[8192], section[32] = "";
+	FILE *f = fopen(path, "r");
+
+	if (!f)
+		return;
+	while (fgets(line, sizeof(line), f)) {
+		uint8_t rec[2048];
+		char *eq;
+		int n, ch;
+
+		line[strcspn(line, "\r\n")] = '\0';
+		if (line[0] == '[') {
+			snprintf(section, sizeof(section), "%.*s", (int)strcspn(line + 1, "]"), line + 1);
+			continue;
+		}
+		if (!strcmp(section, "General") && !strncmp(line, "Name=", 5) && !d->name[0])
+			snprintf(d->name, sizeof(d->name), "%.*s", (int)sizeof(d->name) - 1, line + 5);
+		if (strcmp(section, "ServiceRecords") || !(eq = strchr(line, '=')))
+			continue;
+		if ((n = hex_decode(eq + 1, rec, sizeof(rec))) < 3)
+			continue;
+		/* its service class list names 0x112D (UUID16 element 19 11 2D) */
+		for (int i = 0; i + 2 < n; i++)
+			if (rec[i] == 0x19 && rec[i + 1] == 0x11 && rec[i + 2] == 0x2d) {
+				d->sap = 1;
+				if ((ch = sdp_rfcomm_channel(rec, (size_t)n)) > 0)
+					d->sap_channel = ch;
+				break;
+			}
+	}
+	fclose(f);
+}
+
+static void dev_init(struct bt_dev *d)
+{
+	memset(d, 0, sizeof(*d));
+	d->sap = -1;
+	d->key_type = -1;
+	d->vendor = d->product = d->version = d->vendor_src = -1;
+}
+
+/* <sysroot>/var/lib/bluetooth/<adapter>/<addr>: its files, the adapter's
+ * address in adapter[]; 0 found, -1 not */
+static int dev_lookup(const char *sysroot, const char *addr, struct bt_dev *d, char *adapter, size_t cap)
+{
+	char base[PATH_MAX], p[PATH_MAX];
+	DIR *ad;
+	struct dirent *a;
+	int found = -1;
+
+	dev_init(d);
+	snprintf(base, sizeof(base), "%s/var/lib/bluetooth", sysroot);
+	if (!(ad = opendir(base)))
+		return -1;
+	while (found && (a = readdir(ad))) {
+		if (!is_addr(a->d_name))
+			continue;
+		if (snprintf(p, sizeof(p), "%s/%s/%s/info", base, a->d_name, addr) >= (int)sizeof(p) || access(p, R_OK))
+			continue;
+		read_info(p, d);
+		if (snprintf(p, sizeof(p), "%s/%s/cache/%s", base, a->d_name, addr) < (int)sizeof(p))
+			read_cache(p, d);
+		snprintf(adapter, cap, "%.*s", (int)cap - 1, a->d_name);
+		found = 0;
+	}
+	closedir(ad);
+	return found;
+}
+
+static const char *class_kind(unsigned long cls)
+{
+	static const char *const major[] = { "misc", "computer", "phone", "network", "audio/video", "peripheral",
+					     "imaging", "wearable", "toy", "health" };
+	static const char *const phone[] = { "phone", "cellular", "cordless", "smartphone", "modem", "ISDN" };
+	unsigned mj = (cls >> 8) & 0x1f, mn = (cls >> 2) & 0x3f;
+
+	if (!cls)
+		return "";
+	if (mj == 2 && mn < 6)
+		return phone[mn];
+	return mj < 10 ? major[mj] : "other";
+}
+
+/* how the pairing was made: what `--bt-security high` needs is an
+ * authenticated key (MITM-protected: a PIN or a compared number) */
+static const char *key_kind(int type, int pin_len)
+{
+	switch (type) {
+	case -1: return "";
+	case 0: return pin_len >= 16 ? "legacy PIN (16 digits)" : "legacy PIN";
+	case 4: case 7: return "unauthenticated";
+	case 5: case 8: return "authenticated";
+	default: return "other";
+	}
+}
+
+static const char *vendor_name(long src, long v)
+{
+	/* Bluetooth SIG company ids (Source 1); a few that make phones */
+	static const struct { long id; const char *n; } t[] = {
+		{ 0x004c, "Apple" }, { 0x0075, "Samsung" }, { 0x00e0, "Google" }, { 0x027d, "Huawei" },
+		{ 0x038f, "Xiaomi" }, { 0x0046, "MediaTek" }, { 0x001d, "Qualcomm" }, { 0x000f, "Broadcom" },
+		{ 0x0001, "Nokia" }, { 0x0056, "Sony Ericsson" }, { 0x0072, "OnePlus/Oppo" },
+	};
+	size_t i;
+
+	if (src != 1)
+		return NULL;
+	for (i = 0; i < sizeof(t) / sizeof(t[0]); i++)
+		if (t[i].id == v)
+			return t[i].n;
+	return NULL;
+}
+
+/* The kernel's Bluetooth management API (HCI_CHANNEL_CONTROL), read only:
+ * the adapters, whether they are on, and who is connected now. It needs
+ * CAP_NET_ADMIN; without it (or without Bluetooth) ok stays 0. */
+#define BTPROTO_HCI 1
+#define HCI_CHANNEL_CONTROL 3
+#define MGMT_INDEX_NONE 0xFFFF
+#define MGMT_EV_CMD_COMPLETE 0x0001
+#define MGMT_EV_CMD_STATUS 0x0002
+#define MGMT_OP_READ_INDEX_LIST 0x0003
+#define MGMT_OP_READ_INFO 0x0004
+#define MGMT_OP_GET_CONNECTIONS 0x0015
+
+struct sa_hci {
+	sa_family_t family;
+	unsigned short dev;
+	unsigned short channel;
+};
+
+struct bt_mgmt {
+	int ok;
+	int nadp;
+	struct { int index; char addr[18]; char name[64]; int powered; } adp[8];
+	int nconn;
+	char conn[32][18];
+};
+
+static void addr_str(const uint8_t *b, char *out)
+{
+	snprintf(out, 18, "%02X:%02X:%02X:%02X:%02X:%02X", b[5], b[4], b[3], b[2], b[1], b[0]);
+}
+
+/* one command, its reply's data into out; the data length or -1 */
+static int mgmt_cmd(int fd, uint16_t op, uint16_t index, uint8_t *out, size_t cap)
+{
+	uint8_t req[6] = { (uint8_t)op, (uint8_t)(op >> 8), (uint8_t)index, (uint8_t)(index >> 8), 0, 0 };
+	uint8_t buf[1024];
+	long deadline = now_ms() + 1000;
+
+	if (write(fd, req, sizeof(req)) != (ssize_t)sizeof(req))
+		return -1;
+	for (;;) {
+		struct pollfd p = { .fd = fd, .events = POLLIN };
+		long left = deadline - now_ms();
+		ssize_t n;
+		uint16_t ev, len, rop;
+
+		if (left <= 0 || poll(&p, 1, (int)left) <= 0)
+			return -1;
+		if ((n = read(fd, buf, sizeof(buf))) < 9)
+			continue;
+		ev = (uint16_t)(buf[0] | buf[1] << 8);
+		len = (uint16_t)(buf[4] | buf[5] << 8);
+		rop = (uint16_t)(buf[6] | buf[7] << 8);
+		if (rop != op || (ev != MGMT_EV_CMD_COMPLETE && ev != MGMT_EV_CMD_STATUS))
+			continue;	/* another event */
+		if (ev == MGMT_EV_CMD_STATUS || buf[8] != 0 || (size_t)n < 6u + len || len < 3)
+			return -1;
+		len -= 3;
+		if (len > cap)
+			len = (uint16_t)cap;
+		memcpy(out, buf + 9, len);
+		return len;
+	}
+}
+
+static void mgmt_read(struct bt_mgmt *m)
+{
+	struct sa_hci sa = { .family = AF_BLUETOOTH, .dev = MGMT_INDEX_NONE, .channel = HCI_CHANNEL_CONTROL };
+	uint8_t d[512];
+	int fd, n, i, cnt;
+
+	memset(m, 0, sizeof(*m));
+	fd = socket(AF_BLUETOOTH, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, BTPROTO_HCI);
+	if (fd < 0)
+		return;
+	if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0 ||
+	    (n = mgmt_cmd(fd, MGMT_OP_READ_INDEX_LIST, MGMT_INDEX_NONE, d, sizeof(d))) < 2) {
+		close(fd);
+		return;
+	}
+	m->ok = 1;
+	cnt = d[0] | d[1] << 8;
+	for (i = 0; i < cnt && m->nadp < 8 && 2 + 2 * i + 1 < n; i++) {
+		int idx = d[2 + 2 * i] | d[3 + 2 * i] << 8;
+		uint8_t info[300], c[512];
+		int k, cn;
+
+		m->adp[m->nadp].index = idx;
+		if (mgmt_cmd(fd, MGMT_OP_READ_INFO, (uint16_t)idx, info, sizeof(info)) >= 20) {
+			addr_str(info, m->adp[m->nadp].addr);
+			/* current settings, bit 0: powered */
+			m->adp[m->nadp].powered = info[13] & 1;
+			snprintf(m->adp[m->nadp].name, sizeof(m->adp[m->nadp].name), "%.*s", 63, (const char *)info + 20);
+		}
+		if ((cn = mgmt_cmd(fd, MGMT_OP_GET_CONNECTIONS, (uint16_t)idx, c, sizeof(c))) >= 2)
+			for (k = 0; k < (c[0] | c[1] << 8) && 2 + 7 * k + 6 < cn && m->nconn < 32; k++)
+				addr_str(c + 2 + 7 * k, m->conn[m->nconn++]);
+		m->nadp++;
+	}
+	close(fd);
+}
+
+static int mgmt_connected(const struct bt_mgmt *m, const char *addr)
+{
+	int i;
+
+	for (i = 0; i < m->nconn; i++)
+		if (!strcasecmp(m->conn[i], addr))
+			return 1;
+	return 0;
+}
+
+/* every field known about one phone */
+static void dev_write(struct jw *w, const char *addr, const struct bt_dev *d, const char *adapter,
+		      const struct bt_mgmt *m)
+{
+	const char *vn = vendor_name(d->vendor_src, d->vendor);
+	char v[32];
+	int i;
+
+	jw_str(w, "name", d->name);
+	if (d->alias[0] && strcmp(d->alias, d->name))
+		jw_str(w, "alias", d->alias);
+	if (d->cls) {
+		snprintf(v, sizeof(v), "0x%06lx", d->cls);
+		jw_str(w, "class", v);
+		jw_opt(w, "kind", class_kind(d->cls));
+	}
+	jw_bool(w, "paired", d->paired);
+	jw_bool(w, "trusted", d->trusted);
+	if (d->blocked)
+		jw_bool(w, "blocked", true);
+	jw_opt(w, "key", key_kind(d->key_type, d->pin_len));
+	jw_opt(w, "services", d->services);
+	if (d->vendor >= 0) {
+		snprintf(v, sizeof(v), "%s0x%04lx", d->vendor_src == 2 ? "usb:" : "", d->vendor);
+		jw_str(w, "vendor_id", v);
+		jw_opt(w, "vendor", vn);
+		snprintf(v, sizeof(v), "0x%04lx/0x%04lx", d->product, d->version);
+		jw_str(w, "product_version", v);
+	}
+	if (d->sap < 0)
+		jw_null(w, "sap");
+	else
+		jw_bool(w, "sap", d->sap == 1);
+	if (d->sap_channel)
+		jw_int(w, "sap_channel", d->sap_channel);
+	jw_opt(w, "adapter", adapter);
+	if (m && m->ok) {
+		jw_bool(w, "connected", mgmt_connected(m, addr));
+		for (i = 0; i < m->nadp; i++)
+			if (!strcasecmp(m->adp[i].addr, adapter)) {
+				jw_opt(w, "adapter_name", m->adp[i].name);
+				jw_bool(w, "adapter_powered", m->adp[i].powered);
+			}
+	}
+}
+
+static void bt_info(struct rsim_backend *be, struct jw *w)
+{
+	struct bt_backend *b = (struct bt_backend *)be;
+	struct bt_dev d;
+	struct bt_mgmt m;
+	char adapter[32] = "";
+
+	if (!dev_lookup("", b->addr, &d, adapter, sizeof(adapter))) {
+		mgmt_read(&m);
+		dev_write(w, b->addr, &d, adapter, &m);
+	}
+	if (b->channel > 0)
+		jw_int(w, "channel", b->channel);
+	jw_int(w, "max_msg", b->max_msg);
+	jw_str(w, "apdu_format", b->apdu_param == SAP_P_COMMAND_APDU7816 ? "7816" : "gsm");
+	jw_str(w, "security", b->secure_high ? "high" : "medium");
+	jw_str(w, "sim", b->gone ? "link ended" : b->card > 0 ? "accessible" : "not accessible");
+}
+
+int bt_list(const char *sysroot, char *note, size_t note_cap, char *adapters, size_t acap)
 {
 	char base[PATH_MAX];
 	DIR *ad;
 	struct dirent *a;
-	int n = 0;
+	struct bt_mgmt m;
+	int n = 0, i;
+	size_t o = 0;
 
 	note[0] = '\0';
+	adapters[0] = '\0';
+	/* the adapters the kernel has, and whether they are on */
+	mgmt_read(&m);
+	for (i = 0; m.ok && i < m.nadp && o < acap; i++)
+		o += (size_t)snprintf(adapters + o, acap - o, "%shci%d %s%s%s %s", i ? ", " : "", m.adp[i].index,
+				      m.adp[i].addr, m.adp[i].name[0] ? " " : "", m.adp[i].name,
+				      m.adp[i].powered ? "on" : "off");
+	if (m.ok && !m.nadp)
+		snprintf(adapters, acap, "none");
+
 	snprintf(base, sizeof(base), "%s/var/lib/bluetooth", sysroot);
 	if (!(ad = opendir(base))) {
 		/* no BlueZ is no news; BlueZ that we may not read is */
 		if (errno == EACCES)
-			snprintf(note, note_cap, "bt: %s is not readable (root only) — paired phones not listed", base);
+			snprintf(note, note_cap, "bt: %s is not readable — run as root to list the paired phones", base);
 		return 0;
 	}
 	while ((a = readdir(ad))) {
@@ -795,14 +1218,17 @@ int bt_list(const char *sysroot, char *note, size_t note_cap)
 			continue;
 		}
 		while ((e = readdir(dd))) {
-			char info[PATH_MAX], spec[8 + sizeof(e->d_name)];
+			char p[PATH_MAX], spec[8 + sizeof(e->d_name)];
 			struct bt_dev d;
 			struct jw w;
 			int phone;
 
-			if (!is_addr(e->d_name) || snprintf(info, sizeof(info), "%s/%s/info", adir, e->d_name) >= (int)sizeof(info))
+			if (!is_addr(e->d_name) || snprintf(p, sizeof(p), "%s/%s/info", adir, e->d_name) >= (int)sizeof(p))
 				continue;
-			read_info(info, &d);
+			dev_init(&d);
+			read_info(p, &d);
+			if (snprintf(p, sizeof(p), "%s/cache/%s", adir, e->d_name) < (int)sizeof(p))
+				read_cache(p, &d);
 			/* major device class 2: phone (Assigned Numbers §2.8.2) */
 			phone = ((d.cls >> 8) & 0x1f) == 2;
 			if (!d.paired || !(phone || d.sap == 1))
@@ -812,13 +1238,8 @@ int bt_list(const char *sysroot, char *note, size_t note_cap)
 			jw_str(&w, "backend", "bt");
 			jw_str(&w, "spec", spec);
 			jw_str(&w, "device", e->d_name);
-			jw_str(&w, "name", d.name);
-			jw_str(&w, "adapter", a->d_name);
 			jw_bool(&w, "phone", phone);
-			if (d.sap < 0)
-				jw_null(&w, "sap");
-			else
-				jw_bool(&w, "sap", d.sap == 1);
+			dev_write(&w, e->d_name, &d, a->d_name, &m);
 			jw_end(&w);
 			n++;
 		}
