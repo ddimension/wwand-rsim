@@ -10,6 +10,16 @@ Status: in use on hardware — see [What works](#what-works) for the modems,
 readers, phones and sponsors it has run with, and the workarounds for them.
 Design notes: [docs/plan.md](docs/plan.md).
 
+> **Modem support: the client needs a Quectel modem.** The modem that runs
+> on the remote card has to offer Qualcomm's QMI UIM Remote, which is
+> switched on with a Quectel EFS item (`wwandctl rsim MODEM enable --reset`,
+> `AT+QNVFW`). HW-verified clients: Quectel RG650E-EU (QMI) and RM520N-GL
+> (MBIM, through the QMI passthrough). Other vendors — other Qualcomm
+> modems, Telit/u-blox SAP client modes, Osmocom SIMtrace2 card emulation —
+> are **tbd**, not implemented: [docs/modems.md](docs/modems.md). The card
+> *source* is not limited this way: a reader, a phone, or a Huawei, MeiG or
+> other modem that answers `AT+CSIM` can lend its card.
+
 ## Parts
 
 - `helper/` — `rsim-card`, the C helper that owns the reader and speaks one
@@ -21,6 +31,12 @@ Design notes: [docs/plan.md](docs/plan.md).
 - `luci/` — `luci-app-wwand-rsim`: the configuration page.
 
 ## Use
+
+Step-by-step setups with diagrams — a reader on the router, a reader on
+another machine over SSH, a phone over Bluetooth, an external AT modem, a
+SIM sponsor on the same router, a modem on another wwand router, and how to
+scan for sources: **[docs/howto.md](docs/howto.md)**. Which modems can be
+clients: [docs/modems.md](docs/modems.md).
 
 ```sh
 wwandctl rsim switch                 # is UIM Remote on in the modem firmware?
@@ -98,8 +114,10 @@ or `wwand:iccid:<ICCID>` to name the card rather than the modem it sits in.
 There the plugin runs `wwandctl rsim proxy <modem|iccid:ICCID>` instead of
 rsim-card: a relay that speaks rsim-card's protocol on stdin/stdout and
 hands each request to the rsim plugin in THAT router's daemon, which lends
-the card the way a SIM sponsor on one router does — over the SIM Access
-Profile (default) or APDU by APDU (`rsim_donor_mode apdu`, with
+the card the way a SIM sponsor on one router does — by default (`auto`)
+over the SIM Access Profile, or APDU by APDU over `AT+CSIM` where the lending
+modem has no QMI UIM (an NCM modem); forced APDU by APDU with
+`rsim_donor_mode apdu` (with
 `rsim_donor_slot`, `rsim_donor_apdu`, `rsim_donor_cond` as for a sponsor).
 Its radio is parked for as long as the card is lent, its interfaces are
 refused (`radio_held`), and its status page says to whom. The card goes
@@ -201,6 +219,45 @@ modem, and more:
 
 `wwandctl rsim MODEM take-back` / `lend-allow` do the same as the buttons;
 `wwandctl rsim` shows the lending too.
+
+The page on a MikroTik Chateau 5G, captured with wwand's
+`tools/luci-screenshot.py` (ICCID, IMSI, IMEI, EID and addresses masked).
+**Status**: the RG650E runs on the SIM of a Galaxy S20 FE, lent over
+Bluetooth SAP by a PC next to the phone; the Huawei E392 lends its own card
+APDU by APDU to another wwand router, its radio off:
+
+![Remote SIM — status](docs/images/luci-rsim-status.png)
+
+**Find SIM sources** on that PC (`root@…`, a restricted key): two paired
+phones that offer SIM Access, with what BlueZ knows about each — *Add*
+turns one into a SIM reader:
+
+![Remote SIM — scan of a PC with two phones](docs/images/luci-rsim-scan-phones.png)
+
+The same scan of this router: its modems' ports (those wwand drives, and a
+diagnostic port, are not offered) and the cards of its modems — one lent
+already, the other not the card its modem runs on:
+
+![Remote SIM — scan of this router](docs/images/luci-rsim-scan-local.png)
+
+...and of another wwand router, whose modem's card comes with the settings
+that router dials it with:
+
+![Remote SIM — scan of another wwand router](docs/images/luci-rsim-scan-router.png)
+
+**SSH setup**: the router's key and, per machine, the `authorized_keys`
+line restricted to `rsim-card --serve` and the readers named there:
+
+![Remote SIM — SSH setup](docs/images/luci-rsim-ssh.png)
+
+**SIM readers** and **Modems**: a Smartmouse USB on one machine, the two
+phones behind another, and which of them each modem uses:
+
+![Remote SIM — configuration](docs/images/luci-rsim-config.png)
+
+wwand's modem status page shows the remote SIM in the modem panel:
+
+![Modem status — remote SIM row](docs/images/luci-status-rsim-row.png)
 
 Removing `rsim_reader` gives the modem its own SIM back.
 
