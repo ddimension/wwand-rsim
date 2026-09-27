@@ -28,6 +28,7 @@
 #include <termios.h>
 #include <time.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "atmodem.h"
@@ -536,6 +537,19 @@ struct rsim_backend *atmodem_open(const struct at_cfg *cfg)
 		log_err("%s: %s", cfg->dev, strerror(errno));
 		free(a);
 		return NULL;
+	}
+	/* a modem port is a character device: anything else named here (a file,
+	 * through a key that allows `at:*`) would be read out and written over
+	 * with AT commands */
+	{
+		struct stat st;
+
+		if (fstat(a->fd, &st) || !S_ISCHR(st.st_mode)) {
+			log_err("%s: not a character device — not a modem port, not used", cfg->dev);
+			close(a->fd);
+			free(a);
+			return NULL;
+		}
 	}
 	/* One helper per port. Two would read each other's answers, and the
 	 * first to end would switch the radio back on under the other, which

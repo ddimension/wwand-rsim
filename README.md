@@ -140,9 +140,15 @@ command="rsim-card --serve 'bt:AA:BB:CC:DD:EE:FF' 'wwand:iccid:8949…'",no-pty,
 ```
 
 `rsim-card --serve` runs only wwand-rsim's own calls — rsim-card for the
-readers listed (fnmatch patterns; none: any), its `--list`, and on a wwand
-router `wwandctl rsim proxy` for `wwand:<modem>` / `wwand:iccid:<ICCID>`
-targets listed — split into words and exec'd, never through a shell. It is
+readers listed (fnmatch patterns, where `*` does not cross a `/`:
+`at:/dev/ttyUSB*`; none: any), its `--list` (with readers listed: their rows
+only — not the other cards of that machine, their ICCIDs and settings), and
+on a wwand router `wwandctl rsim proxy` for `wwand:<modem>` /
+`wwand:iccid:<ICCID>` targets listed — split into words and exec'd, never
+through a shell. Only rsim-card's own options pass. A reader that names a
+path (`at:`, `phoenix:`) has to be a character device under `/dev` — rsim-card
+itself refuses anything else, `--serve` or not: named a file, it would read
+it out and write AT commands over it. It is
 part of rsim-card, so it works on a PC with nothing but rsim-card as well as
 on a wwand router. `wwandctl rsim scan user@host` says what is wrong when a
 machine does not answer: no key yet, key not accepted (and the line to put
@@ -199,13 +205,21 @@ modem, and more:
 Removing `rsim_reader` gives the modem its own SIM back.
 
 **The lender's settings come along:** a card borrowed from another wwand
-router, or from a sponsor here, brings the settings its owner dials it with
-— that router's `wwand_sim` for the ICCID, or else the APN, PDP type and
-login of the modem's interface. They are kept here as the card's own
+router brings the settings its owner dials it with — that router's
+`wwand_sim` for the ICCID, or else the APN, PDP type and login of the
+modem's interface. (A sponsor on this router needs none of that: a
+`wwand_sim` for its card applies to both modems as it is.) They are kept here as the card's own
 `wwand_sim` (`wwsim_<ICCID>`, `option origin 'rsim'`), so the next dial with
 that card uses them, now and after a restart. A `wwand_sim` you wrote for
 the card is never touched; removing the `origin` line makes one of these
 yours.
+
+**A sponsor deregisters before its card goes:** its radio is parked
+*before* the card leaves it — before the SIM Access connect, before the
+first APDU, before an AT port's first command — so the modem detaches from
+the network while it still has the card, instead of dropping off it with
+the card; the target then attaches with that IMSI on a network that has
+let go of it. Generic: the same park for QMI, MBIM and AT/NCM.
 
 **While a card is lent, its modem's radio is off, the SIM left on** — on
 every path: QMI `LOW_POWER`, MBIM radio state off, `AT+CFUN=4` on an NCM

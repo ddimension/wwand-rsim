@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <termios.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "log.h"
@@ -212,6 +213,17 @@ struct phx_io *phx_tty_open(const char *dev)
 		log_err("%s: %s", dev, strerror(errno));
 		free(t);
 		return NULL;
+	}
+	/* a reader's port is a character device, never a file (see atmodem.c) */
+	{
+		struct stat st;
+
+		if (fstat(t->fd, &st) || !S_ISCHR(st.st_mode)) {
+			log_err("%s: not a character device — not a serial port, not used", dev);
+			close(t->fd);
+			free(t);
+			return NULL;
+		}
 	}
 	fl = fcntl(t->fd, F_GETFL);
 	if (fl >= 0)

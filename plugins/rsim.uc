@@ -1075,6 +1075,10 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 		if (sap)
 			deps.sim_changed?.(donor, 'card lent over SIM Access');
 
+		// parked before the connect (deregister_then): nothing more to do
+		if (parked)
+			return open_for_use();
+
 
 		if (!deps.modem_radio) {
 			if (sap)
@@ -1106,6 +1110,36 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 		});
 	};
 
+
+	// DEREGISTER FIRST. A card that goes over SIM Access leaves the sponsor
+	// at once — registered, it would drop off the network without a detach,
+	// and the target may attach with the same IMSI while the network still
+	// holds the sponsor's. So its radio goes off BEFORE the connect: low
+	// power / CFUN=4, which the modem carries out with a detach before it
+	// reports the new mode (the same park for every backend — QMI, MBIM,
+	// NCM/AT — through the daemon's modem_radio). APDU mode parks before
+	// the first command anyway (up()).
+	let deregister_then = (then) => {
+		if (parked || !deps.modem_radio)
+			return then();
+
+		deps.modem_radio(donor, false, (pe) => {
+			if (dead || !c) {
+				if (!pe)
+					deps.modem_radio(donor, true, () => null);
+				return;
+			}
+
+			if (pe) {
+				log('warn', sprintf('rsim: cannot park %s before lending its card (%J) — it loses its registration with the card instead', donor, pe));
+				return then();
+			}
+
+			parked = true;
+			log('notice', sprintf('rsim: %s deregistered (radio off) before its card goes over SIM Access', donor));
+			then();
+		});
+	};
 
 	// the SAP connect proper, once the client is registered for its news
 	let connect;
@@ -1145,8 +1179,14 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 				retried_busy = true;
 				log('notice', sprintf('rsim: %s is busy with its card — parking its radio, then asking again', donor));
 				return deps.modem_radio(donor, false, (pe) => {
-					if (dead || !c)
+					// ended while the park was on its way: the hand-back
+					// found nothing parked to wake, so this answer does it
+					// (else the sponsor stays off the network for good)
+					if (dead || !c) {
+						if (!pe)
+							deps.modem_radio(donor, true, () => null);
 						return;
+					}
 					if (pe)
 						return finish(sprintf('the donor %s refused the SIM Access link while busy, and its radio could not be parked (%J)', donor, pe));
 					parked = true;
@@ -1260,11 +1300,11 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 					return;
 
 				if (se || +(sd?.state ?? -1) != 2)
-					return connect();
+					return deregister_then(connect);
 
 				log('notice', sprintf('rsim: %s still has a SIM Access link from before — ending it first', donor));
 				c.request('SAP_CONNECTION', { conn: { op: 0, slot: slot }, mode: 0 }, () =>
-					(dead || !c) ? null : connect(), q_opts);
+					(dead || !c) ? null : deregister_then(connect), q_opts);
 			}, q_opts);
 		}, q_opts);
 	}));
@@ -1786,26 +1826,6 @@ function create(deps)
 		});
 	};
 
-	// The settings a donor dials its card with — its interface's — when the
-	// card has no wwand_sim here. Injectable for the tests.
-	let read_ifaces = deps.iface_sections ?? (() => {
-		let out = [];
-		let c = libuci.cursor();
-
-		c.load('network');
-		c.foreach('network', 'interface', (sec) => { if (sec.proto == 'wwand') push(out, sec); });
-
-		return out;
-	});
-	let donor_settings = (donor) => {
-		for (let sec in read_ifaces())
-			if (sec.modem == donor && sec.apn != null && sec.apn != '')
-				return { apn: sec.apn, pdp_type: sec.pdp_type, auth: sec.auth,
-				         username: sec.username, password: sec.password, source: 'interface' };
-
-		return null;
-	};
-
 	// A borrowed card's settings, as the lender dials it, become this
 	// router's wwand_sim for that ICCID (origin rsim): kept for good, so the
 	// next dial with that card — now or after a restart — uses them. One the
@@ -1919,9 +1939,11 @@ function create(deps)
 			s.reader_info = { backend: 'donor', reader: cfg.donor.ref, mode: cfg.donor.mode,
 			                  modem_manufacturer: inf.manufacturer, modem_model: inf.model,
 			                  modem_revision: inf.revision, iccid: inf.iccid };
-			// a wwand_sim of the card already applies here as it is; if the
-			// donor dials it with its interface's settings, those
-			keep_settings(ref, inf.iccid, donor_settings(cfg.donor.ref));
+			// Not for a sponsor on THIS router: its card's wwand_sim applies
+			// to both modems as it is, and a copy of the sponsor's interface
+			// settings would outrank that interface for the sponsor itself
+			// once it has its card back — a later edit of its APN silently
+			// overridden (found by audit, 2026-09-27).
 		}
 
 		s.rpc = cfg.donor ? donor_card(deps, cfg.donor.ref, cfg.donor, on_card_event, on_card_exit, log)

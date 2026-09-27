@@ -27,6 +27,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "serve.h"
@@ -130,18 +133,6 @@ static const char *base(const char *s)
 	return b ? b + 1 : s;
 }
 
-static int allowed(const char *spec, int nallow, char **allow)
-{
-	int i;
-
-	if (!nallow)
-		return 1;
-	for (i = 0; i < nallow; i++)
-		if (!fnmatch(allow[i], spec, 0))
-			return 1;
-	return 0;
-}
-
 /* rsim-card's options that take a value: the reader is the one word left */
 static int takes_value(const char *a)
 {
@@ -161,6 +152,123 @@ static int refuse(const char *why, const char *what)
 {
 	fprintf(stderr, "rsim-card --serve: %s%s%s — this key is for wwand-rsim only\n", why, what ? ": " : "", what ? what : "");
 	return 1;
+}
+
+static int allowed(const char *spec, int nallow, char **allow)
+{
+	int i;
+
+	if (!nallow)
+		return 1;
+	/* FNM_PATHNAME: a `*` does not cross a `/` — `at:/dev/ttyUSB*` must
+	 * not match `at:/dev/../etc/shadow` */
+	for (i = 0; i < nallow; i++)
+		if (!fnmatch(allow[i], spec, FNM_PATHNAME))
+			return 1;
+	return 0;
+}
+
+/* A reader that names a path (`at:`, `phoenix:`, a bare `/dev/…`) must be a
+ * character device under /dev, however it is spelled: the backends open it
+ * read-write and write AT commands to it — named a file, through a key that
+ * allows `at:*` or any reader, they would read it out over SSH and write
+ * over it. The backends check again (fstat) on their own. */
+static int device_ok(const char *spec)
+{
+	static const char *const pfx[] = { "at:", "phoenix:", "", NULL };
+	char real[PATH_MAX];
+	struct stat st;
+	int i;
+
+	for (i = 0; pfx[i]; i++) {
+		size_t l = strlen(pfx[i]);
+		const char *path;
+
+		if (strncmp(spec, pfx[i], l) || (!l && spec[0] != '/'))
+			continue;
+		path = spec + l;
+		if (!*path && l)
+			return 1;	/* `phoenix:` alone is not a path */
+		return !strncmp(path, "/dev/", 5) && !strstr(path, "/..") && realpath(path, real) &&
+		       !strncmp(real, "/dev/", 5) && !stat(real, &st) && S_ISCHR(st.st_mode);
+	}
+	return 1;
+}
+
+/* The options rsim-card has, as they may be spelled here: the ones without a
+ * value, and the ones with (`--clock 3579` or `--clock=3579`). Anything else
+ * — `--`, an abbreviation getopt_long would expand — is refused rather than
+ * guessed at. 1: a flag, 2: takes the next word, 0: not an option of ours */
+static int option_kind(const char *a)
+{
+	static const char *const flags[] = { "-v", "-s", "-vv", "-vs", "-sv", "--verbose", "--syslog", NULL };
+	int i;
+
+	for (i = 0; flags[i]; i++)
+		if (!strcmp(a, flags[i]))
+			return 1;
+	if (takes_value(a))
+		return 2;
+	if (!strncmp(a, "--", 2) && strchr(a, '=')) {
+		char name[64];
+		size_t l = (size_t)(strchr(a, '=') - a);
+
+		if (l < sizeof(name)) {
+			memcpy(name, a, l);
+			name[l] = '\0';
+			if (takes_value(name))
+				return 1;
+		}
+	}
+	return 0;
+}
+
+/* `--list` for a key restricted to some readers: only those rows — the rest
+ * of what that machine has (other readers, other cards with their ICCID,
+ * IMSI and APN) is none of this key's business */
+static int list_filtered(char **argv, int nallow, char **allow, const char *self)
+{
+	int pfd[2];
+	pid_t pid;
+	FILE *in;
+	char line[8192];
+	int st = 0;
+
+	if (pipe(pfd))
+		return refuse("pipe", strerror(errno));
+	if ((pid = fork()) < 0)
+		return refuse("fork", strerror(errno));
+	if (!pid) {
+		close(pfd[0]);
+		dup2(pfd[1], 1);
+		close(pfd[1]);
+		execv(self, argv);
+		_exit(127);
+	}
+	close(pfd[1]);
+	if (!(in = fdopen(pfd[0], "r")))
+		return refuse("fdopen", strerror(errno));
+	while (fgets(line, sizeof(line), in)) {
+		char spec[512];
+		const char *p = strstr(line, "\"spec\":\"");
+		size_t o = 0;
+
+		if (!p) {		/* the done line, notes */
+			fputs(line, stdout);
+			continue;
+		}
+		for (p += 8; *p && *p != '"' && o < sizeof(spec) - 1; p++) {
+			if (*p == '\\' && p[1])
+				p++;
+			spec[o++] = *p;
+		}
+		spec[o] = '\0';
+		if (*spec && allowed(spec, nallow, allow))
+			fputs(line, stdout);
+	}
+	fclose(in);
+	waitpid(pid, &st, 0);
+	return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
 }
 
 int serve_run(int nallow, char **allow)
@@ -187,10 +295,14 @@ int serve_run(int nallow, char **allow)
 				list = 1;
 			else if (!strcmp(argv[i], "--serve"))
 				return refuse("not again", "--serve");
-			else if (takes_value(argv[i]))
-				i++;
-			else if (argv[i][0] == '-')
-				continue;	/* -v, -s, --help: rsim-card checks them */
+			else if (argv[i][0] == '-') {
+				int k = option_kind(argv[i]);
+
+				if (!k)
+					return refuse("an option this does not pass on", argv[i]);
+				if (k == 2)
+					i++;
+			}
 			else if (!spec)
 				spec = argv[i];
 			else
@@ -200,6 +312,8 @@ int serve_run(int nallow, char **allow)
 			return refuse("no reader", cmd);
 		if (!list && !allowed(spec, nallow, allow))
 			return refuse("this reader is not served to this key", spec);
+		if (!list && !device_ok(spec))
+			return refuse("not a device under /dev", spec);
 		/* ourselves, whatever path the client named: not a program of its
 		 * choice */
 		argv[0] = "rsim-card";
@@ -207,6 +321,10 @@ int serve_run(int nallow, char **allow)
 			const char *self = test_hook("RSIM_TEST_SELF");
 
 			drop_test_env();
+			if (list && nallow) {
+				fflush(stdout);
+				return list_filtered(argv, nallow, allow, self ? self : "/proc/self/exe");
+			}
 			execv(self ? self : "/proc/self/exe", argv);
 		}
 		fprintf(stderr, "rsim-card --serve: exec: %s\n", strerror(errno));

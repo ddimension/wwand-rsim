@@ -78,6 +78,11 @@ struct sa_l2 {
  * bring-up together stays below the plugin's 60 s for the first power-up */
 #define CONNECT_TIMEOUT_MS	25000
 #define STATUS_TIMEOUT_MS	5000
+/* ...and that bound is kept as a whole, not per step: SDP, RFCOMM, a connect
+ * the phone's user has to allow and the size retries each have their own
+ * timeout, and added up they went well past it — the plugin then started a
+ * second helper while the first still waited at the phone's prompt */
+#define BRINGUP_MS		55000
 /* an eUICC works through a profile download in single commands that take
  * seconds each; below the plugin's 30 s for a TPDU */
 #define REQUEST_TIMEOUT_MS	25000
@@ -98,6 +103,7 @@ struct bt_backend {
 	bool served;		/* an ATR went out since the target last saw no card */
 	bool bounce;		/* reset by the phone behind the target's back */
 	bool gone;		/* the link ended */
+	long bringup_until;	/* the open as a whole ends by then (BRINGUP_MS) */
 	uint8_t rbuf[4096];
 	size_t rlen;
 	uint8_t msg[4096];	/* the message being looked at, sap_msg points here */
@@ -656,8 +662,15 @@ static int sap_connect(struct bt_backend *b)
 		struct sap_msg m;
 		int st;
 
+		long left = b->bringup_until - now_ms();
+
+		if (left < 1000) {
+			log_err("bt: %s: no SIM access within %d s — given up for now", b->addr, BRINGUP_MS / 1000);
+			return -1;
+		}
 		b->be.detail[0] = '\0';
-		if (request(b, SAP_CONNECT_REQ, &p, 1, SAP_CONNECT_RESP, CONNECT_TIMEOUT_MS, &m)) {
+		if (request(b, SAP_CONNECT_REQ, &p, 1, SAP_CONNECT_RESP,
+			    left < CONNECT_TIMEOUT_MS ? (int)left : CONNECT_TIMEOUT_MS, &m)) {
 			log_err("bt: %s: SIM access not granted (%s)", b->addr, b->be.detail);
 			return -1;
 		}
@@ -702,6 +715,8 @@ static int sap_connect(struct bt_backend *b)
 	/* the server's STATUS_IND says the card is ready; without it (a call
 	 * still going on) the card is reported absent until it comes */
 	deadline = now_ms() + STATUS_TIMEOUT_MS;
+	if (deadline > b->bringup_until + STATUS_TIMEOUT_MS)
+		deadline = b->bringup_until + STATUS_TIMEOUT_MS;
 	while (!b->gone && b->card < 0) {
 		struct sap_msg m;
 		int r = read_msg(b, deadline, &m);
@@ -731,6 +746,7 @@ struct rsim_backend *bt_open(const struct bt_cfg *cfg)
 	if (!(b = calloc(1, sizeof(*b))))
 		return NULL;
 	snprintf(b->addr, sizeof(b->addr), "%s", cfg->addr);
+	b->bringup_until = now_ms() + BRINGUP_MS;
 	b->apdu_param = cfg->apdu7816 ? SAP_P_COMMAND_APDU7816 : SAP_P_COMMAND_APDU;
 	b->card = -1;
 	b->be.ops = &BT_OPS;

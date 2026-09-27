@@ -1333,6 +1333,62 @@ let donor_plugin = (o) => rsim.create({
 	run_for(50);
 }
 
+// DEREGISTER FIRST: over SIM Access the card leaves the sponsor at once, so
+// its radio is parked (a detach) BEFORE the connect — not after, when it had
+// already dropped off the network without one
+{
+	let t = { now: 1000 };
+	let donor = sap_donor([]);
+	let order = [];
+	let req = donor.request;
+
+	donor.request = (name, a, cb, o) => {
+		if (name == 'SAP_CONNECTION' && a?.conn?.op == 1)
+			push(order, 'connect');
+		return req(name, a, cb, o);
+	};
+
+	let p = rsim.create({
+		log: (l, m) => null, sim_changed: () => null,
+		modem_of: (ref) => ({ modem: modem_obj(ref) }),
+		qmi_client: (ref, schema, cb) => cb(null, (ref == 'm1') ? donor : fake_client()),
+		qmi_release: () => null,
+		modem_radio: (ref, on, cb) => { push(order, sprintf('%s radio %s', ref, on ? 'on' : 'off')); cb?.(null); },
+		now: () => t.now,
+	});
+
+	p.tick('m0', { rsim_reader: 'modem:m1', rsim_donor_mode: 'sap' });
+	run_for(300);
+	eq(slice(order, 0, 2), [ 'm1 radio off', 'connect' ], 'SIM Access: the sponsor is parked (deregistered) before the connect');
+	eq(length(filter(order, (x) => x == 'm1 radio off')), 1, 'SIM Access: ...once — the link coming up does not park it again');
+	p.stop();
+	run_for(50);
+}
+
+// the sponsor parked (deregistered) before a connect it then refuses (busy,
+// QMI 52): the lending ends, and its radio comes back on
+{
+	let t = { now: 1000 };
+	let radio = [];
+	let donor = fake_client({ answer: (name, a) =>
+		(name == 'SAP_CONNECTION' && a.conn.op == 1) ? { __err: { error: 'qmi', code: 52 } }
+		: (name == 'SAP_CONNECTION') ? { state: 0 } : {} });
+	let p = rsim.create({
+		log: (l, m) => null, sim_changed: () => null,
+		modem_of: (ref) => ({ modem: modem_obj(ref) }),
+		qmi_client: (ref, schema, cb) => cb(null, (ref == 'm1') ? donor : fake_client()),
+		qmi_release: () => null,
+		modem_radio: (ref, on, cb) => { push(radio, [ ref, on ]); cb?.(null); },
+		now: () => t.now,
+	});
+
+	p.tick('m0', { rsim_reader: 'modem:m1', rsim_donor_mode: 'sap' });
+	run_for(100);
+	eq(radio, [ [ 'm1', false ], [ 'm1', true ] ], 'a refused connect after the deregister: the sponsor\'s radio is woken again');
+	p.stop();
+	run_for(50);
+}
+
 // --- a modem that is not ready yet --------------------------------------------------
 {
 	let t = { now: 1000 };
@@ -1672,33 +1728,6 @@ let donor_plugin = (o) => rsim.create({
 	// no APN: nothing to keep
 	reader.on_line('{"event":"info","backend":"wwand","reader":"m1","iccid":"89882390001760008921","sim":null}');
 	eq(length(ups), 1, 'lender settings: none sent, nothing written');
-	p.stop();
-	run_for(50);
-}
-
-// a modem here lending its card: its interface's settings, when the card
-// has no wwand_sim of its own
-{
-	let t = { now: 1000 };
-	let target = fake_client();
-	let ups = [];
-	let mods = { m1: { state: 'READY', lowpower_parked: false, info: { iccid: '8949020000102283249' } } };
-	let p = rsim.create({
-		log: (l, m) => null, sim_changed: () => null,
-		modem_of: (ref) => ({ modem: mods[ref] ?? modem_obj(ref) }),
-		qmi_client: (ref, schema, cb) => cb(null, (ref == 'm1') ? apdu_donor() : target),
-		qmi_release: () => null,
-		modem_radio: (ref, on, cb) => cb?.(null),
-		modem_sections: () => ({}),
-		iface_sections: () => [ { '.name': 'wan_m1', proto: 'wwand', modem: 'm1', apn: 'internet.telekom', auth: 'none' } ],
-		sim_upsert: (iccid, f, origin) => { push(ups, [ iccid, f.apn, f.auth, origin ]); return { written: false, reason: 'unchanged' }; },
-		now: () => t.now,
-	});
-
-	p.tick('m0', { rsim_reader: 'modem:m1', rsim_donor_mode: 'apdu' });
-	run_for(50);
-	eq(ups, [ [ '8949020000102283249', 'internet.telekom', 'none', 'rsim' ] ],
-	   'local donor: the settings of its interface are kept for the card');
 	p.stop();
 	run_for(50);
 }

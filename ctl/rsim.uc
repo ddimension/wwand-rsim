@@ -216,8 +216,11 @@ function authorized_line(pub, specs, helper)
 {
 	// a spec is taken as an fnmatch pattern there: a reader name's own
 	// * ? [ ] (PC/SC names carry "[CCID Interface]") must stay literal
-	let lit = (x) => join('', map(split(replace(x, /'/g, ''), ''),
-		(ch) => (index('*?[]\\', ch) >= 0) ? '\\' + ch : ch));
+	// — and a quote, which neither the '…' word nor the command="…" can
+	// carry, becomes `?`: it still matches that one character, where
+	// dropping it made a line that never matches its own reader
+	let lit = (x) => join('', map(split(x, ''),
+		(ch) => (index('*?[]\\', ch) >= 0) ? '\\' + ch : (ch == "'" || ch == '"') ? '?' : ch));
 	// rsim-card outside that user's PATH: the reader's `helper` path
 	let bin = length(helper ?? '') ? "'" + replace(helper, /'/g, '') + "'" : 'rsim-card';
 	let cmd = join(' ', [ bin, '--serve', ...map(specs ?? [], (x) => "'" + lit(x) + "'") ]);
@@ -551,16 +554,15 @@ function test_source(ctx, args, sys)
 		return r.ok ? 0 : 1;
 	};
 	let run = sys?.run ?? ((cmd, input) => {
-		// the requests as a file: rsim-card reads them, then its end of input
-		let path = sprintf('/tmp/wwandctl-rsim-test.%d', +(fs.readlink('/proc/self') ?? 0));
-
-		fs.writefile(path, input);
-
-		let p = fs.popen(sprintf("%s <'%s' 2>&1", cmd, path), 'r');
+		// the requests through a pipe, each line quoted: rsim-card reads
+		// them, then its end of input. (A file in /tmp at a name anyone can
+		// predict was a symlink away from being written through.)
+		let lines = filter(split(input ?? '', '\n'), (l) => length(l));
+		let feed = length(lines) ? sprintf("printf '%%s\\n' %s", join(' ', map(lines, rsim.shq))) : ':';
+		let p = fs.popen(sprintf('%s | %s 2>&1', feed, cmd), 'r');
 		let o = p ? p.read('all') : null;
 
 		p?.close();
-		fs.unlink(path);
 		return o;
 	});
 

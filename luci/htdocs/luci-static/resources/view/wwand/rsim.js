@@ -114,7 +114,7 @@ function authorizedLine(key, specs, helper) {
 	/* rsim-card outside that user's PATH: the reader's helper path */
 	var bin = helper ? "'" + helper.replace(/'/g, '') + "'" : 'rsim-card';
 	var cmd = [ bin, '--serve' ].concat(specs.map(function(x) {
-		return "'" + x.replace(/'/g, '').replace(/([*?\[\]\\])/g, '\\$1') + "'";
+		return "'" + x.replace(/([*?\[\]\\])/g, '\\$1').replace(/['"]/g, '?') + "'";
 	})).join(' ');
 
 	return 'command="%s",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding %s'.format(cmd.replace(/"/g, ''), key.trim());
@@ -178,7 +178,7 @@ function describe(x) {
 		out = out.concat(metaLines([ [ _('Index'), x.index != null ? String(x.index) : null ], [ 'ATR', x.atr ] ]));
 		break;
 	case 'wbsm':
-		out.push(E('div', {}, _('serial %s').format(x.serial || '?')));
+		out.push(E('div', {}, [ _('serial %s').format(x.serial || '?') ]));
 		if (x.access === false)
 			out.push(level('warn', _('no permission to open it (USB device access)')));
 		out = out.concat(usbLines(x), metaLines([ [ _('Kernel driver'), x.kernel_driver ? _('%s (detached while in use)').format(x.kernel_driver) : null ] ]));
@@ -222,7 +222,7 @@ function describe(x) {
 		if (x.eid)
 			out.push(E('div', { 'style': 'opacity:.75;font-size:92%' }, [ 'eUICC ' + x.eid ]));
 		if (x.profile)
-			out.push(E('div', {}, _('eSIM profile %s').format(x.profile)));
+			out.push(E('div', {}, [ _('eSIM profile %s').format(x.profile) ]));
 		if (x.config)
 			out.push(E('div', { 'style': 'opacity:.75;font-size:92%' }, [
 				_('settings %s').format(x.config.name || '?'),
@@ -377,7 +377,7 @@ return view.extend({
 		modems.forEach(function(n) { o.value(n, n); });
 
 		o = s.option(form.ListValue, 'donor_mode', _('How it lends'),
-			_('<strong>SIM Access</strong>: the sponsor hands its card over and stops using it — its own connection goes down, and it gets the card back when the lending ends. Quectel modules need it switched on once: <code>wwandctl rsim SPONSOR sap-enable --reset</code>.<br /><strong>APDU</strong>: the card stays in the sponsor and every command is passed through it. For modems that cannot do SIM Access.<br /><strong>Automatic</strong> (default): SIM Access where the sponsor has it; APDU where it has not — over <code>AT+CSIM</code> on a sponsor without QMI UIM (an NCM modem), and for one whose SIM Access is known to hang (Huawei E392) or did not answer once.<br />Either way the sponsor\'s <strong>radio stays off</strong> for as long as it is configured as a sponsor: two modems must never register with the same card. Its interfaces do not come up meanwhile — an attempt is refused with the reason (<em>Radio off: the SIM card is lent to another modem</em>). Remove the sponsor here and its radio comes back.<br />A modem of <strong>another wwand router</strong> is held only while its card is actually lent: when this router lets go (or loses the SSH link), that router gets its card and its radio back.'));
+			_('<strong>SIM Access</strong>: the sponsor hands its card over and stops using it — its own connection goes down, and it gets the card back when the lending ends. On Quectel modules wwand-rsim switches it on by itself in the modem\'s init (one modem reset; <code>option rsim_sap_auto \'0\'</code> on the modem leaves it off).<br /><strong>APDU</strong>: the card stays in the sponsor and every command is passed through it. For modems that cannot do SIM Access.<br /><strong>Automatic</strong> (default): SIM Access where the sponsor has it; APDU where it has not — over <code>AT+CSIM</code> on a sponsor without QMI UIM (an NCM modem), and for one whose SIM Access is known to hang (Huawei E392) or did not answer once.<br />Either way the sponsor\'s <strong>radio stays off</strong> for as long as it is configured as a sponsor: two modems must never register with the same card. Its interfaces do not come up meanwhile — an attempt is refused with the reason (<em>Radio off: the SIM card is lent to another modem</em>). Remove the sponsor here and its radio comes back.<br />A modem of <strong>another wwand router</strong> is held only while its card is actually lent: when this router lets go (or loses the SSH link), that router gets its card and its radio back.'));
 		o.depends('type', 'modem');
 		o.depends('type', 'wwand');
 		o.value('', _('automatic (default)'));
@@ -565,7 +565,7 @@ return view.extend({
 				if (st.atr)
 					remote.push(E('div', { 'style': 'font-family:monospace;word-break:break-all' }, [ 'ATR ' + st.atr ]));
 				if (st.apdus)
-					remote.push(E('div', {}, _('%d commands · last SW %s').format(st.apdus, st.last_sw || '?')));
+					remote.push(E('div', {}, [ _('%d commands · last SW %s').format(st.apdus, st.last_sw || '?') ]));
 				if (st.last_error)
 					remote.push(level('error', (st.retry_at && st.now && st.retry_at > st.now)
 						? _('%s (retry in %d s)').format(st.last_error, st.retry_at - st.now) : st.last_error));
@@ -647,7 +647,7 @@ return view.extend({
 					return E('tr', { 'class': 'tr' }, [ E('td', { 'class': 'td' }, [ l[0] ]),
 						E('td', { 'class': 'td', 'style': 'word-break:break-all' }, [ l[1] ]) ]);
 				})),
-				E('div', { 'style': 'opacity:.75;font-size:92%' }, _('Lending needs SIM Access in the firmware (Quectel: <code>wwandctl rsim MODEM sap-enable --reset</code>), or the APDU mode. <code>wwandctl rsim MODEM donor-test</code> tries it once.')),
+				E('div', { 'style': 'opacity:.75;font-size:92%' }, _('Lending needs SIM Access in the firmware (Quectel: switched on by wwand-rsim in the modem\'s init), or the APDU mode. <code>wwandctl rsim MODEM donor-test</code> tries it once.')),
 				E('div', { 'class': 'right' }, E('button', { 'class': 'btn', 'click': ui.hideModal }, _('Close'))),
 			]);
 		});
@@ -663,7 +663,7 @@ return view.extend({
 			return Promise.resolve();
 		}
 
-		dom.content(this.scanBox, E('p', { 'class': 'spinning' }, host ? _('Asking %s…').format(host) : _('Looking…')));
+		dom.content(this.scanBox, E('p', { 'class': 'spinning' }, [ host ? _('Asking %s…').format(host) : _('Looking…') ]));
 
 		return fs.exec('/usr/bin/wwandctl', host ? [ 'rsim', 'scan', host, '--json' ] : [ 'rsim', 'scan', '--json' ])
 			.then(function(res) {
@@ -734,7 +734,7 @@ return view.extend({
 			out.push(E('div', { 'class': 'alert-message warning' }, [ E('strong', {}, _('Hint: ')), hint ]));
 		if (host && this.key && hint && /authorized_keys|restricted|key/.test(hint))
 			out.push(E('div', {}, [
-				E('p', {}, _('The line for %s (from the readers configured for it):').format(host)),
+				E('p', {}, [ _('The line for %s (from the readers configured for it):').format(host) ]),
 				E('code', { 'style': 'word-break:break-all;display:block' }, [ authorizedLine(this.key, sshHosts()[host] || [], sshHelper(host)) ]),
 			]));
 
@@ -842,7 +842,7 @@ return view.extend({
 			out.push(E('div', { 'class': 'cbi-value' }, [
 				E('label', { 'class': 'cbi-value-title' }, [ h ]),
 				E('div', { 'class': 'cbi-value-field' }, [
-					E('div', {}, _('serves: %s').format(hosts[h].join(', '))),
+					E('div', {}, [ _('serves: %s').format(hosts[h].join(', ')) ]),
 					E('code', { 'style': 'word-break:break-all;display:block;margin:.3em 0' }, [ authorizedLine(view.key, hosts[h], sshHelper(h)) ]),
 					E('button', { 'class': 'btn cbi-button cbi-button-action', 'click': ui.createHandlerFn(view, function() {
 						dom.content(res, E('p', { 'class': 'spinning' }, _('Connecting…')));

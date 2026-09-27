@@ -430,6 +430,8 @@ function fake_ctx(start)
 	   'ssh: a reader name\'s [ ] * stay literal (fnmatch there)');
 	ok(index(ctl.authorized_line('k', [ 'wbsm:' ], '/home/u/.local/bin/rsim-card'), 'command="\'/home/u/.local/bin/rsim-card\' --serve \'wbsm:\'"') == 0,
 	   'ssh: rsim-card outside the PATH: the reader\'s helper path in command=');
+	ok(index(ctl.authorized_line('k', [ "pcsc:O'Reilly \"R\" 00" ]), "'pcsc:O?Reilly ?R? 00'") > 0,
+	   'ssh: a quote in a reader name becomes ? (still matches it), not dropped (a line that never matched)');
 	ok(index(ctl.ssh_diagnose([ 'root@pc.lan: Permission denied (publickey).' ], 'root@pc.lan', true), 'authorized_keys') >= 0,
 	   'ssh: a key not accepted — where it goes');
 	ok(index(ctl.ssh_diagnose([], 'root@pc.lan', false), 'ssh-key root@pc.lan') >= 0, 'ssh: no key yet — how to make one');
