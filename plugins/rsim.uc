@@ -1660,7 +1660,7 @@ function create(deps)
 	};
 
 	// null, or why this modem's card cannot be lent to another router now
-	let lend_refusal = (ref) => {
+	let lend_refusal = (ref, ext) => {
 		let s = sessions[ref];
 
 		if (lend_hold[ref])
@@ -1668,6 +1668,16 @@ function create(deps)
 
 		if (s && s.state != 'failed')
 			return 'this modem uses a remote card itself';
+
+		// Assigned one and not (yet) connected to it — failed, retrying, or
+		// its reader misconfigured — is not "free to lend": the card in its
+		// slot is not what it is meant to run on, the hold keeps its radio
+		// off for that remote card, and a lend would park it for another
+		// router's sake and be torn down the moment the remote card comes.
+		let r = ext?.rsim ?? ext?.rsim_reader;
+
+		if (type(r) == 'string' && length(r))
+			return 'this modem is configured for a remote card itself';
 
 		for (let other, os in sessions)
 			if (os.state != 'failed' && os.cfg.donor?.ref == ref)
@@ -2563,7 +2573,7 @@ function create(deps)
 			// ---- lending to another router: `wwandctl rsim proxy` ----------
 			// Read-only: null, or why this modem's card cannot be lent now.
 			lend_check: (ref, ext, args, cb) => {
-				let why = lend_refusal(ref);
+				let why = lend_refusal(ref, ext);
 
 				// how it can lend: APDU always; SIM Access when its UIM
 				// has the service (the QMI probe, once per modem object;
@@ -2575,7 +2585,7 @@ function create(deps)
 			// cond, client, pid }. Answers at once with the id; the first
 			// request waits until the card is ready (as with a helper).
 			lend_open: (ref, ext, args, cb) => {
-				let why = lend_refusal(ref);
+				let why = lend_refusal(ref, ext);
 
 				if (why)
 					return cb({ error: 'busy', detail: why });
@@ -2813,7 +2823,7 @@ function create(deps)
 				if (lent)
 					to = { to: lent.client, mode: lend_mode(lent.card, lent.mode), remote: true, commands: lent.commands, since: lent.since };
 
-				let refused = lend_refusal(ref);
+				let refused = lend_refusal(ref, ext);
 
 				cb(null, {
 					lent_to: to,

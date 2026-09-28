@@ -2031,6 +2031,25 @@ let donor_plugin = (o) => { let targets = {}; return rsim.create({
 	eq(radio, [ [ 'm8', false ] ], 'own park: registered on the remote card — not parked');
 }
 
+// --- a modem assigned a remote SIM is not "free to lend" while it waits for it ----
+{
+	let t = { now: 1000 };
+	let p = donor_plugin({ t: t, target: fake_client(), donor: sap_donor([]) });
+	let res = null;
+	let ext = { rsim_reader: 'phoenix:/dev/ttyUSB0' };
+
+	p.ops.lend_check('m1', ext, {}, (e, r) => { res = r; });
+	eq([ res?.lendable, res?.why ], [ false, 'this modem is configured for a remote card itself' ],
+	   'lend: a modem with a remote SIM assigned, no session (failed, not started) — not lendable');
+	p.ops.lend_open('m1', { rsim: 'sm' }, { mode: 'sap', client: 'x', pid: 1 }, (e, r) => { res = e; });
+	eq(res?.error, 'busy', 'lend: ...nor opened, a named reader as well');
+	p.ops.status('m1', ext, {}, (e, r) => { res = r; });
+	eq([ res?.lendable, res?.lend_why ], [ false, 'this modem is configured for a remote card itself' ],
+	   'lend: ...and its status says so');
+	p.ops.lend_check('m1', {}, {}, (e, r) => { res = r; });
+	eq(res?.lendable, true, 'lend: without one, lendable');
+}
+
 // --- two modems at one SIM bank: each needs its own client -----------------------
 // rsim-card announces client 0:0 unless told; two readers of one bank left at
 // that default are two names for ONE client at the server

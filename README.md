@@ -139,7 +139,8 @@ Its radio is parked for as long as the card is lent, its interfaces are
 refused (`radio_held`), and its status page says to whom. The card goes
 home when the proxy ends: at the end of stdin (a dropped SSH link
 included), or — killed hard — when the daemon there sees its process gone
-(within 10 s). A modem there that uses a remote card itself, lends its card
+(within 10 s). A modem there that is configured for a remote card itself
+(connected to it or not), lends its card
 to a modem there, or is configured as a sponsor there is not lent. This
 needs **wwand-rsim-provider** on that router (the proxy; it pulls in
 wwand-rsim) — without it, `wwandctl rsim scan` from here says so and lists

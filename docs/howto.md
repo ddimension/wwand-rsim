@@ -642,7 +642,8 @@ LuCI on B shows the lending in the status with *Take back* / *Allow lending*.
 - The card goes home when the proxy ends — at the end of its input (a dropped
   SSH link included) or, killed hard, when B's daemon sees its process gone
   (within 10 s).
-- Not lent: a modem on B that runs on a remote card itself, that lends its
+- Not lent: a modem on B that is configured for a remote card itself
+  (whether it is connected to it right now or not), that lends its
   card to a modem on B, or that is configured as a sponsor on B. Only the
   card the modem runs on can be lent.
 - HW-tested: Quectel RG502Q (SIM Access) and MeiG SLM770A-R on NCM (APDU over
