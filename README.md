@@ -77,9 +77,10 @@ to note it (after about 12 s). `off` also removes a spelled-out `rsim_reader`. `
 (`ok`, `state`, `iccid`, `error`), for scripts such as a lab test driver.
 
 Options on the `wwand_modem` section: `rsim_reader` (`phoenix:<tty>` or
-`pcsc:<reader name or index>`), `rsim_slot` (1), and for Phoenix readers
-`rsim_clock` (kHz, 3579), `rsim_reset` (`auto|rts|rts_inv|dtr|dtr_inv`),
-`rsim_detect` (`none|cts|dsr|cd`).
+`pcsc:<reader name or index>`), `rsim_slot` (1), `rsim_fallback`
+(`off|local`, what it runs on while the remote SIM is not connected — see
+below), and for Phoenix readers `rsim_clock` (kHz, 3579), `rsim_reset`
+(`auto|rts|rts_inv|dtr|dtr_inv`), `rsim_detect` (`none|cts|dsr|cd`).
 
 Readers: `phoenix:<tty>` (a Phoenix/Smartmouse serial reader with switches),
 `wbsm:[USB serial]` (WB Electronics Smartmouse USB: clock and mode set by
@@ -343,8 +344,37 @@ daemon's first moment until the modem has taken the remote card, its radio
 is held off — wwand refuses its interfaces (`radio_held`) and parks any
 registration of it — and it goes online once the modem has connected to
 the remote card. The same when the remote SIM fails, its reader is
-misconfigured, or the modem lets go of it: the modem stays off rather than
-falling back to the card in its own slot. The status page says why.
+misconfigured, the modem lets go of it, or the modem is connected but the
+card cannot be powered (no ATR): the modem stays off rather than falling
+back to the card in its own slot. (A card the modem powers down and up
+again itself is not a reason: that is normal use.) The status page says
+why. The hold from the daemon's very first moment needs wwand with the
+init hold (commit `106132a`, *radio hold at init*); an older wwand brings
+the modem up on its own card first and parks it once the plugin runs.
+
+Whenever the remote card goes away while the modem runs on it — the reader
+fails, another reader is configured, `wwandctl rsim restart`, the daemon
+stops — its radio is switched off **before** the modem is told, so it
+leaves the network with that card instead of dropping off it. At the
+daemon's exit it stays off until the next start. Removing the remote SIM
+from the configuration is the exception: the modem is meant to have its own
+card back then.
+
+**`option rsim_fallback`** on the `wwand_modem` section decides what the
+modem runs on while its remote SIM is not connected:
+
+| Value | While the remote SIM is not connected |
+|---|---|
+| `off` (default) | nothing — the radio is held off as above |
+| `local` | the modem's own SIM; it switches to the remote card once that connects, and when that goes its radio is parked first, then it comes back on its own card |
+
+`local` is for a remote SIM reached **over this modem's own connection** —
+a SIM bank (`rspro:`), a reader or another router over SSH (`ssh:`,
+`wwand:`) — on a router with no other way out: with the radio held off the
+modem could never reach its remote SIM, and the router would be cut off
+for good. Any other value is taken as `off` and warned about in the log.
+`wwandctl rsim` and the status page show the mode in effect. LuCI: *Modems
+→ When the remote SIM is not connected*.
 
 ## What works
 

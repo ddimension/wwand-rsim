@@ -47,7 +47,10 @@ Slots: 1, 2 (3 on newer IDL).
 4. Modem: `CARD_POWER_DOWN_IND` / `CARD_POWER_UP_IND` / `CARD_RESET_IND` →
    the same on the card; after power-up and reset, `EVENT(card reset, ATR)`.
 5. Client leaving: `EVENT(card removed)`, `EVENT(connection unavailable)`.
-   The modem goes back to its local card.
+   The modem goes back to its local card — which wwand-rsim lets it USE
+   only with `rsim_fallback local`: otherwise its radio is parked before
+   the events (the configuration still assigning a remote SIM) and stays
+   off until the remote card is connected again.
 
 The commands are **T=0 TPDUs** (CLA INS P1 P2 P3 [data]); the modem does GET
 RESPONSE itself, the client passes `61xx`/`6Cxx` back unchanged.
@@ -85,8 +88,10 @@ reader ── rsim-card (C) ── stdio lines ── plugin rsim.uc ── QMI 
   a QMI client of a schema the plugin brings (wwand's own schema format), on
   the modem's QMI channel. `cb(err, client)`; errors `no_modem`,
   `service_unavailable` (not in the modem's GET_VERSION_INFO list),
-  `unsupported` (not a QMI-controlled modem — the MBIM passthrough follows
-  later), or the ALLOCATE_CID failure. The modem owns the client: it is
+  `unsupported` (a modem with no QMI at all: NCM, or MBIM without the
+  QMI-over-MBIM passthrough), or the ALLOCATE_CID failure. An MBIM modem
+  with the passthrough gets its client over it — HW-verified as a client on
+  the Quectel RM520N-GL (GL-X3000, 2026-09-26/27; README *What works*). The modem owns the client: it is
   released (RELEASE_CID) on teardown like its own, and `client.destroyed`
   tells the plugin it has to allocate again. It knows nothing about UIM
   Remote.
@@ -281,7 +286,11 @@ helper lines.
   backoff; card back → `EVENT(card inserted, ATR)`.
 - **Leaving:** `rsim_reader` removed, plugin stop, modem stop:
   `EVENT(card removed)` + `EVENT(connection unavailable)` so the modem returns
-  to its own card; client released.
+  to its own card; client released. Where the configuration still assigns a
+  remote SIM (a failure, a restart, another reader, the daemon's exit) and
+  the modem runs on the remote card, its radio is parked FIRST, so it
+  deregisters with the card that leaves; it stays off unless
+  `rsim_fallback local` (README).
 - **Interplay with wwand:** the modem sees an ordinary SIM in that slot, so
   PIN (per-ICCID `wwand_sim`), APN resolution and registration work unchanged.
   The daemon's SIM hot-reset and slot switch act on the modem; the plugin
@@ -338,7 +347,8 @@ are for Bluetooth SAP, a different service. Quectel only (`AT+QNVFR`/
 - Plugin: sequence tests, and that leaving always sends card removed +
   connection unavailable (the modem must never be left without a card).
 - Hardware: registration and data on the remote SIM; unplug the reader and
-  check the modem returns to its local card.
+  check the modem is parked (or, with `rsim_fallback local`, returns to its
+  local card).
 
 ## 9. Open points
 

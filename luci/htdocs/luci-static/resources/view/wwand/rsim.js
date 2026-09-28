@@ -540,6 +540,19 @@ return view.extend({
 			return form.ListValue.prototype.load.apply(this, [ sid ]);
 		};
 
+		/* shown like the slot: only with a reader chosen */
+		o = s.option(form.ListValue, 'rsim_fallback', _('When the remote SIM is not connected'),
+			_('<strong>Keep the radio off</strong>: the modem runs on the remote SIM or not at all — it never registers or dials with the card in its own slot, also while the remote SIM starts, fails or is retried. <strong>Use the modem\'s own SIM</strong>: it runs on its own card meanwhile and switches to the remote one once that is connected (its radio is switched off for a moment when the remote SIM goes, so it leaves the network with that card before it comes back on its own). Needed when the remote SIM is reached <em>over this modem\'s own connection</em> — a SIM bank, or a reader or another router over SSH, with this modem as the only way out: with the radio kept off the modem could never reach its remote SIM, and the router stays cut off.'));
+		o.value('', _('Keep the radio off (default)'));
+		o.value('local', _('Use the modem\'s own SIM'));
+		o.optional = true;
+		o.load = function(sid) {
+			var names = uci.sections('network', 'wwand_simreader').map(function(r) { return r['.name']; });
+
+			this.deps = names.length ? names.map(function(n) { return { 'rsim': n }; }) : [ { 'rsim': '\u0000' } ];
+			return form.ListValue.prototype.load.apply(this, [ sid ]);
+		};
+
 		var view = this;
 
 		return m.render().then(function(node) {
@@ -637,9 +650,13 @@ return view.extend({
 			/* the remote SIM this modem uses */
 			var remote;
 
+			/* with rsim_fallback local nothing is held: it runs on its own SIM */
+			var own = (st.fallback == 'local')
+				? E('div', { 'style': 'opacity:.75;font-size:92%' }, _('on its own SIM until the remote one is connected (fallback)')) : null;
+
 			if (st.config_error)
 				remote = [ level('error', st.config_error),
-				           level('warn', _('radio off — the modem does not use its own SIM')) ];
+				           st.radio_held ? level('warn', _('radio off — the modem does not use its own SIM')) : own ];
 			else if (!st.enabled)
 				remote = [ E('span', {}, _('its own SIM')) ];
 			else {
@@ -669,6 +686,8 @@ return view.extend({
 				/* it does not run on its own SIM meanwhile */
 				if (st.radio_held)
 					remote.push(level('warn', _('radio off until the remote SIM is in use — the modem does not use its own SIM')));
+				else if (own && st.state != 'powered' && st.state != 'connected')
+					remote.push(own);
 
 				actions.push(button(_('Restart'), _('Give the modem its own SIM back for a moment, then offer the remote one again'),
 					function() { return callRsim(n, 'rsim', 'restart').then(L.bind(view.refresh, view)); }));

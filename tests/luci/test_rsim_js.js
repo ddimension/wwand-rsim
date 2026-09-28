@@ -104,8 +104,8 @@ const poll = { add: (fn, s) => polls.push([ fn, s ]) };
 let options = {};
 class Section {
 	constructor(type) { this.type = type; }
-	option(cls, name) {
-		let o = { name: name, values: [], deps: [], value(k, v) { this.values.push(k); }, depends(d, v) { this.deps.push(v === undefined ? d : { [d]: v }); } };
+	option(cls, name, title, description) {
+		let o = { name: name, title: title, description: description, values: [], deps: [], value(k, v) { this.values.push(k); }, depends(d, v) { this.deps.push(v === undefined ? d : { [d]: v }); } };
 		o.section = { formvalue: (sid, opt) => (conf[sid] || {})[opt] };
 		options[this.type + '.' + name] = o;
 		return o;
@@ -192,6 +192,23 @@ const page = new Function('view', 'form', 'rpc', 'ui', 'fs', 'uci', 'dom', 'poll
 	   'status: a reader that cannot work — the error, and the radio off');
 	view.renderStatus(data);
 	ok(st.indexOf('not lendable: this modem uses a remote card itself') >= 0, 'status: why a card cannot be lent');
+
+	/* rsim_fallback local: nothing held, it runs on its own SIM meanwhile */
+	view.renderStatus({ modems: [ 'm3' ], st: [ { enabled: false, config_error: 'its remote SIM cannot be used (x is not a reader)',
+		radio_held: false, fallback: 'local', now: 1000 } ], info: status });
+	ok(text(view.statusBox).indexOf('on its own SIM until the remote one is connected') >= 0 && text(view.statusBox).indexOf('radio off') < 0,
+	   'status: fallback local and a reader that cannot work — on its own SIM, not "radio off"');
+	view.renderStatus({ modems: [ 'm3' ], st: [ { enabled: true, reader: 'rspro:bank.lan', slot: 1, state: 'waiting',
+		radio_held: false, fallback: 'local', now: 1000 } ], info: status });
+	ok(text(view.statusBox).indexOf('on its own SIM until the remote one is connected') >= 0, 'status: fallback local, waiting — on its own SIM');
+	view.renderStatus({ modems: [ 'm3' ], st: [ { enabled: true, reader: 'rspro:bank.lan', slot: 1, state: 'powered',
+		radio_held: false, fallback: 'local', now: 1000 } ], info: status });
+	ok(text(view.statusBox).indexOf('on its own SIM') < 0, 'status: fallback local, on the remote card — not said');
+	view.renderStatus(data);
+
+	const fbo = options['wwand_modem.rsim_fallback'];
+	ok(fbo && fbo.values.join(',') == ',local', 'form: the fallback, keep off (default) or the modem\'s own SIM');
+	ok(fbo && fbo.description.indexOf('over this modem\'s own connection') >= 0, 'form: ...with the WAN lockout explained');
 
 	const rows = find(view.statusBox, (x) => x.tag == 'tr').slice(1);
 

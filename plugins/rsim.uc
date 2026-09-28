@@ -444,6 +444,30 @@ function reader_options(r)
 	};
 }
 
+// What a modem with a remote SIM assigned runs on while that SIM is not
+// connected (option rsim_fallback on its wwand_modem):
+//   off    nothing — its radio is held off (the default: one card, the one
+//          configured; a modem that silently dials on its own card instead
+//          bills the wrong subscription and hides a broken remote SIM)
+//   local  the card in its own slot. For a remote SIM reached OVER this
+//          modem's own connection — a SIM bank (rspro:), a reader or
+//          another router over SSH (ssh:, wwand:) with this modem as the
+//          only WAN: held off, the modem could never reach its remote SIM
+//          again, and the router would be locked out for good.
+// -> { mode, bad } — bad: the value given when it is none of these (taken
+// as off, the safe side, and warned about).
+function fallback_of(ext)
+{
+	let v = ext?.rsim_fallback;
+
+	if (v == null || v == '' || v == 'off')
+		return { mode: 'off', bad: null };
+	if (v == 'local')
+		return { mode: 'local', bad: null };
+
+	return { mode: 'off', bad: sprintf('%s', v) };
+}
+
 // How a sponsor lends: 'sap' or 'apdu' as configured, 'auto' when nothing
 // is — SIM Access, or APDU over AT+CSIM on a donor without QMI UIM (an NCM
 // modem), which has no SIM Access to offer
@@ -1659,6 +1683,15 @@ function create(deps)
 			push(draining, { ref: 'lend:' + l.id, cfg: { donor: { ref: l.ref, mode: l.mode } }, rpc: l.card });
 	};
 
+	// per modem: a withdrawal that parked the radio first is still on its
+	// way (stop_session) — held meanwhile, whatever the fallback
+	let withdrawing = {};
+	// per modem: the fallback its configuration last named (tick), for the
+	// indications, which come without the modem's options
+	let fallbacks = {};
+	// per modem: the unknown rsim_fallback value already warned about
+	let fallback_warned = {};
+
 	// null, or why this modem's card cannot be lent to another router now
 	let lend_refusal = (ref, ext) => {
 		let s = sessions[ref];
@@ -1706,7 +1739,29 @@ function create(deps)
 	// failed, its reader cannot work, or the modem let go of it (it falls
 	// back to the local card then). No session yet is not connected: the
 	// hold stands from the daemon's first moment.
+	//
+	// The release point is CONNECT_IND, not the powered card, on purpose: a
+	// CARD_POWER_DOWN_IND takes a working session back to `connected`, and a
+	// hold there would park a modem that is only power-cycling its card. A
+	// power-up that FAILED (no ATR, EV_CARD_ERROR sent) is different: the
+	// modem has no card at all then, so the hold stands again until one is
+	// powered.
+	//
+	// rsim_fallback local (fallback_of): no hold while the remote SIM is not
+	// connected, nor for a card that cannot be powered — the modem's own
+	// card is the configured way out, and holding the radio would cut off
+	// the link the remote SIM may be reached over. The one hold left is the
+	// withdrawal in flight: the radio parked before it (stop_session) must
+	// not be woken on the local card before the modem has let go of ours.
 	let own_hold = (ref, ext) => {
+		let assigned = ext?.rsim ?? ext?.rsim_reader;
+
+		if (withdrawing[ref] && type(assigned) == 'string' && length(assigned))
+			return 'its remote SIM is being withdrawn — the radio stays off until the modem has let go of it';
+
+		if (fallback_of(ext).mode == 'local')
+			return null;
+
 		let rs = resolve(ext);
 
 		if (rs.error)
@@ -1721,11 +1776,14 @@ function create(deps)
 		}
 
 		let s = sessions[ref];
+		let name = rs.cfg.reader_name ?? rs.cfg.reader;
+
+		if (s && s.state == 'connected' && s.card_failed)
+			return sprintf('its remote SIM %s is connected, but its card cannot be powered (%s)', name, s.card_failed);
 
 		if (s && (s.state == 'connected' || s.state == 'powered'))
 			return null;
 
-		let name = rs.cfg.reader_name ?? rs.cfg.reader;
 		let n = notes[ref] ?? {};
 
 		if (!s && n.hold)
@@ -1740,6 +1798,33 @@ function create(deps)
 
 	// parks in flight (own_hold in tick), so a tick does not ask twice
 	let parking = {};
+
+	// The radio of a modem whose remote SIM goes away, parked when it still
+	// runs — so it deregisters with the card that is leaving instead of
+	// dropping off the network with it (the network would hold that IMSI's
+	// registration, and a modem, or a bank's next client, attaching with it
+	// meets a stale one). cb() once parked, or at once when there is
+	// nothing to park or no way to; a park that fails is logged and cb()
+	// runs anyway: the withdrawal must not hang on it.
+	let park_radio = (ref, why, cb) => {
+		let m = deps.modem_of?.(ref)?.modem;
+
+		if (!deps.modem_radio || !m || m.lowpower_parked)
+			return cb();
+
+		let done = false;
+		let once = () => { if (!done) { done = true; cb(); } };
+
+		log('notice', sprintf('rsim %s: %s — switching its radio off first', ref, why));
+		deps.modem_radio(ref, false, (e) => {
+			if (e)
+				log('warn', sprintf('rsim %s: switching the radio off failed: %J', ref, e));
+			once();
+		});
+		// set_opmode answers within its own timeout; this is for one that
+		// does not, so the modem is not left offered a card that is gone
+		uloop.timer(20000, once);
+	};
 
 	let stop_session;
 
@@ -1764,7 +1849,7 @@ function create(deps)
 			// the configuration it failed on: another one is tried afresh
 			note(s.ref, { retry_at: null, hold: true, hold_key: s.key });
 			log('warn', sprintf('rsim %s: %s — not retrying until the configuration changes or `wwandctl rsim restart`', s.ref, why));
-			return stop_session(s, false);
+			return stop_session(s, false, true);
 		}
 
 		let f = notes[s.ref].failures;
@@ -1776,7 +1861,7 @@ function create(deps)
 		note(s.ref, { retry_at: now() + ((wait > BACKOFF_MAX) ? BACKOFF_MAX : wait) });
 		log('warn', sprintf('rsim %s: %s — trying again in %d s', s.ref, why,
 			notes[s.ref].retry_at - now()));
-		stop_session(s, false);
+		stop_session(s, false, true);
 	};
 
 	// a start that could not even begin — the modem is between two lives
@@ -1795,7 +1880,7 @@ function create(deps)
 			return fail(s, why);
 
 		log('info', sprintf('rsim %s: %s — trying again shortly', s.ref, why));
-		stop_session(s, false);
+		stop_session(s, false, true);
 	};
 
 	let event = (s, ev, extra, cb) => {
@@ -1828,10 +1913,14 @@ function create(deps)
 
 			if (err || !bytes(res?.atr)) {
 				log('warn', sprintf('rsim %s: card %s failed: %s', s.ref, op, err?.error ?? 'no ATR'));
+				// the modem is connected to a card that is not there:
+				// held again until one is powered (own_hold)
+				s.card_failed = sprintf('%s: %s', op, err?.error ?? 'no ATR');
 				return event(s, EV_CARD_ERROR, { error_cause: (err?.error == 'timeout') ? ERR_TIMEOUT : ERR_NO_LINK });
 			}
 
 			s.atr = res.atr;
+			s.card_failed = null;
 			s.state = 'powered';
 			s.powered_at ??= now();
 			log('notice', sprintf('rsim %s: card %s, ATR %s', s.ref,
@@ -1916,6 +2005,7 @@ function create(deps)
 				return;
 
 			s.state = 'connected';
+			s.card_failed = null;
 			log('notice', sprintf('rsim %s: the modem connected to the remote card (slot %d)', s.ref, s.cfg.slot));
 			card_up(s, 'power_up');
 
@@ -1939,7 +2029,15 @@ function create(deps)
 				? log('warn', sprintf('rsim %s: powering the card down failed: %s', s.ref, err.error ?? '?'))
 				: null);
 			s.state = 'waiting';
+			s.card_failed = null;
 			log('notice', sprintf('rsim %s: the modem disconnected from the remote card', s.ref));
+
+			// It let go on its own: the card is gone from under its
+			// registration, and with no fallback it must not carry on — nor
+			// register anew — on the card in its own slot. The core parks
+			// only a NEW registration; this one is still standing.
+			if (fallbacks[s.ref] != 'local')
+				park_radio(s.ref, 'the modem let go of its remote SIM', () => null);
 		});
 		c.on('CARD_POWER_UP_IND', (d) => mine(d) ? card_up(s, 'power_up') : null);
 		c.on('CARD_RESET_IND', (d) => mine(d) ? card_up(s, (s.state == 'powered') ? 'reset' : 'power_up') : null);
@@ -2049,6 +2147,7 @@ function create(deps)
 						return;
 
 					s.atr = res.atr;
+					s.card_failed = null;
 					s.state = 'powered';
 					event(s, EV_CARD_INSERTED, { atr: bytes(s.atr) });
 
@@ -2189,8 +2288,18 @@ function create(deps)
 
 	// polite: tell the modem the card is gone and the connection with it, so
 	// it goes back to its own SIM; `polite` false after a failure where the
-	// client may be what failed
-	stop_session = (s, polite) => {
+	// client may be what failed.
+	// park: the configuration still assigns a remote SIM (a failure, a
+	// restart, another reader, the daemon's exit — not the remote SIM
+	// switched off). A modem on the remote card then has its radio parked
+	// BEFORE it hears that the card goes (park_radio): without a fallback it
+	// stays off (own_hold); with rsim_fallback local the hold ends once the
+	// modem has let go, and the core wakes it on its own card. At the
+	// daemon's exit nothing wakes it: it stays off until the next start,
+	// whose init hold decides (off: until the remote card is connected;
+	// local: at once) — rather than dropping off the network with the card
+	// and registering on its own one unattended.
+	stop_session = (s, polite, park) => {
 		if (sessions[s.ref] == s)
 			delete sessions[s.ref];
 
@@ -2229,18 +2338,33 @@ function create(deps)
 
 				if (stopping[s.ref] == s)
 					delete stopping[s.ref];
+				if (withdrawing[s.ref] && !stopping[s.ref])
+					delete withdrawing[s.ref];
 			};
 
-			if (polite && was != 'starting') {
-				c.request('EVENT', { info: { event: EV_CARD_REMOVED, slot: s.cfg.slot } }, () =>
+			let withdraw = () => {
+				if (c.destroyed)
+					return rel();
+
+				if (polite && was != 'starting') {
+					c.request('EVENT', { info: { event: EV_CARD_REMOVED, slot: s.cfg.slot } }, () =>
+						c.request('EVENT', { info: { event: EV_CONN_UNAVAILABLE, slot: s.cfg.slot } }, () => rel(),
+							{ no_recovery: true, timeout: 3000 }),
+						{ no_recovery: true, timeout: 3000 });
+				}
+				else {
 					c.request('EVENT', { info: { event: EV_CONN_UNAVAILABLE, slot: s.cfg.slot } }, () => rel(),
-						{ no_recovery: true, timeout: 3000 }),
-					{ no_recovery: true, timeout: 3000 });
+						{ no_recovery: true, timeout: 3000 });
+				}
+			};
+
+			// on the remote card (connected; powered or power-cycling it)
+			if (park && (was == 'connected' || was == 'powered')) {
+				withdrawing[s.ref] = true;
+				park_radio(s.ref, 'its remote SIM goes away', withdraw);
 			}
-			else {
-				c.request('EVENT', { info: { event: EV_CONN_UNAVAILABLE, slot: s.cfg.slot } }, () => rel(),
-					{ no_recovery: true, timeout: 3000 });
-			}
+			else
+				withdraw();
 		}
 
 		let r = s.rpc;
@@ -2262,6 +2386,12 @@ function create(deps)
 			let rs = resolve(ext);
 			let cfg = rs.cfg;
 			let s = sessions[ref];
+			let fb = fallback_of(ext);
+
+			fallbacks[ref] = fb.mode;
+			if (fb.bad != null && fallback_warned[ref] !== fb.bad)
+				log('warn', sprintf('rsim %s: rsim_fallback \'%s\' is not off or local — taken as off: the radio stays off while the remote SIM is not connected', ref, fb.bad));
+			fallback_warned[ref] = fb.bad;
 
 			draining = filter(draining, (d) => d.rpc.busy());
 
@@ -2330,7 +2460,7 @@ function create(deps)
 			// new offer
 			if (s && (!cfg || s.key != sprintf('%J', cfg))) {
 				log('notice', sprintf('rsim %s: %s', ref, cfg ? 'reader configuration changed' : 'remote card switched off'));
-				stop_session(s, true);
+				stop_session(s, true, !!cfg);
 				delete notes[ref];
 				return;
 			}
@@ -2824,6 +2954,8 @@ function create(deps)
 					to = { to: lent.client, mode: lend_mode(lent.card, lent.mode), remote: true, commands: lent.commands, since: lent.since };
 
 				let refused = lend_refusal(ref, ext);
+				let held = own_hold(ref, ext);
+				let fb = fallback_of(ext);
 
 				cb(null, {
 					lent_to: to,
@@ -2840,10 +2972,16 @@ function create(deps)
 					reader: cfg?.reader ?? null,
 					conflict: n.conflict ?? null,
 					// a reader that cannot work, named or spelled out
-					config_error: rs.error ?? (cfg ? null : own_hold(ref, ext)),
+					config_error: rs.error ?? (cfg ? null : held),
 					// the modem is held off its own card until the remote one
-					// is in use: its radio is off meanwhile
-					radio_held: !!own_hold(ref, ext),
+					// is in use: its radio is off meanwhile — and why
+					radio_held: !!held,
+					radio_why: held,
+					// what it runs on while the remote SIM is not connected
+					// (rsim_fallback): 'off' or 'local', and a value given
+					// that is neither (taken as off)
+					fallback: fb.mode,
+					fallback_invalid: fb.bad,
 					slot: cfg?.slot ?? null,
 					state: s?.state ?? (cfg ? 'idle' : 'off'),
 					atr: s?.atr ?? null,
@@ -2864,7 +3002,7 @@ function create(deps)
 			// give the modem its own card back now, and offer ours again
 			restart: (ref, ext, args, cb) => {
 				if (sessions[ref])
-					stop_session(sessions[ref], true);
+					stop_session(sessions[ref], true, true);
 				delete notes[ref];
 				cb(null, { restarted: true });
 			},
@@ -2893,7 +3031,7 @@ function create(deps)
 
 			for (let ref, s in sessions) {
 				pending = true;
-				stop_session(s, true);
+				stop_session(s, true, true);
 			}
 
 			return pending;
@@ -2918,6 +3056,7 @@ return {
 	rspro_ok: rspro_ok,
 	rspro_client_ok: rspro_client_ok,
 	rspro_claim: rspro_claim,
+	fallback_of: fallback_of,
 	port_ok: port_ok,
 	SSH_KEY_DIR: SSH_KEY_DIR,
 	segments: segments,
@@ -2928,6 +3067,8 @@ return {
 	options: [ 'rsim_reader', 'rsim_slot', 'rsim_clock', 'rsim_reset', 'rsim_detect', 'rsim_mode', 'rsim_at_radio', 'rsim_at_baud',
 	           'rsim_bt_channel', 'rsim_bt_security', 'rsim_bt_apdu', 'rsim_sap_auto', 'rsim_rspro_client', 'rsim_rspro_rest_port',
 	           'rsim_ssh_port', 'rsim_ssh_key', 'rsim_ssh_helper', 'rsim_donor_mode', 'rsim_donor_slot', 'rsim_donor_cond', 'rsim_donor_apdu',
+	           // off | local: what the modem runs on while its remote SIM is not connected
+	           'rsim_fallback',
 	           // a named SIM reader (config wwand_simreader) instead of the above
 	           'rsim' ],
 	create: create,

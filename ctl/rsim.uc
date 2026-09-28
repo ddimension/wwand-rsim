@@ -124,6 +124,14 @@ function status_lines(st)
 	// held off its own card meanwhile: the plugin's radio_hold
 	let radio = st.radio_held ? [ [ 'radio', 'off until the remote SIM is in use — the modem does not use its own SIM' ] ] : [];
 
+	// what it runs on while the remote SIM is not connected (rsim_fallback);
+	// absent from a plugin older than the option
+	if (st.fallback != null && (st.enabled || st.config_error))
+		push(radio, [ 'fallback', (st.fallback == 'local')
+			? 'its own SIM while the remote one is not connected (rsim_fallback local)'
+			: sprintf('none — radio off while the remote SIM is not connected%s',
+			          (st.fallback_invalid != null) ? sprintf(' (rsim_fallback \'%s\' is not off or local)', st.fallback_invalid) : '') ]);
+
 	if (st.config_error)
 		return [ [ 'remote SIM', st.config_error ], ...radio, ...lend ];
 

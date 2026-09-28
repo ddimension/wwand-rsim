@@ -34,6 +34,14 @@ let prov = require('wwand.ctl.rsim_provider');
 	   'status: a modem waiting for its remote SIM is held off its own');
 	eq(ctl.status_lines({ config_error: 'its remote SIM cannot be used (x is not a reader)', radio_held: true })[1][0], 'radio',
 	   'status: ...also when its reader cannot work');
+	eq(ctl.status_lines({ enabled: true, reader: 'rspro:bank.lan', slot: 1, state: 'waiting', fallback: 'local' })[1],
+	   [ 'fallback', 'its own SIM while the remote one is not connected (rsim_fallback local)' ],
+	   'status: the fallback, local');
+	eq(ctl.status_lines({ enabled: true, reader: 'pcsc:0', slot: 1, state: 'waiting', radio_held: true, fallback: 'off',
+	                      fallback_invalid: 'lokal' })[2],
+	   [ 'fallback', 'none — radio off while the remote SIM is not connected (rsim_fallback \'lokal\' is not off or local)' ],
+	   'status: the fallback, off — and a value that is neither, said');
+	eq(length(ctl.status_lines({ enabled: false, fallback: 'off' })), 1, 'status: no fallback line without a remote SIM');
 }
 
 {

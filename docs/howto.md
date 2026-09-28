@@ -305,8 +305,11 @@ The log is that of section 1, with `reader ssh:rsim@pc.lan:wbsm:`.
 
 ### Limits
 
-- A dropped SSH link is handled like a helper that exited: the modem gets
-  its own SIM back and the plugin retries with backoff.
+- A dropped SSH link is handled like a helper that exited: the modem's
+  radio is parked, the card withdrawn, and the plugin retries with backoff —
+  the modem stays off meanwhile, or runs on its own SIM with
+  `rsim_fallback local` (see *When the remote SIM is not connected* below;
+  needed when the SSH link runs over this modem).
 - Latency: each command crosses the link once. Over a LAN that is
   milliseconds; through a slow AT sponsor (the Cudy LT300: SSH, a small CPU,
   `AT+CSIM`) about 1 s per command, and a client reads ~150–250 commands
@@ -399,8 +402,9 @@ phone. The first answer of a Bluetooth source may take 60 s.
 ### Limits
 
 - A dropped link (phone out of range, SIM access switched off on the phone)
-  ends the helper; the modem gets its own SIM back and the plugin tries
-  again.
+  ends the helper; the modem's radio is parked, the card withdrawn, and the
+  plugin tries again — the modem stays off meanwhile unless
+  `rsim_fallback local`.
 - Phones answer with small SAP messages (Samsung's first accepts 261 bytes);
   rsim-card steps the size down on its own.
 - Tested with rsim-card on a Linux PC; not on an OpenWrt router as the
@@ -687,6 +691,7 @@ config wwand_simreader 'bank1'
 
 config wwand_modem 'wwmodem0'
 	option rsim 'bank1'
+	option rsim_fallback 'local'    # only when the bank is reached over this modem
 ```
 
 Leave `bank` out to use whatever the operator maps to client `10` (the
@@ -707,8 +712,13 @@ wwandctl rsim wwmodem0                  # reader: remsim-server …, bank slot 1
 
 - The server and the bankd must be reachable from the router directly (no
   SSH), unencrypted TCP as osmo-remsim has it — a VPN if they are elsewhere.
-- One client slot per modem: two modems with the same `client` are refused
-  by the server (`identityInUse`).
+- One client slot per modem: of two modems with the same `client` at one
+  bank (two readers left at the default `0:0`, say) only the first is
+  started; the other's status says to give it its own. LuCI refuses that
+  pair, and *Add* from the bank scan picks a free client.
+- Reached over this modem's own connection (the modem is the router's only
+  way to the bank): `rsim_fallback local`, or the modem, held off while the
+  bank is not connected, could never reach it.
 - Without a mapping the first start fails and is retried with the usual
   backoff; with `bank` the helper makes the mapping itself.
 
@@ -728,3 +738,29 @@ use by the modem*, *stopped* (with the last error and when it is retried).
 `error`) once the modem runs on the card, for scripts.
 
 Removing `option rsim` / `rsim_reader` gives the modem its own SIM back.
+
+### When the remote SIM is not connected
+
+A modem with a remote SIM assigned runs on it or not at all: until the
+modem has connected to the remote card, while it is retried after a
+failure, when its reader cannot work, and when the modem is connected but
+the card cannot be powered, its radio is held off (`radio_held`, wwand
+refuses its interfaces). When the remote card goes while the modem runs on
+it, the radio is switched off first, so the modem leaves the network with
+that card. That needs wwand with the init hold (`106132a`) to stand from
+the first moment after a boot.
+
+Where the remote SIM is reached over this modem's own connection — a SIM
+bank, a reader or another router over SSH, with no other uplink — that
+would lock the router out. Then:
+
+```
+config wwand_modem 'wwmodem0'
+	option rsim 'bank1'
+	option rsim_fallback 'local'    # own SIM while the remote one is not connected
+```
+
+With `local` the modem runs on its own card meanwhile and switches to the
+remote one when it connects; when that goes, its radio is parked first and
+then comes back on its own card. `wwandctl rsim wwmodem0` shows the
+`fallback` line; LuCI: *Modems → When the remote SIM is not connected*.

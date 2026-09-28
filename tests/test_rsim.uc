@@ -2050,6 +2050,224 @@ let donor_plugin = (o) => { let targets = {}; return rsim.create({
 	eq(res?.lendable, true, 'lend: without one, lendable');
 }
 
+// --- the radio parked BEFORE the remote card goes, and the fallback -------------
+// A modem on the remote card that hears "card removed / connection
+// unavailable" while its radio runs drops off the network with the card; the
+// network keeps that IMSI's registration. So every withdrawal of a card the
+// modem is on parks the radio first — when the configuration still assigns a
+// remote SIM (without one the modem is meant to go back to its own card).
+
+// one plugin, one target modem m0 whose radio is on; `order` gets the park
+// and the events to the modem in the order they happen
+let park_rig = (o) => {
+	let r = { t: { now: 1000 }, order: [], reader: fake_reader(card_model()), logs: [],
+	          mods: { m0: { state: 'READY', lowpower_parked: false } } };
+
+	r.client = fake_client({ wire: r.order });
+	r.client.tag = 'm0';
+	r.p = rsim.create({
+		log: (l, m) => push(r.logs, [ l, m ]), sim_changed: () => null,
+		open_helper: r.reader.open_helper, helper_path: '/x',
+		modem_of: (ref) => ({ modem: r.mods[ref] }),
+		qmi_client: (ref, schema, cb) => cb(null, r.client), qmi_release: () => null,
+		modem_radio: (ref, on, cb) => {
+			push(r.order, sprintf('%s radio %s', ref, on ? 'on' : 'off'));
+			let fin = () => { r.mods[ref].lowpower_parked = !on; cb?.(null); };
+			o?.park_ms ? uloop.timer(o.park_ms, fin) : fin();
+		},
+		readers: () => ({}), now: () => r.t.now,
+	});
+	// offered and connected: the modem runs on the remote card, radio on
+	r.up = (ext) => {
+		r.p.tick('m0', ext);
+		run_for(20);
+		r.client.fire('CONNECT_IND', { slot: 1 });
+		run_for(20);
+		r.mods.m0.lowpower_parked = false;
+	};
+
+	return r;
+};
+// what happened after the first `n` entries
+let tail_of = (r, n) => slice(r.order, n);
+
+{
+	// a failure (the reader helper exits) while the modem is on the card
+	let r = park_rig();
+
+	r.up(EXT);
+	let n = length(r.order);
+
+	r.reader.on_exit();
+	run_for(50);
+	eq(tail_of(r, n), [ 'm0 radio off', 'm0:0' ],
+	   'park first: the reader fails — radio off, THEN connection unavailable');
+	ok(r.p.radio_hold('m0', EXT) != null, 'park first: ...and it stays held (no fallback)');
+}
+
+{
+	// another reader configured: still a remote SIM assigned
+	let r = park_rig();
+
+	r.up(EXT);
+	let n = length(r.order);
+
+	r.p.tick('m0', { rsim_reader: 'phoenix:/dev/ttyUSB1' });
+	run_for(50);
+	eq(tail_of(r, n), [ 'm0 radio off', 'm0:3', 'm0:0' ],
+	   'park first: another reader configured — radio off, then card removed, connection unavailable');
+}
+
+{
+	// the remote SIM switched off: the modem is meant to go back to its own card
+	let r = park_rig();
+
+	r.up(EXT);
+	let n = length(r.order);
+
+	r.p.tick('m0', {});
+	run_for(50);
+	eq(tail_of(r, n), [ 'm0:3', 'm0:0' ], 'park first: not when the remote SIM is switched off — its own card is wanted');
+}
+
+{
+	// `wwandctl rsim restart`
+	let r = park_rig();
+
+	r.up(EXT);
+	let n = length(r.order);
+
+	r.p.ops.restart('m0', EXT, {}, () => null);
+	run_for(50);
+	eq(tail_of(r, n), [ 'm0 radio off', 'm0:3', 'm0:0' ], 'park first: a restart');
+}
+
+{
+	// the daemon exits: parked, so it does not run on its own card unattended
+	let r = park_rig();
+
+	r.up(EXT);
+	let n = length(r.order);
+
+	ok(r.p.stop(), 'park first: the daemon exits — work pending');
+	ok(r.p.busy(), 'park first: ...busy while the park and the withdrawal run');
+	run_for(50);
+	eq(tail_of(r, n), [ 'm0 radio off', 'm0:3', 'm0:0' ], 'park first: the daemon exits — radio off, then the card goes');
+	ok(!r.p.busy(), 'park first: ...and done');
+}
+
+{
+	// the modem lets go of the card itself
+	let r = park_rig();
+
+	r.up(EXT);
+	let n = length(r.order);
+
+	r.client.fire('DISCONNECT_IND', { slot: 1 });
+	run_for(50);
+	eq(tail_of(r, n), [ 'm0 radio off' ], 'park: the modem let go of the remote card — parked at once, not left on its own card');
+}
+
+{
+	// a radio already off is not parked again; a modem not on the card is not
+	let r = park_rig();
+
+	r.up(EXT);
+	r.mods.m0.lowpower_parked = true;
+	let n = length(r.order);
+
+	r.reader.on_exit();
+	run_for(50);
+	eq(tail_of(r, n), [ 'm0:0' ], 'park first: already off — just the withdrawal');
+
+	let r2 = park_rig();
+
+	r2.p.tick('m0', EXT);
+	run_for(20);
+	n = length(r2.order);
+	r2.reader.on_exit();
+	run_for(50);
+	eq(tail_of(r2, n), [ 'm0:0' ], 'park first: offered, never connected — the modem is not on that card, nothing to park');
+}
+
+// --- a connected card that cannot be powered: held again --------------------------
+{
+	let r = park_rig();
+
+	r.p.tick('m0', EXT);
+	run_for(20);
+	r.reader.card.present = false;
+	r.client.fire('CONNECT_IND', { slot: 1 });
+	run_for(20);
+	ok(index(r.p.radio_hold('m0', EXT) ?? '', 'cannot be powered') >= 0,
+	   'power-up failed: connected, but no card — the hold stands again (' + r.p.radio_hold('m0', EXT) + ')');
+	eq(r.p.radio_hold('m0', { ...EXT, rsim_fallback: 'local' }), null,
+	   'power-up failed: ...not with rsim_fallback local');
+
+	r.reader.card.present = true;
+	r.client.fire('CARD_POWER_UP_IND', { slot: 1 });
+	run_for(20);
+	eq(r.p.radio_hold('m0', EXT), null, 'power-up failed: once a power-up works, free again');
+
+	r.client.fire('CARD_POWER_DOWN_IND', { slot: 1, mode: 1 });
+	run_for(20);
+	eq(r.p.radio_hold('m0', EXT), null, 'power-down: the modem power-cycling its card is not held (connected is the release point)');
+}
+
+// --- rsim_fallback: what a modem runs on while its remote SIM is not connected ----
+{
+	eq(rsim.fallback_of({}), { mode: 'off', bad: null }, 'fallback: off by default');
+	eq(rsim.fallback_of({ rsim_fallback: 'local' }), { mode: 'local', bad: null }, 'fallback: local');
+	eq(rsim.fallback_of({ rsim_fallback: 'lokal' }), { mode: 'off', bad: 'lokal' }, 'fallback: anything else is off, and said');
+	ok(index(rsim.options, 'rsim_fallback') >= 0, 'fallback: an option wwand hands to the plugin');
+
+	let r = park_rig({ park_ms: 30 });
+	let LX = { ...EXT, rsim_fallback: 'local' };
+
+	eq(r.p.radio_hold('m0', LX), null, 'fallback local: not held before any session — the modem runs on its own card');
+	eq(r.p.radio_hold('m0', { rsim: 'nosuch', rsim_fallback: 'local' }), null, 'fallback local: nor for a reader that cannot work');
+	ok(r.p.radio_hold('m0', EXT) != null, 'fallback off: held');
+	ok(r.p.radio_hold('m0', { ...EXT, rsim_fallback: 'lokal' }) != null, 'fallback: an unknown value holds, like off');
+
+	r.p.tick('m0', { ...EXT, rsim_fallback: 'lokal' });
+	r.p.tick('m0', { ...EXT, rsim_fallback: 'lokal' });
+	eq(length(filter(r.logs, (l) => l[0] == 'warn' && index(l[1], "rsim_fallback 'lokal'") >= 0)), 1,
+	   'fallback: an unknown value is warned about once');
+	run_for(20);
+
+	// connected -> dropped -> own card
+	r.client.fire('CONNECT_IND', { slot: 1 });
+	run_for(20);
+	r.mods.m0.lowpower_parked = false;
+	r.p.tick('m0', LX);
+	eq(r.p.radio_hold('m0', LX), null, 'fallback local: on the remote card, free');
+
+	let st = null;
+
+	r.p.ops.status('m0', LX, {}, (e, x) => { st = x; });
+	eq([ st.fallback, st.fallback_invalid, st.radio_held ], [ 'local', null, false ], 'fallback: the status names it');
+
+	let n = length(r.order);
+
+	r.reader.on_exit();
+	run_for(10);
+	ok(index(r.p.radio_hold('m0', LX) ?? '', 'being withdrawn') >= 0,
+	   'fallback local: the remote SIM drops — held while the radio is parked and the card withdrawn');
+	run_for(100);
+	eq(tail_of(r, n), [ 'm0 radio off', 'm0:0' ], 'fallback local: radio off first, then the card goes');
+	eq(r.p.radio_hold('m0', LX), null, 'fallback local: ...then free — the core wakes it on its own card');
+
+	// the modem letting go on its own is not parked with a fallback
+	let r2 = park_rig();
+
+	r2.up(LX);
+	n = length(r2.order);
+	r2.client.fire('DISCONNECT_IND', { slot: 1 });
+	run_for(50);
+	eq(tail_of(r2, n), [], 'fallback local: the modem let go of the card — left on, on its own card');
+	eq(r2.p.radio_hold('m0', LX), null, 'fallback local: ...and not held');
+}
+
 // --- two modems at one SIM bank: each needs its own client -----------------------
 // rsim-card announces client 0:0 unless told; two readers of one bank left at
 // that default are two names for ONE client at the server
