@@ -42,5 +42,88 @@ int main(void)
 	CHECK(jtok_parse("{\"a\":\"x", 7, t, 64) < 0);
 	CHECK(jtok_parse("{1:2}", 5, t, 64) < 0);
 	CHECK(jtok_parse(js, strlen(js), t, 4) < 0);
+	/* the grammar, not a guess at it: each of these was read as a
+	 * document by a tokenizer that skipped colons and commas */
+	current_test = "grammar";
+	{
+		static const char *const bad[] = {
+			"{\"a\" 1}",			/* no colon */
+			"{\"a\":1 \"b\":2}",		/* no comma */
+			"[1 2]",
+			"{\"a\":}",			/* a key without its value */
+			"{\"a\"}",
+			"{\"a\":1,}",			/* a comma after the last */
+			"[1,]",
+			"[,1]",
+			"{,}",
+			"{\"a\"::1}",
+			"{\"a\":1}{}",			/* two roots */
+			"{} x",
+			"",
+			"   ",
+			"\"a\x01b\"",			/* a control character */
+			"\"a\nb\"",
+			"\"\\q\"",			/* an escape JSON has not */
+			"\"\\u12G4\"",
+			"\"\\u12\"",
+			"tru",				/* primitives spelled wrongly */
+			"nul",
+			"True",
+			"01",
+			"-",
+			"1.",
+			".5",
+			"1e",
+			"+1",
+			"0x10",
+			"{\"a\":bankId}",
+			"[1:2]",
+			"{\"a\",1}",
+			NULL,
+		};
+		static const char *const good[] = {
+			"{}", "[]", " [ ] ", "0", "-0.5e+3", "\"\\u00e9\\n\\\"\"", "[true,false,null]",
+			"{\"a\":{\"b\":[1,{\"c\":\"d\"}]},\"e\":-12}", NULL,
+		};
+		int i;
+
+		for (i = 0; bad[i]; i++) {
+			int r = jtok_parse(bad[i], strlen(bad[i]), t, 64);
+
+			CHECK(r < 0);
+			if (r >= 0)
+				fprintf(stderr, "  taken: %s\n", bad[i]);
+		}
+		for (i = 0; good[i]; i++) {
+			int r = jtok_parse(good[i], strlen(good[i]), t, 64);
+
+			CHECK(r > 0);
+			if (r <= 0)
+				fprintf(stderr, "  refused: %s\n", good[i]);
+		}
+		/* sizes as before: members of an object, elements of an array */
+		n = jtok_parse("{\"a\":[1,[2,3],{}],\"b\":{}}", strlen("{\"a\":[1,[2,3],{}],\"b\":{}}"), t, 64);
+		CHECK(n == 10 && t[0].size == 2 && t[2].size == 3 && t[4].size == 2 && t[9].size == 0);
+		/* nesting has its limit */
+		{
+			char deep[64];
+
+			memset(deep, '[', 40);
+			memset(deep + 40, ']', 20);
+			CHECK(jtok_parse(deep, 40, t, 64) < 0);
+		}
+	}
+
+	/* a zero-sized buffer is not written to */
+	current_test = "str_cap0";
+	{
+		char guard[2] = { 'x', 'y' };
+
+		n = jtok_parse("\"abc\"", 5, t, 64);
+		jtok_str("\"abc\"", t, 0, guard + 1, 0);
+		CHECK(guard[1] == 'y');
+		jtok_str("\"abc\"", t, 0, guard, 1);
+		CHECK(guard[0] == '\0' && guard[1] == 'y');
+	}
 	return check_done("test_jtok");
 }
