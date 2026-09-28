@@ -69,6 +69,25 @@ function rspro_client_ok(v)
 	return !!match(v ?? '', /^[0-9]{1,5}(:[0-9]{1,5})?$/) && length(filter(split(v, ':'), (x) => +x > 65535)) == 0;
 }
 
+// Who a SIM bank sees: the remsim-server (host, port) and the client slot
+// we announce there (--rspro-client, rsim-card's default 0:0, a bare id
+// meaning slot 0 — main.c 'I'). Two modems announcing the same one would
+// each be the other to the server: its mapping for that client goes to
+// whichever connected last, and the bankd hands the card to both. So that is
+// what two modems must not share, whatever the reader sections are called.
+// null for any other reader.
+function rspro_claim(cfg)
+{
+	let m = match(cfg?.local_reader ?? '', RSPRO_READER);
+
+	if (!m)
+		return null;
+
+	let c = split(cfg.rspro_client ?? '0:0', ':');
+
+	return sprintf('rspro:%s:%d#%d:%d', lc(m[1]), m[2] ? +substr(m[2], 1) : 9998, +c[0], +(c[1] ?? 0));
+}
+
 // wwand-rsim-provider's module: installed or not, for the status (whether
 // another router can be served)
 const PROVIDER_PATH = '/usr/share/ucode/wwand/ctl/rsim_provider.uc';
@@ -1580,10 +1599,10 @@ function create(deps)
 		return !!(m && m.state == 'READY' && !m.lowpower_parked);
 	};
 
-	// what two modems must not share: a named reader, a lending modem, or a
-	// directly spelled reader
-	let claim_of = (cfg) => cfg.reader_name ? 'reader:' + cfg.reader_name
-		: cfg.donor ? 'donor:' + cfg.donor.ref : 'spec:' + cfg.reader;
+	// what two modems must not share: a SIM bank's client, a named reader, a
+	// lending modem, or a directly spelled reader
+	let claim_of = (cfg) => rspro_claim(cfg) ?? (cfg.reader_name ? 'reader:' + cfg.reader_name
+		: cfg.donor ? 'donor:' + cfg.donor.ref : 'spec:' + cfg.reader);
 
 	// per modem: the session with the modem and the card
 	let sessions = {};
@@ -2343,6 +2362,9 @@ function create(deps)
 				    && claim_of(h[1].cfg) == claim) {
 					note(ref, { conflict: (h[1].state == 'draining')
 						? sprintf('%s: the previous link is still being handed back', cfg.reader_name ?? cfg.reader)
+						: (rspro_claim(cfg) && (h[1].cfg.reader_name ?? h[1].cfg.reader) != (cfg.reader_name ?? cfg.reader))
+						? sprintf('%s: modem %s is client %s at that SIM bank already — give each modem its own client id (option client, or rsim_rspro_client)',
+							cfg.reader_name ?? cfg.reader, h[0], cfg.rspro_client ?? '0:0')
 						: sprintf('%s is in use by modem %s', cfg.reader_name ?? cfg.reader, h[0]) });
 					return;
 				}
@@ -2885,6 +2907,7 @@ return {
 	ssh_split: ssh_split,
 	rspro_ok: rspro_ok,
 	rspro_client_ok: rspro_client_ok,
+	rspro_claim: rspro_claim,
 	port_ok: port_ok,
 	SSH_KEY_DIR: SSH_KEY_DIR,
 	segments: segments,

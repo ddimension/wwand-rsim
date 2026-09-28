@@ -160,7 +160,10 @@ slot mapped to another client is refused, one already mapped to our client
 to its client — a mapping that appears later is reported as a card
 inserted, one taken away as removed. The client is `rsim_rspro_client
 '<id>[:<slot>]'` (default `0:0`; two modems using the bank at the same
-time need two), the REST port `rsim_rspro_rest_port`. As a named reader:
+time need two — with the same client, two readers of one bank left at the
+default say, they are one client to the server, so only the first is
+started and the other's status says why; LuCI's *Add* from a bank scan
+gives each slot a free client), the REST port `rsim_rspro_rest_port`. As a named reader:
 `option type 'rspro'`, `option device '<server>[:<port>]'`, `option bank
 '<bank>:<slot>'`, `option client`, `option rest_port`. It is reached
 directly, never over SSH. `rsim-card` has its own small BER codec — no

@@ -51,6 +51,17 @@ function rsproServerOk(v) {
 	return !!m && (!m[2] || (+m[2].substr(1) >= 1 && +m[2].substr(1) <= 65535));
 }
 
+/* who a SIM bank sees, as the plugin's rspro_claim(): the server with its
+   port and the client slot announced there (rsim-card's default 0:0, a bare
+   id is slot 0). Two modems announcing the same one are one client to the
+   server. null for any other reader. */
+function rsproClaim(r) {
+	var m = r && (r.type || 'wbsm') == 'rspro' ? RSPRO_SERVER.exec(r.device || '') : null;
+	var c = ((r && r.client) || '0:0').split(':');
+
+	return m ? '%s:%d#%d:%d'.format(m[1].toLowerCase(), m[2] ? +m[2].substr(1) : 9998, +c[0], +(c[1] || 0)) : null;
+}
+
 /* numbers a:b (or a alone when single), each 0..65535 */
 function u16Pair(v, single) {
 	var m = /^([0-9]{1,5})(?::([0-9]{1,5}))?$/.exec(v || '');
@@ -350,7 +361,7 @@ return view.extend({
 		};
 
 		o = s.option(form.Value, 'client', _('Client'),
-			_('Who this router is at the remsim-server: <code>id</code> or <code>id:slot</code>. Each modem using a SIM bank at the same time needs its own.'));
+			_('Who this router is at the remsim-server: <code>id</code> or <code>id:slot</code> (empty: <code>0:0</code>). Each modem using a SIM bank at the same time needs its own — two modems with the same client are one client to the server, and only the first is started. <em>Add</em> from the bank scan picks a free one.'));
 		o.depends('type', 'rspro');
 		o.optional = true;
 		o.placeholder = '0:0';
@@ -486,9 +497,23 @@ return view.extend({
 		o.optional = true;
 		o.validate = function(sid, v) {
 			var r = v ? uci.get('network', v) : null;
+			var claim = rsproClaim(r);
+			var self = this;
 
-			return (r && r['.type'] == 'wwand_simreader' && r.type == 'modem' && r.donor == sid)
-				? _('A modem cannot use the card it is lending out') : true;
+			if (r && r['.type'] == 'wwand_simreader' && r.type == 'modem' && r.donor == sid)
+				return _('A modem cannot use the card it is lending out');
+
+			/* another SIM reader of the same bank announcing the same client:
+			   the plugin starts only the first (one reader shared by two
+			   modems is fine — the second waits for it) */
+			var clash = claim ? uci.sections('network', 'wwand_modem').filter(function(x) {
+				var ov = (x['.name'] == sid) ? null : (self.section.formvalue(x['.name'], 'rsim') || x.rsim);
+
+				return ov && ov != v && rsproClaim(uci.get('network', ov)) == claim;
+			})[0] : null;
+
+			return clash ? _('Modem %s is client %s at this SIM bank already (reader %s) — give the SIM readers different clients')
+				.format(clash['.name'], r.client || '0:0', self.section.formvalue(clash['.name'], 'rsim') || clash.rsim) : true;
 		};
 
 		/* a reader spelled out with uci: shown, left alone — and only where
@@ -894,6 +919,16 @@ return view.extend({
 			o = { type: 'rspro', device: rest.substr(0, rest.lastIndexOf('/')), bank: rest.substr(rest.lastIndexOf('/') + 1) };
 			if (restPort)
 				o.rest_port = restPort;
+
+			/* a client of its own, spelled out: left at rsim-card's
+			   default, every slot added from one bank would be client 0:0,
+			   and two modems using two of them would be one client there */
+			var used = uci.sections('network', 'wwand_simreader').map(rsproClaim);
+			var id = 0;
+
+			while (used.indexOf(rsproClaim({ type: 'rspro', device: o.device, client: id + ':0' })) >= 0)
+				id++;
+			o.client = id + ':0';
 		}
 
 		if (host && kind != 'modem')

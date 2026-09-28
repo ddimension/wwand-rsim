@@ -2031,6 +2031,48 @@ let donor_plugin = (o) => { let targets = {}; return rsim.create({
 	eq(radio, [ [ 'm8', false ] ], 'own park: registered on the remote card — not parked');
 }
 
+// --- two modems at one SIM bank: each needs its own client -----------------------
+// rsim-card announces client 0:0 unless told; two readers of one bank left at
+// that default are two names for ONE client at the server
+{
+	eq(rsim.rspro_claim({ local_reader: 'rspro:Bank.lan/1:0' }), 'rspro:bank.lan:9998#0:0',
+	   'rspro claim: the server with its default port, the default client 0:0');
+	eq(rsim.rspro_claim({ local_reader: 'rspro:bank.lan:9998/1:1', rspro_client: '0' }), 'rspro:bank.lan:9998#0:0',
+	   'rspro claim: a bare client id is slot 0 — the same client');
+	ok(rsim.rspro_claim({ local_reader: 'rspro:bank.lan', rspro_client: '1' }) != rsim.rspro_claim({ local_reader: 'rspro:bank.lan' }),
+	   'rspro claim: another client id, another claim');
+	eq(rsim.rspro_claim({ local_reader: 'phoenix:/dev/ttyUSB0' }), null, 'rspro claim: none for other readers');
+
+	let t = { now: 1000 };
+	let reader = fake_reader(card_model());
+	let targets = { m0: fake_client(), m1: fake_client(), m2: fake_client() };
+	let secs = {
+		ba: { type: 'rspro', device: 'bank.lan', bank: '1:0' },
+		bb: { type: 'rspro', device: 'bank.lan:9998', bank: '1:1' },
+		bc: { type: 'rspro', device: 'bank.lan', bank: '1:2', client: '1' },
+	};
+	let p = rsim.create({
+		log: (l, m) => null, sim_changed: () => null,
+		open_helper: reader.open_helper, readers: () => secs,
+		modem_of: (ref) => ({ modem: modem_obj(ref) }),
+		qmi_client: (ref, schema, cb) => cb(null, targets[ref]),
+		qmi_release: () => null, now: () => t.now,
+	});
+
+	p.tick('m0', { rsim: 'ba' });
+	run_for(30);
+	p.tick('m1', { rsim: 'bb' });
+	run_for(30);
+	eq([ reader.open, length(targets.m1.sent) ], [ 1, 0 ],
+	   'rspro: a second reader of the same bank with the same client is not started');
+	ok(index(p.status('m1', { rsim: 'bb' }).text, 'give each modem its own client id') >= 0,
+	   'rspro: ...and the status says what to change');
+
+	p.tick('m2', { rsim: 'bc' });
+	run_for(30);
+	eq(reader.open, 2, 'rspro: a modem with its own client id at the same bank starts');
+}
+
 // --- the configuration is parsed once per change, not per question ---------------
 // radio_hold, the status row, the status op and the tick all resolve readers
 // and modems; a uci load for each was paid on every registration and every

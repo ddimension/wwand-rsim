@@ -350,6 +350,21 @@ const page = new Function('view', 'form', 'rpc', 'ui', 'fs', 'uci', 'dom', 'poll
 	ok(added && added.device == 'bank.lan' && added.bank == '1:0' && added.rest_port == '8997' && !added.host,
 	   'add: a SIM bank slot, with the REST port it was found on (' + JSON.stringify(added) + ')');
 	eq(added && added['.name'], 'rspro_b1s0'.replace('rspro', 'bank'), 'add: named after the bank slot');
+	eq(added && added.client, '0:0', 'add: a SIM bank slot gets its client spelled out');
+	await view.addReader({ backend: 'rspro', spec: 'rspro:bank.lan/1:2', server: 'bank.lan', bank: 1, slot: 2 }, '', '8997');
+	let added2 = conf.bank_b1s2;
+	eq(added2 && added2.client, '1:0', 'add: a second slot of the same bank gets the next free client');
+
+	/* two modems on two readers of one bank with one client: refused */
+	const msel = options['wwand_modem.rsim'];
+	conf.mx = { '.name': 'mx', '.type': 'wwand_modem', rsim: 'bank_b1s0' };
+	conf.my = { '.name': 'my', '.type': 'wwand_modem' };
+	ok(msel.validate('my', 'bank_b1s2') === true, 'form: two modems at one bank with their own clients');
+	ok(msel.validate('my', 'bank_b1s0') === true, 'form: ...one reader for two modems is left to the plugin (the second waits)');
+	conf.bank_b1s2.client = '0';
+	ok(String(msel.validate('my', 'bank_b1s2')).indexOf('Modem mx is client 0 at this SIM bank already') == 0,
+	   'form: ...the same client on two readers of one bank is refused (' + msel.validate('my', 'bank_b1s2') + ')');
+	delete conf.mx; delete conf.my; delete conf.bank_b1s2;
 	await button(br[0], 'Test').attrs.click();
 	eq(execs[execs.length - 1], '/usr/bin/wwandctl rsim test rspro:bank.lan/1:0 --rspro-rest-port 8997 --json',
 	   'test bank: on the REST port it was found on');
