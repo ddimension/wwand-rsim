@@ -467,8 +467,9 @@ wwandctl rsim wwmodem0
   Samsung S20 as USB modem (its AT lock) both did (HW-tested) — refused at
   open, with the reason.
 - Killed hard (SIGKILL, power loss) the helper cannot restore the radio; the
-  mode it had is kept in `/tmp/rsim-card-cfun-<port>` and the next run
-  restores it at its end.
+  mode it had is kept in `/tmp/rsim-card-<uid>/cfun-<port>` (its own
+  directory, 0700 — a file there that is not its own is ignored) and the
+  next run restores it at its end.
 - A port of one of wwand's own modems is not a source here — that is a SIM
   sponsor (section 5).
 

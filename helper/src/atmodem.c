@@ -309,21 +309,68 @@ int atmodem_csim_answer(const char *line, unsigned char *resp, int cap)
  * until it is restored. A helper killed hard (SIGKILL, power loss on the SIM
  * host) cannot restore it, and the next start would read CFUN=4 as "how it
  * was" and never switch the radio back on: the file tells it otherwise. In
- * /tmp — a reboot of the SIM host restarts the modem anyway. */
+ * /tmp — a reboot of the SIM host restarts the modem anyway.
+ *
+ * Its second line is SENT to the modem (the network selection to restore),
+ * so it lives in a directory of our own — /tmp/rsim-card-<euid>, 0700 —
+ * and is believed only when that directory and the file are ours and
+ * writable by nobody else, opened without following a link. In /tmp itself
+ * anyone could plant it, or a link to a file of their choosing. Per euid: a
+ * SIM host where several users run rsim-card must not have one user's
+ * directory lock the others out. */
+static int mark_dir(char *out, size_t cap)
+{
+	struct stat st;
+
+	snprintf(out, cap, "/tmp/rsim-card-%u", (unsigned)geteuid());
+	if (mkdir(out, 0700) && errno != EEXIST)
+		return -1;
+	if (lstat(out, &st) || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 077)) {
+		errno = EPERM;
+		return -1;
+	}
+	return 0;
+}
+
+/* "" when the directory cannot be trusted: then nothing is read from it,
+ * and nothing is parked (the mode could not be kept) */
 static void mark_path(const char *dev, char *out, size_t cap)
 {
 	size_t o;
 	const char *p;
 
-	o = (size_t)snprintf(out, cap, "/tmp/rsim-card-cfun-");
+	if (mark_dir(out, cap)) {
+		out[0] = '\0';
+		return;
+	}
+	o = strlen(out);
+	o += (size_t)snprintf(out + o, cap - o, "/cfun-");
 	for (p = dev; *p && o + 1 < cap; p++)
 		out[o++] = (*p == '/') ? '_' : *p;
 	out[o] = '\0';
 }
 
+static FILE *mark_open(const char *path)
+{
+	struct stat st;
+	FILE *f;
+	int fd;
+
+	if (!path[0] || (fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)) < 0)
+		return NULL;
+	if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 022)) {
+		log_warn("%s: not ours, or writable by others — ignored", path);
+		close(fd);
+		return NULL;
+	}
+	if (!(f = fdopen(fd, "r")))
+		close(fd);
+	return f;
+}
+
 static int mark_read(const char *path)
 {
-	FILE *f = fopen(path, "r");
+	FILE *f = mark_open(path);
 	int v = -1;
 
 	if (f) {
@@ -337,7 +384,7 @@ static int mark_read(const char *path)
 /* what else the mark keeps: line 2, the network selection to restore */
 static void mark_read_cops(const char *path, char *out, size_t cap)
 {
-	FILE *f = fopen(path, "r");
+	FILE *f = mark_open(path);
 	/* the size of cops_restore: what it holds fits, anything longer is
 	 * not one of ours */
 	char line[128];
@@ -831,9 +878,12 @@ struct rsim_backend *atmodem_open(const struct at_cfg *cfg)
 			int mfd;
 
 			snprintf(tmp, sizeof(tmp), "%s.tmp", a->mark);
-			/* not through a link someone left in /tmp */
-			unlink(tmp);
-			mfd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+			/* not through a link someone left there */
+			if (a->mark[0])
+				unlink(tmp);
+			mfd = a->mark[0] ? open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600) : -1;
+			if (!a->mark[0])
+				errno = EPERM;
 			if (mfd >= 0 && !(m = fdopen(mfd, "w")))
 				close(mfd);
 			if (mfd >= 0 && m) {
@@ -844,7 +894,8 @@ struct rsim_backend *atmodem_open(const struct at_cfg *cfg)
 			}
 			if (!ok) {
 				log_err("%s: cannot keep the radio's mode in %s (%s); not switching it off",
-					cfg->dev, a->mark, strerror(errno));
+					cfg->dev, a->mark[0] ? a->mark : "/tmp/rsim-card-<uid> (not ours, or open to others)",
+					strerror(errno));
 				close(a->fd);
 				free(a);
 				return NULL;

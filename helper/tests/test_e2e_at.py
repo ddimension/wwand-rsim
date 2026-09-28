@@ -141,6 +141,14 @@ class FakeModem(threading.Thread):
                     self.answer(line)
 
 
+# where rsim-card keeps a lent modem's radio mode: a directory of its own
+MARKDIR = "/tmp/rsim-card-%d" % os.geteuid()
+
+
+def mark_of(slave):
+    return os.path.join(MARKDIR, "cfun-" + os.ttyname(slave).replace("/", "_"))
+
+
 class Rig:
     def __init__(self, args=(), reuse=None, premark=None, **modem):
         if reuse:
@@ -154,7 +162,8 @@ class Rig:
             self.modem.start()
         if premark is not None:
             # what a run before this one left: its mark file
-            with open("/tmp/rsim-card-cfun-" + os.ttyname(self.slave).replace("/", "_"), "w") as f:
+            os.makedirs(MARKDIR, mode=0o700, exist_ok=True)
+            with os.fdopen(os.open(mark_of(self.slave), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
                 f.write(premark)
         self.proc = subprocess.Popen(
             [BIN, "-v"] + list(args) + ["at:" + os.ttyname(self.slave)],
@@ -246,6 +255,46 @@ rig.ask({"op": "power_up"})
 rig.close()
 check(rig.modem.cops_set[-1:] == ["0"] and rig.modem.cops == "+COPS: 0",
       "an earlier run's mark: its selection comes back, not the COPS=2 it left (%r)" % rig.modem.cops_set)
+
+# --- the mark is believed only when it is ours --------------------------------------
+# Its second line is sent to the modem. A mark that is a link, or one others
+# may write, is ignored: with the modem off (CFUN=4) nothing is then taken as
+# "how it was", and nothing is sent at the end.
+bait = os.path.join(MARKDIR, "bait")
+with open(bait, "w") as f:
+    f.write("1\nAT+COPS=1,2,\"99999\"\n")
+for how in ("link", "open"):
+    rig = Rig(cfun=4, cops="+COPS: 2")
+    m = mark_of(rig.slave)
+    if how == "link":
+        os.symlink(bait, m)
+    else:
+        with open(m, "w") as f:
+            f.write("1\nAT+COPS=1,2,\"99999\"\n")
+        os.chmod(m, 0o666)
+    rig.ask({"op": "power_up"})
+    rig.close()
+    check(rig.modem.cfun == 4 and not any("99999" in c for c in rig.modem.cops_set),
+          "mark as a %s: not believed, nothing of it sent (cfun %d, %r)" % (how, rig.modem.cfun, rig.modem.cops_set))
+    if os.path.lexists(m):
+        os.unlink(m)
+os.unlink(bait)
+
+# ...nor kept in a directory others can write to: then the radio is not
+# switched off at all (its mode could not be kept safely)
+os.chmod(MARKDIR, 0o777)
+rig = Rig()
+rig.ask({"op": "power_up"}, timeout=10)
+try:
+    rig.proc.wait(10)
+except subprocess.TimeoutExpired:
+    rig.proc.stdin.close()                       # it lent the card: ends it
+    rig.proc.wait(20)
+err = rig.proc.stderr.read().decode(errors="replace")
+os.chmod(MARKDIR, 0o700)
+check(rig.proc.returncode == 1 and rig.modem.cfun == 1 and "cannot keep the radio's mode" in err,
+      "a mark directory open to others: not trusted, the modem not parked (%r)" % err[-200:])
+rig.modem.running = False
 
 # --- a modem that refuses COPS=2 is still parked ---------------------------------
 rig = Rig(cops_refuse=True)
@@ -405,9 +454,9 @@ up = rig.ask({"op": "power_up"})
 check(up and not up.get("ok") and up.get("error") == "no_card", "no card: power_up says no_card (%r)" % up)
 rig.close()
 
-for f in os.listdir("/tmp"):                     # the state files of these runs
-    if f.startswith("rsim-card-cfun-_dev_pts_"):
-        os.unlink(os.path.join("/tmp", f))
+for f in os.listdir(MARKDIR):                    # the state files of these runs
+    if f.startswith("cfun-_dev_pts_"):
+        os.unlink(os.path.join(MARKDIR, f))
 
 # --- the park is confirmed, like a QMI park ------------------------------------------
 rig = Rig()
