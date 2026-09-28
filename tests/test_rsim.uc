@@ -5,6 +5,7 @@
 'use strict';
 
 import * as uloop from 'uloop';
+import * as fs from 'fs';
 import * as struct from 'struct';
 import * as tlv from 'wwand.codec.tlv';
 import { eq, ok, done } from './lib/check.uc';
@@ -2028,6 +2029,51 @@ let donor_plugin = (o) => { let targets = {}; return rsim.create({
 	p.tick('m8', EXT);
 	run_for(20);
 	eq(radio, [ [ 'm8', false ] ], 'own park: registered on the remote card — not parked');
+}
+
+// --- the configuration is parsed once per change, not per question ---------------
+// radio_hold, the status row, the status op and the tick all resolve readers
+// and modems; a uci load for each was paid on every registration and every
+// second of LuCI's poll
+{
+	let t = { now: 1000 };
+	let loads = 0;
+	let file = sprintf('/tmp/rsim-test-network-%d', t.now);
+
+	fs.writefile(file, 'a');
+
+	let p = mk(fake_reader(card_model()), (ref, schema, cb) => cb(null, fake_client()), t, {
+		config_file: file,
+		readers: () => { loads++; return { sm: { type: 'phoenix', device: '/dev/ttyUSB9' } }; },
+		modem_sections: () => { loads++; return { m0: { rsim: 'sm' }, m1: {} }; },
+	});
+	let ext = { rsim: 'sm' };
+
+	for (let i = 0; i < 3; i++) {
+		p.radio_hold('m0', ext);
+		p.radio_hold('m1', {});
+		p.status('m0', ext);
+		p.ops.status('m0', ext, {}, () => null);
+		t.now++;
+	}
+	eq(loads, 2, 'config cache: many questions over seconds, the file unchanged — read once');
+
+	// uci commit: a new file renamed over the old one (a new inode), within
+	// the same second
+	fs.writefile(file + '.new', 'a');
+	fs.rename(file + '.new', file);
+	p.radio_hold('m0', ext);
+	eq(loads, 4, 'config cache: a commit — read again, even with the same size and second');
+	p.status('m0', ext);
+	eq(loads, 4, 'config cache: ...and then kept');
+
+	fs.unlink(file);
+	p.radio_hold('m0', ext);
+
+	let before = loads;
+
+	p.radio_hold('m0', ext);
+	ok(before > 4 && loads > before, 'config cache: no file to tell a change by — read every time');
 }
 
 done('test_rsim');

@@ -1504,50 +1504,51 @@ function create(deps)
 	let now = deps.now ?? (() => time());
 	let helper_path = () => deps.helper_path ?? helper_found();
 
-	// The named readers, read at most once a second: status() is what LuCI
-	// polls every second, per modem. Injectable for the tests.
-	// The modems' own rsim options (the wwand_modem sections), for the hold
-	// that must stand before any session does. Injectable for the tests.
-	let read_modems = deps.modem_sections ?? (() => {
+	// The named readers (wwand_simreader) and the modems' own rsim options
+	// (wwand_modem, for the hold that must stand before any session does),
+	// both from /etc/config/network — the same view of the config the daemon
+	// builds `ext` from (main.uc): LuCI's staged edits live in rpcd's
+	// per-session save directory, not here, so they are not seen until
+	// applied.
+	//
+	// Parsed again only when the file changed. radio_hold is asked on every
+	// registration and interface bring-up, status() is what LuCI polls every
+	// second per modem, and each resolves every modem's reader; a uci load
+	// per call was the price. `uci commit` writes a new file and renames it
+	// over the old one (uci file.c:792-822 uci_file_commit, uci 2025.12.02),
+	// so its inode changes with every commit — mtime alone
+	// has one-second steps and would miss a second commit within the same
+	// second. No stamp (the file missing): read every time.
+	// Injectable for the tests: readers, modem_sections, config_file.
+	let config_stamp = deps.config_stamp ?? (() => {
+		let st = fs.stat(deps.config_file ?? '/etc/config/network');
+
+		return st ? sprintf('%d/%d/%d', st.inode, st.mtime, st.size) : null;
+	});
+	let load_network = (type) => {
 		let out = {};
 		let c = libuci.cursor();
 
 		c.load('network');
-		c.foreach('network', 'wwand_modem', (sec) => { out[sec['.name']] = sec; });
+		c.foreach('network', type, (sec) => { out[sec['.name']] = sec; });
 
 		return out;
-	});
-	let modems_cache = null, modems_at = null;
-	let modem_sections = () => {
-		if (modems_at !== now()) {
-			modems_cache = read_modems();
-			modems_at = now();
+	};
+	let read_modems = deps.modem_sections ?? (() => load_network('wwand_modem'));
+	let read_readers = deps.readers ?? (() => load_network('wwand_simreader'));
+	let conf_cache = null, conf_stamp = null;
+	let conf = () => {
+		let st = config_stamp();
+
+		if (conf_cache == null || st == null || st !== conf_stamp) {
+			conf_cache = { modems: read_modems() ?? {}, readers: read_readers() ?? {} };
+			conf_stamp = st;
 		}
 
-		return modems_cache ?? {};
+		return conf_cache;
 	};
-
-	let read_readers = deps.readers ?? (() => {
-		let out = {};
-		// the same view of the config the daemon builds `ext` from
-		// (main.uc): LuCI's staged edits live in rpcd's per-session save
-		// directory, not here, so they are not seen until applied
-		let c = libuci.cursor();
-
-		c.load('network');
-		c.foreach('network', 'wwand_simreader', (sec) => { out[sec['.name']] = sec; });
-
-		return out;
-	});
-	let readers_cache = null, readers_at = null;
-	let readers = () => {
-		if (readers_at !== now()) {
-			readers_cache = read_readers();
-			readers_at = now();
-		}
-
-		return readers_cache ?? {};
-	};
+	let modem_sections = () => conf().modems;
+	let readers = () => conf().readers;
 
 	// ext -> { cfg } (null cfg: no remote SIM) or { error } for a modem that
 	// names a reader which is not there or cannot work
