@@ -27,8 +27,9 @@ Design notes: [docs/plan.md](docs/plan.md).
 
 ## Parts
 
-- `helper/` — `rsim-card`, the C helper that owns the reader and speaks one
-  JSON object per line on stdin/stdout.
+- `helper/` — `rsim-card`, the C helper that owns the reader (or is the
+  osmo-remsim client of a SIM bank, `rspro:`) and speaks one JSON object per
+  line on stdin/stdout.
 - `plugins/rsim.uc` — the wwand plugin: runs the helper, offers the card to the
   modem, serves its commands.
 - `ctl/rsim.uc` — `wwandctl rsim`: status, the modem firmware switches
@@ -476,6 +477,10 @@ this project:
 apk add rsim-card                     # opkg install rsim-card on older releases
 rsim-card wbsm:                       # try it: {"op":"power_up"} on stdin
 ```
+
+The same package carries the osmo-remsim client (`rspro:`), but that one
+runs on the router with the modem, which reaches the SIM bank itself — never
+on a SIM host over SSH (`rsim-card --serve` refuses it).
 
 Then on the router with the modem: `option rsim_reader
 ssh:<user>@<simhost>:wbsm:` (or a `wwand_simreader` with `host`), and the
