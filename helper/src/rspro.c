@@ -337,23 +337,29 @@ static int br_slot(struct br c, struct rspro_slot *s)
 	return 0;
 }
 
+/* ComponentIdentity { type, name, software [0], swVersion [1], ... }: the
+ * type and the name are mandatory */
 static int dec_identity(struct br c, struct rspro_pdu *p)
 {
 	struct br v;
 	uint8_t t;
 	int r;
+	bool type = false, name = false;
 
 	while ((r = br_next(&c, &t, &v)) == 1) {
-		if (t == 0x0A)
-			br_int(&v, &p->comp_type);
-		else if (t == 0x16)
+		if (t == 0x0A) {
+			if (br_int(&v, &p->comp_type))
+				return -1;
+			type = true;
+		} else if (t == 0x16) {
 			br_cstr(&v, p->comp_name, sizeof(p->comp_name));
-		else if (t == 0x80)
+			name = true;
+		} else if (t == 0x80)
 			br_cstr(&v, p->comp_software, sizeof(p->comp_software));
 		else if (t == 0x81)
 			br_cstr(&v, p->comp_version, sizeof(p->comp_version));
 	}
-	return r;
+	return (r < 0 || !type || !name) ? -1 : 0;
 }
 
 static int dec_data(const struct br *v, struct rspro_pdu *p)
@@ -365,32 +371,75 @@ static int dec_data(const struct br *v, struct rspro_pdu *p)
 	return 0;
 }
 
-/* TpduFlags: the second BOOLEAN is finalPart */
-static void dec_flags(struct br c, struct rspro_pdu *p)
+/* TpduFlags: four BOOLEANs, the second is finalPart */
+static int dec_flags(struct br c, struct rspro_pdu *p)
 {
 	struct br v;
 	uint8_t t;
-	int i = 0;
+	int i = 0, r;
 
-	while (br_next(&c, &t, &v) == 1)
-		if (t == 0x01 && i++ == 1)
-			p->final_part = v.n == 1 && v.p[0];
+	while ((r = br_next(&c, &t, &v)) == 1)
+		if (t == 0x01) {
+			if (v.n != 1)
+				return -1;
+			if (i++ == 1)
+				p->final_part = v.p[0];
+		}
+	return (r < 0 || i < 4) ? -1 : 0;
 }
 
-/* the fields of the alternative, by position and tag */
+/* IpPort { ip IpAddress CHOICE { ipv4 [0], ipv6 [1] }, port INTEGER } */
+static int dec_ipport(struct br c, struct rspro_pdu *p)
+{
+	struct br f;
+	uint8_t ft;
+	int r;
+	bool port = false;
+
+	while ((r = br_next(&c, &ft, &f)) == 1) {
+		if ((ft == 0x80 && f.n == 4) || (ft == 0x81 && f.n == 16)) {
+			memcpy(p->ip, f.p, f.n);
+			p->ip_len = f.n;
+		} else if (ft == 0x80 || ft == 0x81) {
+			return -1;
+		} else if (ft == 0x02) {
+			if (br_u16(&f, &p->port))
+				return -1;
+			port = true;
+		}
+	}
+	return (r < 0 || !p->ip_len || !port) ? -1 : 0;
+}
+
+/* the messages whose content is one ResultCode (and extensions) */
+static bool result_only(int msg)
+{
+	return msg == RSPRO_CREATE_MAPPING_RES || msg == RSPRO_REMOVE_MAPPING_RES ||
+	       msg == RSPRO_CONFIG_CLIENT_ID_RES || msg == RSPRO_CONFIG_CLIENT_BANK_RES ||
+	       msg == RSPRO_SET_ATR_RES || msg == RSPRO_RESET_STATE_RES;
+}
+
+/* The fields of the alternative, by position and tag. What a message must
+ * carry (asn1/RSPRO.asn: the fields without OPTIONAL) is required: a
+ * response without its result would otherwise read as one that did not
+ * refuse, a slot or an address that is missing as slot 0:0 or port 0. */
 static int dec_msg(struct br c, struct rspro_pdu *p)
 {
 	struct br v;
 	uint8_t t;
 	int seq = 0, r;
+	bool identity = false, flags = false, data = false, phys = false;
 
 	while ((r = br_next(&c, &t, &v)) == 1) {
 		switch (p->msg) {
 		case RSPRO_CONNECT_CLIENT_RES:
 		case RSPRO_CONNECT_BANK_RES:
-			if (t == 0x30 && dec_identity(v, p) < 0)
-				return -1;
-			if (t == 0x0A && br_int(&v, &p->result))
+			if (t == 0x30 && !identity) {
+				if (dec_identity(v, p) < 0)
+					return -1;
+				identity = true;
+			}
+			if (t == 0x0A && (p->result >= 0 || br_int(&v, &p->result)))
 				return -1;
 			break;
 		case RSPRO_CONFIG_CLIENT_ID_REQ:
@@ -401,24 +450,14 @@ static int dec_msg(struct br c, struct rspro_pdu *p)
 			}
 			break;
 		case RSPRO_CONFIG_CLIENT_BANK_REQ:
-			/* bankSlot BankSlot, bankd IpPort { ip CHOICE {ipv4 [0],
-			 * ipv6 [1]}, port INTEGER } */
+			/* bankSlot BankSlot, bankd IpPort */
 			if (t == 0x30 && seq == 0) {
 				if (br_slot(v, &p->bank))
 					return -1;
 				p->has_bank = true;
 			} else if (t == 0x30 && seq == 1) {
-				struct br f;
-				uint8_t ft;
-
-				while (br_next(&v, &ft, &f) == 1) {
-					if ((ft == 0x80 && f.n == 4) || (ft == 0x81 && f.n == 16)) {
-						memcpy(p->ip, f.p, f.n);
-						p->ip_len = f.n;
-					} else if (ft == 0x02 && br_u16(&f, &p->port)) {
-						return -1;
-					}
-				}
+				if (dec_ipport(v, p))
+					return -1;
 			}
 			if (t == 0x30)
 				seq++;
@@ -428,8 +467,10 @@ static int dec_msg(struct br c, struct rspro_pdu *p)
 				if (br_slot(v, &p->client))
 					return -1;
 				p->has_client = true;
-			} else if (t == 0x04 && dec_data(&v, p)) {
-				return -1;
+			} else if (t == 0x04 && !data) {
+				if (dec_data(&v, p))
+					return -1;
+				data = true;
 			}
 			break;
 		case RSPRO_TPDU_CARD_TO_MODEM:
@@ -450,9 +491,15 @@ static int dec_msg(struct br c, struct rspro_pdu *p)
 				else
 					p->has_client = true;
 			} else if (t == 0x30 && seq == 2 && p->msg != RSPRO_BANK_SLOT_STATUS_IND) {
-				dec_flags(v, p);
-			} else if (t == 0x04 && dec_data(&v, p)) {
-				return -1;
+				if (dec_flags(v, p))
+					return -1;
+				flags = true;
+			} else if (t == 0x30 && seq == 2) {
+				phys = true;
+			} else if (t == 0x04 && !data) {
+				if (dec_data(&v, p))
+					return -1;
+				data = true;
 			}
 			if (t == 0x30)
 				seq++;
@@ -461,10 +508,14 @@ static int dec_msg(struct br c, struct rspro_pdu *p)
 		case RSPRO_ERROR_IND:
 			/* sender, severity, code: three ENUMERATEDs in order */
 			if (t == 0x0A) {
+				int e;
+
+				if (br_int(&v, &e))
+					return -1;
 				if (seq == 1)
-					br_int(&v, &p->err_severity);
+					p->err_severity = e;
 				else if (seq == 2)
-					br_int(&v, &p->err_code);
+					p->err_code = e;
 				seq++;
 			} else if (t == 0x82) {
 				br_cstr(&v, p->err_string, sizeof(p->err_string));
@@ -478,7 +529,29 @@ static int dec_msg(struct br c, struct rspro_pdu *p)
 			break;
 		}
 	}
-	return r;
+	if (r < 0)
+		return -1;
+
+	switch (p->msg) {
+	case RSPRO_CONNECT_CLIENT_RES:
+	case RSPRO_CONNECT_BANK_RES:
+		return (identity && p->result >= 0) ? 0 : -1;
+	case RSPRO_CONFIG_CLIENT_ID_REQ:
+		return p->has_client ? 0 : -1;
+	case RSPRO_CONFIG_CLIENT_BANK_REQ:
+		return (p->has_bank && p->ip_len && seq >= 2) ? 0 : -1;
+	case RSPRO_SET_ATR_REQ:
+		return (p->has_client && data) ? 0 : -1;
+	case RSPRO_TPDU_CARD_TO_MODEM:
+	case RSPRO_TPDU_MODEM_TO_CARD:
+		return (p->has_bank && p->has_client && flags && data) ? 0 : -1;
+	case RSPRO_BANK_SLOT_STATUS_IND:
+		return (p->has_bank && p->has_client && phys) ? 0 : -1;
+	case RSPRO_ERROR_IND:
+		return (seq >= 3) ? 0 : -1;
+	default:
+		return (result_only(p->msg) && p->result < 0) ? -1 : 0;
+	}
 }
 
 int rspro_decode(const uint8_t *b, size_t n, struct rspro_pdu *p)
@@ -486,36 +559,41 @@ int rspro_decode(const uint8_t *b, size_t n, struct rspro_pdu *p)
 	struct br r = { b, n }, pdu, v, alt;
 	uint8_t t;
 	bool have_version = false, have_tag = false;
+	int rr;
 
 	memset(p, 0, sizeof(*p));
 	p->msg = -1;
 	p->result = -1;
 	p->comp_type = -1;
 	p->err_severity = p->err_code = -1;
-	if (br_next(&r, &t, &pdu) != 1 || t != 0x30)
+	/* one RsproPDU and nothing after it: a frame carries exactly one */
+	if (br_next(&r, &t, &pdu) != 1 || t != 0x30 || r.n)
 		return -1;
-	while (br_next(&pdu, &t, &v) == 1) {
+	while ((rr = br_next(&pdu, &t, &v)) == 1) {
 		if (t == 0x80) {
 			uint32_t u;
 
-			if (br_uint(&v, &u))
+			if (have_version || br_uint(&v, &u))
 				return -1;
 			p->version = u;
 			have_version = true;
 		} else if (t == 0x81) {
-			if (br_uint(&v, &p->tag))
+			if (have_tag || br_uint(&v, &p->tag))
 				return -1;
 			have_tag = true;
 		} else if (t == 0xA2) {
-			/* the explicit CHOICE wrapper: one alternative inside */
-			if (br_next(&v, &t, &alt) != 1 || (t & 0xE0) != 0xA0)
+			/* the explicit CHOICE wrapper: exactly one alternative */
+			if (p->msg >= 0 || br_next(&v, &t, &alt) != 1 || (t & 0xE0) != 0xA0 || v.n)
 				return -1;
 			p->msg = t & 0x1f;
 			if (dec_msg(alt, p) < 0)
 				return -1;
 		}
 	}
-	return (have_version && have_tag && p->msg >= 0) ? 0 : -1;
+	if (rr < 0 || !have_version || !have_tag || p->msg < 0)
+		return -1;
+	/* another version may mean other fields under the same tags */
+	return (p->version == RSPRO_VERSION) ? 0 : RSPRO_E_VERSION;
 }
 
 const char *rspro_msg_name(int msg)

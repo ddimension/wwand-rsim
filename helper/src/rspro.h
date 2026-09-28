@@ -127,8 +127,12 @@ struct rspro_pdu {
 	char err_string[256];
 };
 
+/* rspro_decode: a PDU of another RSPRO version (decoded as far as it went) */
+#define RSPRO_E_VERSION		-2
+
 /* 0 decoded (an unknown message decodes to its msg number and nothing
- * else), -1 malformed */
+ * else), -1 malformed — not BER, more or less than one PDU, a field a
+ * message must have missing — RSPRO_E_VERSION another version */
 int rspro_decode(const uint8_t *b, size_t n, struct rspro_pdu *p);
 
 /* The encoders write one RsproPDU into out and return its length, 0 when

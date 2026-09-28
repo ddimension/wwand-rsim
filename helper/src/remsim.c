@@ -262,8 +262,13 @@ static int conn_take(struct conn *c, struct rspro_pdu *p, const char *who)
 			ccm(c, pl, pln);
 			r = 0;
 		} else if (proto == IPA_PROTO_OSMO && ext == IPA_EXT_RSPRO) {
-			r = rspro_decode(pl, pln, p) ? -2 : 1;
-			if (r == -2)
+			int d = rspro_decode(pl, pln, p);
+
+			r = d ? -2 : 1;
+			if (d == RSPRO_E_VERSION)
+				log_warn("rspro: %s speaks RSPRO version %u, not %d — its %s skipped", who, p->version,
+					 RSPRO_VERSION, rspro_msg_name(p->msg));
+			else if (d)
 				log_warn("rspro: %s sent a PDU that does not decode (%zu bytes), skipped", who, pln);
 		} else {
 			r = 0;
@@ -417,7 +422,9 @@ static void on_server(struct rp *rp, const struct rspro_pdu *p)
 {
 	switch (p->msg) {
 	case RSPRO_CONNECT_CLIENT_RES:
-		rp->srv_result = p->result < 0 ? RSPRO_RES_OK : p->result;
+		/* the decoder has made sure there is one: an absent result
+		 * read as OK would take a refusal for an acceptance */
+		rp->srv_result = p->result;
 		snprintf(rp->srv_name, sizeof(rp->srv_name), "%s", p->comp_name);
 		snprintf(rp->srv_sw, sizeof(rp->srv_sw), "%s", p->comp_software);
 		snprintf(rp->srv_ver, sizeof(rp->srv_ver), "%s", p->comp_version);
@@ -480,7 +487,7 @@ static void on_bank(struct rp *rp, const struct rspro_pdu *p)
 {
 	switch (p->msg) {
 	case RSPRO_CONNECT_CLIENT_RES:
-		if (p->result > 0) {
+		if (p->result != RSPRO_RES_OK) {
 			log_warn("rspro: the bankd refused us: %s", rspro_result_name(p->result));
 			snprintf(rp->be.detail, sizeof(rp->be.detail), "bankd refused client %u:%u: %s",
 				 rp->cs.id, rp->cs.nr, rspro_result_name(p->result));

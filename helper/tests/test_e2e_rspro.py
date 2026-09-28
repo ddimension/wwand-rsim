@@ -223,7 +223,7 @@ class Server(Peer):
             self.conn.sendall(struct.pack(">HBB", 1, 0xFE, 0x00))  # a PING
             self.conn.sendall(struct.pack(">HBB", 1, 0xFE, 0x06))  # an ID_ACK: not to be answered
             self.conn.sendall(struct.pack(">HBBB", 2, 0xFE, 0x04, 0x01))  # ID_GET, unit name
-            self.send(3, identity(1, b"remsim-server") + integer(0x0A, self.result), tag)
+            self.send(3, identity(1, b"remsim-server") + (b"" if self.result is None else integer(0x0A, self.result)), tag)
             for b, c in self.maps.items():
                 if c == self.client:
                     self.config_bank(b)
@@ -387,7 +387,7 @@ check(any(c[:1] == b"\x05" and b"rsim-card\0" in c for c in server.ccm), "ID_GET
 check(not any(c[:1] == b"\x06" for c in server.ccm), "ID_ACK not answered (a client does not; two servers would loop)")
 check(getattr(server, "version", None) == 2, "RsproPDU version 2")
 check(bankd.got[0][0] == 2 and bankd.client == (5, 2), "ConnectClientReq to the bankd")
-check(14 in bankd.msgs(), "SetAtrReq answered")
+check(wait_for(lambda: 14 in bankd.msgs()), "SetAtrReq answered")  # the bankd thread reads it after our answer on stdout
 check(bankd.statuses == [], "first power_up: the ATR the bankd just sent, no reset pulse on top (%r)" % bankd.statuses)
 inf = h.info
 check(inf.get("backend") == "rspro" and inf.get("reader") == spec and inf.get("client") == "5:2"
@@ -472,6 +472,14 @@ server, bankd = world(result=6)
 h = Helper("rspro:127.0.0.1:%d" % server.port)
 rc = h.end()
 check(rc == 1 and "identityInUse" in h.err, "the server refuses the client: exit 1, and why (%r)" % h.err[-200:])
+
+# a ConnectClientRes without its result is not an acceptance
+server, bankd = world(result=None)
+h = Helper("rspro:127.0.0.1:%d" % server.port)
+r = h.ask({"op": "power_up"}, timeout=20)
+rc = h.end()
+check(rc == 1 and not (r or {}).get("ok") and "does not decode" in h.err,
+      "a ConnectClientRes without a result: not taken as accepted (%r, %r)" % (r, h.err[-200:]))
 
 server, bankd = world(maps={(1, 1): (9, 0)})
 h = Helper("rspro:127.0.0.1:%d/1:1" % server.port, "--rspro-rest-port", str(server.rest_port))

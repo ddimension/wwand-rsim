@@ -136,7 +136,13 @@ in an IPA frame (ip.access's multiplex header: u16 length, 0xEE, extension
 is answered as an IPA client does (libosmocore's ipa_ccm_rcvmsg_bts_base):
 PING with PONG, ID_GET with ID_RESP (unit name `rsim-card`), ID_ACK not at
 all — a server answers it, so two answering sides would never stop. `src/rspro.c` encodes and decodes by hand only what a client
-needs (the tests check it against hand-built BER). The session:
+needs (the tests check it against hand-built BER). A PDU is taken only
+whole: one RsproPDU and nothing after it, one version (2 — another is
+skipped with its number in the log), one tag, exactly one alternative, no
+element that does not parse, and every field the module does not mark
+OPTIONAL — a ConnectClientRes without its result is no acceptance, a
+ConfigClientBankReq without a port no mapping. Anything else is logged and
+skipped. The session:
 ConnectClientReq (identity + client id:slot) to the server (default port
 9998) → ConnectClientRes; the server's ConfigClientIdReq (it may reassign
 the client slot) and ConfigClientBankReq (bank id:slot + bankd ip:port; the
