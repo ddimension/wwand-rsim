@@ -739,6 +739,18 @@ static int rest_get(const char *host, uint16_t port, const char *path, char **bo
 	return n;
 }
 
+/* obj[key] as a 16-bit id or slot number: 0, or -1 when absent or out of
+ * range */
+static int u16_at(const char *body, const struct jtok *t, int n, int obj, const char *key, uint16_t *out)
+{
+	long v = jtok_long(body, t, jtok_get(body, t, n, obj, key), -1);
+
+	if (v < 0 || v > 65535)
+		return -1;
+	*out = (uint16_t)v;
+	return 0;
+}
+
 /* GET /api/backend/v1/slotmaps: {"slotmaps":[{"bank":{"bankId","slotNr"},
  * "client":{"clientId","slotNr"},"state"}]} into *out (the caller frees);
  * the count, -1 on failure */
@@ -762,10 +774,18 @@ static int get_slotmaps(const char *host, uint16_t port, struct slotmap **out,
 		for (i = 0, k = 0; i < t[arr].size; i++, e = jtok_skip(t, n, e)) {
 			int b = jtok_get(body, t, n, e, "bank"), c = jtok_get(body, t, n, e, "client");
 
-			m[k].bank.id = (uint16_t)jtok_long(body, t, jtok_get(body, t, n, b, "bankId"), 0);
-			m[k].bank.nr = (uint16_t)jtok_long(body, t, jtok_get(body, t, n, b, "slotNr"), 0);
-			m[k].client.id = (uint16_t)jtok_long(body, t, jtok_get(body, t, n, c, "clientId"), 0);
-			m[k].client.nr = (uint16_t)jtok_long(body, t, jtok_get(body, t, n, c, "slotNr"), 0);
+			/* An id that is missing or not 0..65535 is not a slot:
+			 * cast, 65536 would read as client 0 — our default
+			 * identity — and another client's mapping would be taken
+			 * as ours and deleted at the end. Such an entry is left
+			 * out. */
+			if (u16_at(body, t, n, b, "bankId", &m[k].bank.id) ||
+			    u16_at(body, t, n, b, "slotNr", &m[k].bank.nr) ||
+			    u16_at(body, t, n, c, "clientId", &m[k].client.id) ||
+			    u16_at(body, t, n, c, "slotNr", &m[k].client.nr)) {
+				log_warn("rspro: REST slotmaps: an entry without valid bank and client slots, left out");
+				continue;
+			}
 			jtok_str(body, t, jtok_get(body, t, n, e, "state"), m[k].state, sizeof(m[k].state));
 			k++;
 		}

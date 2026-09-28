@@ -184,7 +184,11 @@ per slot, `{"backend":"rspro","spec":"rspro:<server>/<bank>:<slot>",
 "bank","slot","name","bank_state","peer"}` plus `mapped_to` / `map_state`
 when it is mapped, then `{"done":true,"backends":"rspro","slots":N}` with an
 `error` when the server could not be asked. HTTP/1.0 and a small JSON token
-reader (`src/jtok.c`); no library.
+reader (`src/jtok.c`, RFC 8259's grammar checked: one root value, colons
+and commas in place, valid escapes and primitives, no control characters
+in strings); no library. A slotmap entry whose bank or client ids are
+missing or outside 0..65535 is left out — cut to 16 bits, client 65536
+would read as client 0, the default identity, and be deleted as ours.
 Written from the osmo-remsim sources, **not run against a real
 remsim-server or bankd yet** (2026-09-27); `tests/test_e2e_rspro.py`
 simulates both from the same reading.

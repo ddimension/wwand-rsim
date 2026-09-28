@@ -494,6 +494,14 @@ rc = h.end()
 check(rc == 1 and "in use by client 9 slot 0" in h.err and server.maps == {(1, 1): (9, 0)}
       and not server.deleted, "a slot mapped to another client: refused, left alone (%r)" % h.err[-200:])
 
+# a client id past 65535 is not client 0 (our default identity): not ours,
+# not deleted
+server, bankd = world(maps={(1, 1): (65536, 0)})
+h = Helper("rspro:127.0.0.1:%d/1:1" % server.port, "--rspro-rest-port", str(server.rest_port))
+rc = h.end()
+check(rc == 1 and not server.deleted and server.maps == {(1, 1): (65536, 0)},
+      "a slotmap with client 65536: not taken for client 0, left alone (%r, %r)" % (server.deleted, h.err[-200:]))
+
 # a slot already mapped to us (a run before that was killed): ours, removed at the end
 server, bankd = world(maps={(1, 1): (0, 0)})
 h = Helper("rspro:127.0.0.1:%d/1:1" % server.port, "--rspro-rest-port", str(server.rest_port))
