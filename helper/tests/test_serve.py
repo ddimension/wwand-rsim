@@ -119,6 +119,13 @@ with tempfile.TemporaryDirectory() as root:
     check(p.returncode == 0 and "8988" in p.stdout and "8949" not in p.stdout,
           "proxy --list for a key to one modem: that modem's card only (%r)" % p.stdout)
 
+    # a SIM bank: never over --serve, not even for an open key or one that
+    # names it — the SIM host would connect to any host and port it is told
+    for allow in ((), ("*",), ("rspro:*",), ("rspro:bank.lan/1:0",)):
+        p = serve("'rsim-card' 'rspro:bank.lan/1:0'", *allow)
+        check(p.returncode == 1 and "a SIM bank is reached directly, not over SSH" in p.stderr,
+              "rspro: refused by --serve (keys %r) (%r)" % (allow, p.stderr))
+
     p = serve("'rsim-card' 'at:%s' 'bt:00:11:22:33:44:55'" % TTY, "at:/dev/pts/*")
     check(p.returncode == 1 and "more than one reader" in p.stderr, "two readers: refused")
 
@@ -132,6 +139,13 @@ with tempfile.TemporaryDirectory() as root:
     p = serve("'wwandctl' 'rsim' 'proxy' 'iccid:89490200001022832490' '--mode' 'apdu'", "wwand:iccid:*")
     check(p.returncode == 0 and "wwandctl called: rsim proxy iccid:89490200001022832490 --mode apdu" in p.stdout,
           "the proxy of a wwand router: run (%r)" % (p.stdout + p.stderr))
+    # no proxy there: the package that has it is named (the plugin's scan
+    # tells a missing provider by it)
+    env = dict(base_env, RSIM_TEST_WWANDCTL=os.path.join(root, "nosuch"),
+               SSH_ORIGINAL_COMMAND="'wwandctl' 'rsim' 'proxy' 'm0'")
+    p = subprocess.run([BIN, "--serve"], input="", capture_output=True, text=True, timeout=30, env=env)
+    check(p.returncode == 1 and "is wwand-rsim-provider installed here?" in p.stderr,
+          "no wwandctl: names wwand-rsim-provider (%r)" % p.stderr)
     p = serve("'wwandctl' 'rsim' 'proxy' 'wwmodem1'", "wwand:wwmodem0")
     check(p.returncode == 1 and "wwand:wwmodem1" in p.stderr, "another modem there: refused")
     p = serve("'wwandctl' 'rsim' 'proxy' '--list'", "wwand:wwmodem0")

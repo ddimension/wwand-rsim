@@ -340,6 +340,13 @@ int serve_run(int nallow, char **allow)
 		}
 		if (!list && !spec)
 			return refuse("no reader", cmd);
+		/* A SIM bank is never served, whatever the key allows: its spec
+		 * names a host and a port, so the SIM host would connect wherever
+		 * the caller says, POST a slot mapping to that host's REST port and
+		 * relay the card of a bank the caller could not reach itself. The
+		 * plugin reaches a bank directly, never over SSH. */
+		if (!list && !strncmp(spec, "rspro:", 6))
+			return refuse("a SIM bank is reached directly, not over SSH", spec);
 		if (!list && !allowed(spec, nallow, allow))
 			return refuse("this reader is not served to this key", spec);
 		if (!list && !device_ok(spec))
@@ -394,7 +401,7 @@ int serve_run(int nallow, char **allow)
 			return list_filtered(argv, nallow, allow, wwandctl ? wwandctl : "/usr/bin/wwandctl");
 		}
 		execv(wwandctl ? wwandctl : "/usr/bin/wwandctl", argv);
-		fprintf(stderr, "rsim-card --serve: wwandctl: %s — is wwand-rsim installed here?\n", strerror(errno));
+		fprintf(stderr, "rsim-card --serve: wwandctl: %s — is wwand-rsim-provider installed here?\n", strerror(errno));
 		return 1;
 	}
 

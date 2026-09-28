@@ -190,8 +190,11 @@ so `at:/dev/ttyUSB*`, not `at:*`; no SPECs: any), `rsim-card --list`, or
 its `--list`). With SPECs, both lists are cut down to the rows they match (a
 modem's card also by `wwand:<modem>`). A reader that names a path must be a
 serial port under `/dev` (`tty*`, `rfcomm*`, `pts/*`) — rsim-card's AT and
-Phoenix backends refuse anything that is not a tty themselves. Only
-rsim-card's own options pass, spelled out. A second reader, `--serve` again,
+Phoenix backends refuse anything that is not a tty themselves. An `rspro:`
+reader is never served, whatever the SPECs say: its spec names a host and a
+port, so the SIM host would connect wherever the caller says, map a bank
+slot over that host's REST port and relay the card (a SIM bank is reached
+from the router directly). Only rsim-card's own options pass, spelled out. A second reader, `--serve` again,
 an option the proxy lacks, or anything else is refused with a message. `RSIM_TEST_SELF` /
 `RSIM_TEST_WWANDCTL`: what to exec instead, for the tests.
 

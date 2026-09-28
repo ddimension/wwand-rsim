@@ -213,7 +213,9 @@ readers listed (fnmatch patterns, where `*` does not cross a `/`:
 only — not the other cards of that machine, their ICCIDs and settings), and
 on a wwand router `wwandctl rsim proxy` for `wwand:<modem>` /
 `wwand:iccid:<ICCID>` targets listed — split into words and exec'd, never
-through a shell. Only rsim-card's own options pass. A reader that names a
+through a shell. Only rsim-card's own options pass. An `rspro:` reader is
+never served (it would make that machine connect to any host it is told);
+a SIM bank is reached from the router directly. A reader that names a
 path (`at:`, `phoenix:`) has to be, under `--serve`, a path under `/dev`
 that resolves to `/dev/tty*`, `/dev/rfcomm*` or `/dev/pts/*` and is a
 character device; rsim-card itself, `--serve` or not, opens only a serial
