@@ -209,6 +209,15 @@ const page = new Function('view', 'form', 'rpc', 'ui', 'fs', 'uci', 'dom', 'poll
 	const fbo = options['wwand_modem.rsim_fallback'];
 	ok(fbo && fbo.values.join(',') == ',local', 'form: the fallback, keep off (default) or the modem\'s own SIM');
 	ok(fbo && fbo.description.indexOf('over this modem\'s own connection') >= 0, 'form: ...with the WAN lockout explained');
+	ok(typeof fbo.validate == 'function' && fbo.validate('m0', '') === true && fbo.validate('m0', 'off') === true && fbo.validate('m0', 'local') === true
+	   && fbo.validate('m0', 'lokal') !== true, 'form: the fallback is off or local (empty: off)');
+	fbo.load('m2');
+	let dd = fbo.deps.filter((d) => d.rsim_reader)[0];
+	ok(dd && dd.rsim_reader.test('ssh:rsim@pc.lan:at:/dev/ttyUSB2') && !dd.rsim_reader.test('—') && fbo.deps.some((d) => d.rsim == 'phone'),
+	   'form: the fallback is shown for a reader spelled out with rsim_reader too, not only a named one');
+	conf.m0.rsim_fallback = 'off';
+	eq(fbo.cfgvalue ? fbo.cfgvalue('m0') : 'off', '', 'form: off spelled out is shown as the default');
+	delete conf.m0.rsim_fallback;
 
 	const rows = find(view.statusBox, (x) => x.tag == 'tr').slice(1);
 

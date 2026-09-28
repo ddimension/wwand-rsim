@@ -2268,6 +2268,82 @@ let tail_of = (r, n) => slice(r.order, n);
 	eq(r2.p.radio_hold('m0', LX), null, 'fallback local: ...and not held');
 }
 
+// --- review round 2 (Codex, 2026-09-28) ---------------------------------------------
+
+// the daemon exits with rsim_fallback local: the card goes, the radio is NOT
+// parked — nothing would wake it, and local promises the modem its own card
+{
+	let r = park_rig();
+	let LX = { ...EXT, rsim_fallback: 'local' };
+
+	r.up(LX);
+	let n = length(r.order);
+
+	r.p.stop();
+	run_for(50);
+	eq(tail_of(r, n), [ 'm0:3', 'm0:0' ], 'exit, fallback local: card removed, connection unavailable — the radio left on');
+}
+
+// a card that fails a reset while powered: held as well
+{
+	let r = park_rig();
+
+	r.up(EXT);
+	eq(r.p.radio_hold('m0', EXT), null, 'reset failed: in use first, free');
+	r.reader.card.present = false;
+	r.client.fire('CARD_RESET_IND', { slot: 1 });
+	run_for(20);
+	ok(index(r.p.radio_hold('m0', EXT) ?? '', 'cannot be powered') >= 0,
+	   'reset failed: powered, then a reset without an ATR — held (' + r.p.radio_hold('m0', EXT) + ')');
+	eq(r.p.radio_hold('m0', { ...EXT, rsim_fallback: 'local' }), null, 'reset failed: ...not with rsim_fallback local');
+	r.reader.card.present = true;
+	r.client.fire('CARD_RESET_IND', { slot: 1 });
+	run_for(20);
+	eq(r.p.radio_hold('m0', EXT), null, 'reset failed: the next reset works — free');
+}
+
+// the tick's own-card park: a modem that cannot be parked is not asked every
+// tick; a transient failure backs off
+{
+	let t = { now: 1000 };
+	let calls = 0;
+	let answer = { error: 'unsupported' };
+	let mods = { m9: { state: 'READY', lowpower_parked: false } };
+	let p = rsim.create({
+		log: (l, m) => null, sim_changed: () => null,
+		open_helper: fake_reader(card_model()).open_helper, helper_path: '/x',
+		modem_of: (ref) => ({ modem: mods[ref] }),
+		// no UIM Remote client: the session never starts, the hold stands
+		qmi_client: (ref, schema, cb) => cb({ error: 'service_unavailable' }), qmi_release: () => null,
+		modem_radio: (ref, on, cb) => { calls++; cb?.(answer); },
+		readers: () => ({}), now: () => t.now,
+	});
+
+	for (let i = 0; i < 4; i++) {
+		p.tick('m9', EXT);
+		run_for(10);
+		t.now += 30;
+	}
+	eq(calls, 1, 'own park: unsupported — asked once, not every tick');
+
+	mods.m9 = { state: 'READY', lowpower_parked: false };
+	p.tick('m9', EXT);
+	run_for(10);
+	eq(calls, 2, 'own park: ...asked again once the modem is a new object (restarted)');
+
+	answer = { error: 'timeout' };
+	mods.m9 = { state: 'READY', lowpower_parked: false };
+	p.tick('m9', EXT);
+	run_for(10);
+	p.tick('m9', EXT);
+	run_for(10);
+	eq(calls, 3, 'own park: a transient failure is not retried at once');
+	t.now += 11;
+	p.tick('m9', EXT);
+	run_for(10);
+	eq(calls, 4, 'own park: ...but after its backoff');
+}
+
 // --- two modems at one SIM bank: each needs its own client -----------------------
 // rsim-card announces client 0:0 unless told; two readers of one bank left at
 // that default are two names for ONE client at the server

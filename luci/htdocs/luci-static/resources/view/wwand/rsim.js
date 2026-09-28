@@ -546,11 +546,30 @@ return view.extend({
 		o.value('', _('Keep the radio off (default)'));
 		o.value('local', _('Use the modem\'s own SIM'));
 		o.optional = true;
+		/* with a named reader chosen, or a reader spelled out with
+		   rsim_reader: the "Set directly" field above carries it (a spec
+		   starts with its kind and a colon; that field shows a dash when a
+		   modem has none) */
+		var direct = uci.sections('network', 'wwand_modem').some(function(x) { return x.rsim_reader; });
 		o.load = function(sid) {
 			var names = uci.sections('network', 'wwand_simreader').map(function(r) { return r['.name']; });
+			var deps = names.map(function(n) { return { 'rsim': n }; });
 
-			this.deps = names.length ? names.map(function(n) { return { 'rsim': n }; }) : [ { 'rsim': '\u0000' } ];
+			if (direct)
+				deps.push({ 'rsim_reader': /^[a-z]+:/ });
+			this.deps = deps.length ? deps : [ { 'rsim': '\u0000' } ];
 			return form.ListValue.prototype.load.apply(this, [ sid ]);
+		};
+		/* `off` written by hand is the default, shown as such */
+		o.cfgvalue = function(sid) {
+			var v = uci.get('network', sid, 'rsim_fallback');
+
+			return (v == 'off') ? '' : v;
+		};
+		/* the plugin takes anything else as off, with a warning */
+		o.validate = function(sid, v) {
+			return (v == null || v == '' || v == 'off' || v == 'local') ? true
+				: _('Expecting off (keep the radio off) or local (the modem\'s own SIM)');
 		};
 
 		var view = this;

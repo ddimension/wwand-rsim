@@ -1783,7 +1783,9 @@ function create(deps)
 		let s = sessions[ref];
 		let name = rs.cfg.reader_name ?? rs.cfg.reader;
 
-		if (s && s.state == 'connected' && s.card_failed)
+		// a failed power-up or reset: the state stays what it was
+		// (`powered` after a failed reset), the card is gone all the same
+		if (s && (s.state == 'connected' || s.state == 'powered') && s.card_failed)
 			return sprintf('its remote SIM %s is connected, but its card cannot be powered (%s)', name, s.card_failed);
 
 		if (s && (s.state == 'connected' || s.state == 'powered'))
@@ -1803,6 +1805,9 @@ function create(deps)
 
 	// parks in flight (own_hold in tick), so a tick does not ask twice
 	let parking = {};
+	// per modem: a failed tick park — { modem (the object it failed on),
+	// fails, retry_at, unsupported }
+	let park_state = {};
 
 	// The radio of a modem whose remote SIM goes away, parked when it still
 	// runs — so it deregisters with the card that is leaving instead of
@@ -2300,10 +2305,11 @@ function create(deps)
 	// BEFORE it hears that the card goes (park_radio): without a fallback it
 	// stays off (own_hold); with rsim_fallback local the hold ends once the
 	// modem has let go, and the core wakes it on its own card. At the
-	// daemon's exit nothing wakes it: it stays off until the next start,
-	// whose init hold decides (off: until the remote card is connected;
-	// local: at once) — rather than dropping off the network with the card
-	// and registering on its own one unattended.
+	// daemon's exit nothing wakes it: without a fallback it stays off until
+	// the next start, whose init hold keeps it so until the remote card is
+	// connected — rather than dropping off the network with the card and
+	// registering on its own one unattended. With local, stop() passes no
+	// park: parked there it would stay off, which that option rules out.
 	stop_session = (s, polite, park) => {
 		if (sessions[s.ref] == s)
 			delete sessions[s.ref];
@@ -2440,7 +2446,17 @@ function create(deps)
 			// remote SIM configured while the modem is online, or one the
 			// modem let go of without registering anew, left it on its local
 			// card. Parked here; the core wakes it once the hold is gone.
-			if (deps.modem_radio && !parking[ref] && registered(ref)) {
+			// A modem that cannot be parked (`unsupported`: no set_opmode,
+			// an MBIM modem before wwand's MBIM backend has one) is not asked
+			// again every tick — only once it is a new modem object (a
+			// restart, an upgraded daemon). Other failures back off.
+			let pk = park_state[ref];
+
+			if (pk && pk.modem !== mo)
+				pk = park_state[ref] = null;
+
+			if (deps.modem_radio && !parking[ref] && registered(ref) && !pk?.unsupported
+			    && !(pk?.retry_at && now() < pk.retry_at)) {
 				let why = own_hold(ref, ext);
 
 				if (why) {
@@ -2448,8 +2464,27 @@ function create(deps)
 					log('notice', sprintf('rsim %s: registered on its own card although %s — switching its radio off', ref, why));
 					deps.modem_radio(ref, false, (e) => {
 						delete parking[ref];
-						if (e)
-							log('warn', sprintf('rsim %s: switching the radio off failed: %J', ref, e));
+
+						if (!e)
+							return delete park_state[ref];
+
+						let st = park_state[ref] ?? { modem: mo, fails: 0 };
+
+						st.modem = mo;
+						st.fails++;
+						park_state[ref] = st;
+
+						if (e?.error == 'unsupported') {
+							st.unsupported = true;
+							return log('warn', sprintf('rsim %s: its radio cannot be switched off here (%J) — it stays on its own card; not tried again until the modem restarts', ref, e));
+						}
+
+						let wait = BACKOFF_MIN;
+
+						for (let i = 1; i < st.fails && wait < BACKOFF_MAX; i++)
+							wait *= 2;
+						st.retry_at = now() + ((wait > BACKOFF_MAX) ? BACKOFF_MAX : wait);
+						log('warn', sprintf('rsim %s: switching the radio off failed: %J — trying again in %d s', ref, e, st.retry_at - now()));
 					});
 				}
 			}
@@ -3034,9 +3069,12 @@ function create(deps)
 					pending = true;
 				}
 
+			// With rsim_fallback local not parked: nothing is left to wake
+			// it once the daemon is gone, and the fallback promises the
+			// modem its own card whenever the remote one is not there.
 			for (let ref, s in sessions) {
 				pending = true;
-				stop_session(s, true, true);
+				stop_session(s, true, fallbacks[ref] != 'local');
 			}
 
 			return pending;

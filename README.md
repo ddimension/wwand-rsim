@@ -358,7 +358,7 @@ is held off — wwand refuses its interfaces (`radio_held`) and parks any
 registration of it — and it goes online once the modem has connected to
 the remote card. The same when the remote SIM fails, its reader is
 misconfigured, the modem lets go of it, or the modem is connected but the
-card cannot be powered (no ATR): the modem stays off rather than falling
+card cannot be powered (a power-up or reset without an ATR): the modem stays off rather than falling
 back to the card in its own slot. (A card the modem powers down and up
 again itself is not a reason: that is normal use.) The status page says
 why. The hold from the daemon's very first moment needs wwand with the
@@ -369,7 +369,11 @@ Whenever the remote card goes away while the modem runs on it — the reader
 fails, another reader is configured, `wwandctl rsim restart`, the daemon
 stops — its radio is switched off **before** the modem is told, so it
 leaves the network with that card instead of dropping off it. At the
-daemon's exit it stays off until the next start. Removing the remote SIM
+daemon's exit it stays off until the next start (with `rsim_fallback
+local`, below, it is not parked there: nothing would wake it). A modem
+whose radio cannot be switched off (`unsupported` — an MBIM modem with a
+wwand that cannot park it) is asked once, not every 10 s, until it
+restarts; other failures are retried with a backoff. Removing the remote SIM
 from the configuration is the exception: the modem is meant to have its own
 card back then.
 
@@ -379,7 +383,7 @@ modem runs on while its remote SIM is not connected:
 | Value | While the remote SIM is not connected |
 |---|---|
 | `off` (default) | nothing — the radio is held off as above |
-| `local` | the modem's own SIM; it switches to the remote card once that connects, and when that goes its radio is parked first, then it comes back on its own card |
+| `local` | the modem's own SIM; it switches to the remote card once that connects, and when that goes its radio is parked first, then it comes back on its own card (at the daemon's exit it is not parked) |
 
 `local` is for a remote SIM reached **over this modem's own connection** —
 a SIM bank (`rspro:`), a reader or another router over SSH (`ssh:`,
@@ -387,7 +391,8 @@ a SIM bank (`rspro:`), a reader or another router over SSH (`ssh:`,
 modem could never reach its remote SIM, and the router would be cut off
 for good. Any other value is taken as `off` and warned about in the log.
 `wwandctl rsim` and the status page show the mode in effect. LuCI: *Modems
-→ When the remote SIM is not connected*.
+→ When the remote SIM is not connected*, shown for a named reader and for
+one spelled out with `rsim_reader`.
 
 ## What works
 
