@@ -221,6 +221,28 @@ static void resync(struct at_backend *a)
 	a->dirty = true;	/* still not quiet: again before the next one */
 }
 
+/* A command or answer line for the debug log. AT+CSIM carries the APDU
+ * and +CSIM its answer — the PIN (VERIFY), authentication vectors, the
+ * card's files — so of those only the length (and the status word) goes in:
+ * a debug log is what gets shared for support. */
+static void log_at(const char *dir, const char *line)
+{
+	int n;
+
+	if (!strncmp(line, "AT+CSIM=", 8) && sscanf(line + 8, "%d", &n) == 1)
+		log_dbg("at%s AT+CSIM=%d,<%d bytes>", dir, n, n / 2);
+	else if (!strncmp(line, "+CSIM:", 6) && sscanf(line + 6, " %d", &n) == 1) {
+		size_t l = strlen(line);
+		const char *e = (l >= 5 && line[l - 1] == '"') ? line + l - 5 : NULL;
+
+		if (e && n >= 4)
+			log_dbg("at%s +CSIM: %d,<%d bytes> SW %.4s", dir, n, n / 2 - 2, e);
+		else
+			log_dbg("at%s +CSIM: %d,<…>", dir, n);
+	} else
+		log_dbg("at%s %s", dir, line);
+}
+
 /* Send one command and collect its answer. want: the prefix of the line to
  * keep (e.g. "+CSIM:"), copied into got; lines of other kinds (echo,
  * unsolicited results such as +QIND or RDY) are passed over. Returns RSIM_OK
@@ -249,7 +271,7 @@ static int at_cmd(struct at_backend *a, const char *cmd, const char *want, char 
 		resync(a);
 	tcflush(a->fd, TCIFLUSH);
 	a->rlen = 0;
-	log_dbg("at> %s", cmd);
+	log_at(">", cmd);
 	if (write_all(a->fd, cmd, strlen(cmd), deadline) < 0 || write_all(a->fd, "\r", 1, deadline) < 0) {
 		if (err && errcap)
 			snprintf(err, errcap, "write: %s", strerror(errno));
@@ -257,7 +279,7 @@ static int at_cmd(struct at_backend *a, const char *cmd, const char *want, char 
 	}
 
 	while ((r = read_line(a, line, sizeof(line), deadline)) == 1) {
-		log_dbg("at< %s", line);
+		log_at("<", line);
 		if (!strcmp(line, "OK"))
 			return RSIM_OK;
 		/* A phone whose application side filters the AT commands meant for

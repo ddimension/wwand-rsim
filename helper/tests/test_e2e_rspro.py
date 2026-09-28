@@ -420,6 +420,8 @@ check(r and r.get("ok") and wait_for(lambda: bankd.statuses[-2:] == [(True, True
       "power_up after power_down: a cold start signalled, RST pulse with VCC (%r)" % bankd.statuses)
 rc = h.end()
 check(rc == 0 and server.deleted == [(1, 1)] and not server.maps, "the end: unmapped (%r %r)" % (rc, server.deleted))
+check("INS A4" in h.err and "A0A40000023F00" not in h.err and "000102030405060708090A0B0C0D0E0F" not in h.err.upper(),
+      "debug log: INS and sizes, no command or answer bytes (%r)" % h.err[-400:])
 
 # --- the slot the spec names is taken away: mapped again ------------------------
 server, bankd = world()

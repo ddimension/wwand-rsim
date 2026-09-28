@@ -30,7 +30,7 @@ written against. The end-to-end test needs `python3` (standard library only).
 
 | Option | Default | |
 |---|---|---|
-| `-v` | | debug logging (stderr) |
+| `-v` | | debug logging (stderr): each command's INS and size and its status word, never the bytes of a command or an answer (PIN, authentication, the card's files) |
 | `-s` | | also log to syslog |
 | `--clock KHZ` | 3579 | the reader's card clock; baud = clock / 372 |
 | `--reset MODE` | `auto` | `rts`, `rts_inv`, `dtr`, `dtr_inv`; `auto` tries RTS, then inverted RTS, and keeps what answered |

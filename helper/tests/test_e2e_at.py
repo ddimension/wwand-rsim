@@ -220,6 +220,11 @@ log = [c for c in rig.modem.log if c.startswith(("AT+COPS", "AT+CFUN="))]
 check(log[:3] == ["AT+COPS?", "AT+COPS=2", "AT+CFUN=4"],
       "park: its network selection read, deregistered (COPS=2), THEN the radio off (%r)" % log)
 rig.close()
+# the debug log (-v) has no command or answer bytes: they carry the PIN,
+# authentication vectors, the card's files
+err = rig.proc.stderr.read().decode(errors="replace")
+check("AT+CSIM=14" in err and "00A40004023F00" not in err and '"6124"' not in err and "620000" not in err,
+      "debug log: AT+CSIM lengths and status words, no APDU bytes (%r)" % err[-400:])
 check(rig.modem.cfun == 1, "radio: back to the mode it had (CFUN=1) at the end")
 log = [c for c in rig.modem.log if c.startswith(("AT+COPS", "AT+CFUN="))]
 check(log[-2:] == ["AT+CFUN=1", "AT+COPS=0"] and rig.modem.cops == "+COPS: 0",
