@@ -457,6 +457,17 @@ function fake_ctx(start)
 	eq(ctl.proxy({}, [ '--list' ], noprov), 1, 'proxy --list without it: 1, no cards for another router');
 	eq([ length(out), length(calls) ], [ 0, 0 ], '...nothing written, wwand not asked');
 	eq(ctl.proxy({}, [ '--list' ], { ...sys, provider: { proxy: () => 7 } }), 7, 'proxy: handed to the provider module');
+
+	// "not installed" is the provider module itself missing — a module it
+	// needs that is missing is a broken installation, said as such
+	eq(ctl.provider((m) => die(sprintf("No module named '%s' could be found", m))), null,
+	   'provider: its own module absent — not installed');
+	let broken = null;
+
+	try { ctl.provider((m) => die("No module named 'wwand.nosuch' could be found")); }
+	catch (e) { broken = e.message; }
+	ok(index(broken ?? '', 'is installed but does not load') >= 0 && index(broken ?? '', 'wwand.nosuch') >= 0,
+	   'provider: a dependency inside it missing — installed but broken, not "install it"');
 	ok(index(ctl.ssh_diagnose([ 'wwandctl rsim proxy: wwand-rsim-provider is not installed here — this router\'s modem cards are not lent to other routers' ],
 	                          'root@r2', true) ?? '', 'apk add wwand-rsim-provider') >= 0,
 	   'ssh: a router without the provider — which package to install there');

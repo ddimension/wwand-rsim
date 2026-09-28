@@ -477,16 +477,22 @@ function lend_rows(call, sims)
 
 // the provider side, when its package is installed: null otherwise
 const PROVIDER_PKG = 'wwand-rsim-provider';
+const PROVIDER_MOD = 'wwand.ctl.rsim_provider';
 
-function provider()
+// `req` (tests) stands in for require
+function provider(req)
 {
 	try {
-		return require('wwand.ctl.rsim_provider');
+		return (req ?? require)(PROVIDER_MOD);
 	}
 	catch (e) {
 		// not installed is null; installed but broken (a failed upgrade)
-		// is that error, not "install it" advice
-		if (match(e?.message ?? '', /could be found|No module named/))
+		// is that error, not "install it" advice. Only the provider's OWN
+		// name counts: a module it needs that is missing raises the same
+		// words with that module's name (ucode's require, host build
+		// 2026-09), and "install wwand-rsim-provider" would then send the
+		// user to install what is already there.
+		if ((e?.message ?? '') == sprintf("No module named '%s' could be found", PROVIDER_MOD))
 			return null;
 		die(sprintf('wwandctl rsim: %s is installed but does not load: %s', PROVIDER_PKG, e?.message ?? e));
 	}
