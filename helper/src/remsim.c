@@ -483,6 +483,22 @@ static void on_server(struct rp *rp, const struct rspro_pdu *p)
 	}
 }
 
+/* A card message for another client or from another bank slot than the one
+ * the server mapped to us is not our card's: a bankd serving several slots
+ * that mixed them up would otherwise hand the modem another subscriber's
+ * ATR or answers. */
+static bool ours(struct rp *rp, const struct rspro_pdu *p, bool bank)
+{
+	if (!p->has_client || p->client.id != rp->cs.id || p->client.nr != rp->cs.nr ||
+	    (bank && (!p->has_bank || p->bank.id != rp->bs.id || p->bank.nr != rp->bs.nr))) {
+		log_warn("rspro: %s for client %u:%u, bank slot %u:%u — we are client %u:%u on bank slot %u:%u; not ours, dropped",
+			 rspro_msg_name(p->msg), p->client.id, p->client.nr, p->bank.id, p->bank.nr,
+			 rp->cs.id, rp->cs.nr, rp->bs.id, rp->bs.nr);
+		return false;
+	}
+	return true;
+}
+
 static void on_bank(struct rp *rp, const struct rspro_pdu *p)
 {
 	switch (p->msg) {
@@ -498,6 +514,11 @@ static void on_bank(struct rp *rp, const struct rspro_pdu *p)
 		rp->bank_ready = true;
 		break;
 	case RSPRO_SET_ATR_REQ:
+		/* SetAtrReq names only the client slot */
+		if (!ours(rp, p, false)) {
+			answer(&rp->bank, RSPRO_SET_ATR_RES, p->tag, RSPRO_RES_ILLEGAL_CLIENT_ID);
+			break;
+		}
 		if (!p->data_len || p->data_len > ATR_MAX) {
 			log_warn("rspro: the bankd sent an ATR of %zu bytes, not taken", p->data_len);
 			answer(&rp->bank, RSPRO_SET_ATR_RES, p->tag, RSPRO_RES_CARD_UNRESPONSIVE);
@@ -512,6 +533,10 @@ static void on_bank(struct rp *rp, const struct rspro_pdu *p)
 		answer(&rp->bank, RSPRO_SET_ATR_RES, p->tag, RSPRO_RES_OK);
 		break;
 	case RSPRO_TPDU_CARD_TO_MODEM:
+		/* dropped, the command still waiting: its timeout drops the
+		 * bankd link, which is what a bankd this confused needs */
+		if (!ours(rp, p, true))
+			break;
 		if (!rp->waiting) {
 			log_warn("rspro: an answer from the card nobody asked for, dropped");
 			break;

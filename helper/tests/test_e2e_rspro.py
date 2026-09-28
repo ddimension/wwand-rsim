@@ -170,14 +170,18 @@ class Bankd(Peer):
             self.client = slot_of(f[1][1])
             self.send(3, identity(2, b"bankd") + integer(0x0A, 0), tag)
             if self.s.get("atr", True):
-                self.send(13, slot(*self.client) + tlv(0x04, ATR))
+                self.send(13, slot(*(self.s.get("atr_client") or self.client)) + tlv(0x04, ATR))
         elif msg == 15:         # tpduModemToCard
             data = f[3][1]
             if self.s.get("silent"):
                 return
             flags = tlv(0x30, boolean(0x01, True) + boolean(0x01, True) + boolean(0x01, False) + boolean(0x01, False))
             resp = {"A0A40000023F00": "9F17", "00B0000010": bytes(range(16)).hex() + "9000"}.get(data.hex().upper(), "6D00")
-            self.send(16, slot(1, 1) + slot(*self.client) + flags + tlv(0x04, bytes.fromhex(resp)), tag)
+            # the slots it answers for: the mapping the server gave it,
+            # or a scripted wrong one
+            bank = self.s.get("tpdu_bank") or getattr(self, "bank", (1, 1))
+            client = self.s.get("tpdu_client") or self.client
+            self.send(16, slot(*bank) + slot(*client) + flags + tlv(0x04, bytes.fromhex(resp)), tag)
         elif msg == 17:         # clientSlotStatusInd
             st = dict(parse(f[2][1]))
             rst, vcc = st[0x80] != b"\x00", st[0x81] != b"\x00"
@@ -203,6 +207,7 @@ class Server(Peer):
     def config_bank(self, bank=None):
         if bank:
             ip, port = socket.inet_aton("127.0.0.1"), self.bankd.port
+            self.bankd.bank = bank
         else:
             bank, ip, port = (0, 0), b"\0\0\0\0", 0
         self.send(10, slot(*bank) + tlv(0x30, tlv(0x80, ip) + integer(0x02, port)))
@@ -518,6 +523,29 @@ h.end()
 check(subprocess.run([BIN, "rspro:host/1"], capture_output=True).returncode == 1, "a bad spec: exit 1")
 check(subprocess.run([BIN, "--rspro-client", "1:", "rspro:host"], capture_output=True).returncode == 2,
       "a bad --rspro-client: exit 2")
+
+# --- a card message for another client or bank slot is not ours ------------------
+server, bankd = world(maps={(1, 0): (0, 0)}, bankd={"atr_client": (7, 0)})
+h = Helper("rspro:127.0.0.1:%d" % server.port)
+r = h.ask({"op": "power_up"}, timeout=20)
+check(r and not r.get("ok"), "an ATR for another client: not taken (%r)" % r)
+h.end()
+check("not ours" in h.err, "...and said so (%r)" % h.err[-300:])
+
+server, bankd = world(maps={(1, 0): (0, 0)}, bankd={"tpdu_bank": (1, 5)})
+h = Helper("rspro:127.0.0.1:%d" % server.port)
+h.ask({"op": "power_up"})
+r = h.ask({"op": "tpdu", "data": "A0A40000023F00"}, timeout=35)
+check(r and not r.get("ok"), "an answer from another bank slot: not the card's answer (%r)" % r)
+h.end()
+check("not ours" in h.err, "...and said so (%r)" % h.err[-300:])
+
+server, bankd = world(maps={(1, 0): (0, 0)}, bankd={"tpdu_client": (9, 9)})
+h = Helper("rspro:127.0.0.1:%d" % server.port)
+h.ask({"op": "power_up"})
+r = h.ask({"op": "tpdu", "data": "A0A40000023F00"}, timeout=35)
+check(r and not r.get("ok"), "an answer for another client: not the card's answer (%r)" % r)
+h.end()
 
 # --- the server goes away: the helper ends --------------------------------------
 server, bankd = world(maps={(1, 0): (0, 0)})

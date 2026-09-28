@@ -148,7 +148,10 @@ ConnectClientReq (identity + client id:slot) to the server (default port
 the client slot) and ConfigClientBankReq (bank id:slot + bankd ip:port; the
 all-zero address when the mapping is removed; ResetStateReq drops it too)
 are answered `ok`; the client then connects to that bankd with its own
-ConnectClientReq and waits for SetAtrReq, the card's ATR. That connect does
+ConnectClientReq and waits for SetAtrReq, the card's ATR. A SetAtrReq for
+another client slot, or a TpduCardToModem from another bank slot or for
+another client than the mapping says, is not our card's: dropped (the ATR
+refused with `illegalClientId`) and logged. That connect does
 not block: it runs on while the helper serves (a bankd that drops SYNs
 would otherwise stall stdin and the server's PINGs), 5 s at most, retried
 every 5 s. power_up waits up to 10 s for the ATR (no mapping: `no_card`
