@@ -16,6 +16,10 @@ let rsim = require('wwand.plugins.rsim');
 // would look like a modem restarting on every look
 let modems_by_ref = {};
 let modem_obj = (ref) => (modems_by_ref[ref ?? '?'] ??= { state: 'READY' });
+// a modem using another's card, as the core leaves it before the card is in
+// use: parked at its registration (radio_hold), so not registered on its own
+let held_objs = {};
+let held_obj = (ref) => (ref == 'm0') ? (held_objs[ref] ??= { state: 'READY', lowpower_parked: true }) : modem_obj(ref);
 let M = rsim.UIMRMT.messages;
 
 uloop.init();
@@ -849,7 +853,7 @@ function sap_donor(log)
 	let radio = [], changed = [];
 	let donor = fake_client({ answer: (name) =>
 		(name == 'GET_ATR') ? { atr: rsim.bytes(ATR) } : (name == 'SEND_APDU') ? { response: rsim.bytes('9000') } : {} });
-	let mods = { m1: { state: 'READY', lowpower_parked: false } };
+	let mods = { m0: { state: 'READY', lowpower_parked: true }, m1: { state: 'READY', lowpower_parked: false } };
 	let p = rsim.create({
 		log: (l, m) => null,
 		sim_changed: (ref, why) => push(changed, [ ref, why ]),
@@ -1081,9 +1085,12 @@ let slots_242 = [
 let apdu_donor = () => fake_client({ answer: (name) =>
 	(name == 'GET_ATR') ? { atr: rsim.bytes(ATR) } : (name == 'SEND_APDU') ? { response: rsim.bytes('9000') } : {} });
 
-let donor_plugin = (o) => rsim.create({
+// the target m0 is held off its own card until the lent one is in use: the
+// core parked it at its registration, so the plugin has none to park
+let donor_plugin = (o) => { let targets = {}; return rsim.create({
 	log: (l, m) => null, sim_changed: () => null,
-	modem_of: (ref) => ({ modem: o.mods?.[ref] ?? modem_obj(ref) }),
+	modem_of: (ref) => ({ modem: o.mods?.[ref]
+		?? ((ref == 'm0') ? (targets[ref] ??= { state: 'READY', lowpower_parked: true }) : modem_obj(ref)) }),
 	qmi_client: o.qmi_client ?? ((ref, schema, cb) => cb(null, (ref == 'm1') ? o.donor : o.target)),
 	qmi_release: () => null,
 	modem_radio: (ref, on, cb) => { push(o.radio ?? [], [ ref, on ]); if (o.mods?.[ref]) o.mods[ref].lowpower_parked = !on; cb?.(null); },
@@ -1091,7 +1098,7 @@ let donor_plugin = (o) => rsim.create({
 	modem_sections: o.modem_sections ?? (() => ({})),
 	pid_alive: o.pid_alive,
 	now: () => o.t.now,
-});
+}); };
 
 {
 	let t = { now: 1000 };
@@ -1170,7 +1177,11 @@ let donor_plugin = (o) => rsim.create({
 	   'SAP: a link from before is ended at once, then connected anew');
 	eq(radio, [ [ 'm1', false ] ], 'SAP: the sponsor is parked too — its recovery must not reset it over the lost card');
 	eq(p.radio_hold('m1', {}), 'its card is lent to m0', 'radio hold: an ifup on the sponsor must not wake it');
-	eq(p.radio_hold('m0', {}), null, 'radio hold: ...the modem using the card is free');
+	eq(p.radio_hold('m0', ext), 'its remote SIM modem:m1 is not connected yet',
+	   'radio hold: ...the modem using the card is held too, until the modem has taken it');
+	target.fire('CONNECT_IND', { slot: 1 });
+	run_for(20);
+	eq(p.radio_hold('m0', ext), null, 'radio hold: ...and free once it has');
 
 	// woken behind the plugin's back: parked again on the next tick
 	mods.m1.lowpower_parked = false;
@@ -1311,7 +1322,7 @@ let donor_plugin = (o) => rsim.create({
 	let target = fake_client();
 	let donor = apdu_donor();
 	let radio = [];
-	let mods = { m0: { state: 'READY' }, m1: { state: 'INIT_SERVICES', lowpower_parked: false } };
+	let mods = { m0: { state: 'READY', lowpower_parked: true }, m1: { state: 'INIT_SERVICES', lowpower_parked: false } };
 	let p = donor_plugin({ t: t, donor: donor, target: target, radio: radio, mods: mods });
 	let ext = { rsim_reader: 'modem:m1', rsim_donor_mode: 'apdu' };
 
@@ -1377,7 +1388,7 @@ let donor_plugin = (o) => rsim.create({
 
 	let p = rsim.create({
 		log: (l, m) => null, sim_changed: () => null,
-		modem_of: (ref) => ({ modem: modem_obj(ref) }),
+		modem_of: (ref) => ({ modem: held_obj(ref) }),
 		qmi_client: (ref, schema, cb) => cb(null, (ref == 'm1') ? donor : fake_client()),
 		qmi_release: () => null,
 		modem_radio: (ref, on, cb) => { push(order, sprintf('%s radio %s', ref, on ? 'on' : 'off')); cb?.(null); },
@@ -1402,7 +1413,7 @@ let donor_plugin = (o) => rsim.create({
 		: (name == 'SAP_CONNECTION') ? { state: 0 } : {} });
 	let p = rsim.create({
 		log: (l, m) => null, sim_changed: () => null,
-		modem_of: (ref) => ({ modem: modem_obj(ref) }),
+		modem_of: (ref) => ({ modem: held_obj(ref) }),
 		qmi_client: (ref, schema, cb) => cb(null, (ref == 'm1') ? donor : fake_client()),
 		qmi_release: () => null,
 		modem_radio: (ref, on, cb) => { push(radio, [ ref, on ]); cb?.(null); },
@@ -1511,7 +1522,7 @@ let donor_plugin = (o) => rsim.create({
 	let radio = [], pending = null;
 	let p = rsim.create({
 		log: (l, m) => null, sim_changed: () => null,
-		modem_of: (ref) => ({ modem: modem_obj(ref) }),
+		modem_of: (ref) => ({ modem: held_obj(ref) }),
 		qmi_client: (ref, schema, cb) => cb(null, (ref == 'm1') ? donor : target),
 		qmi_release: () => null,
 		modem_radio: (ref, on, cb) => { push(radio, [ ref, on ]); if (on) cb?.(null); else pending = cb; },
@@ -1576,7 +1587,7 @@ let donor_plugin = (o) => rsim.create({
 	} });
 	let p = rsim.create({
 		log: (l, m) => null, sim_changed: (ref, why) => push(changed, ref),
-		modem_of: (ref) => ({ modem: modem_obj(ref) }),
+		modem_of: (ref) => ({ modem: held_obj(ref) }),
 		qmi_client: (ref, schema, cb) => cb(null, (ref == 'm1') ? donor : target),
 		qmi_release: () => null,
 		// answered later, like the real one: the window the second report
@@ -1694,11 +1705,13 @@ let donor_plugin = (o) => rsim.create({
 	let p = donor_plugin({ t: t, target: fake_client(), donor: apdu_donor(), modem_sections: () => secs });
 
 	eq(p.radio_hold('m1', {}), 'it is the SIM sponsor of m0', 'config hold: the sponsor is held with no session yet');
-	eq(p.radio_hold('m0', {}), null, 'config hold: the modem using the card is not');
+	eq(p.radio_hold('m0', secs.m0), 'its remote SIM modem:m1 is not connected yet',
+	   'config hold: the modem using the card is held as well — not on its own card either');
 
 	secs = { m0: {}, m1: {} };
 	t.now++;
 	eq(p.radio_hold('m1', {}), null, 'config hold: configured away, the hold goes');
+	eq(p.radio_hold('m0', secs.m0), null, 'config hold: ...for both');
 }
 
 // --- the AT init step that allows a Qualcomm modem to lend its card over SAP --------
@@ -1932,6 +1945,89 @@ let donor_plugin = (o) => rsim.create({
 	eq(filter(radio, (x) => x[0] == 'held')[0][1], 'its card is lent to 10.0.0.2', 'proxy+plugin: the radio held meanwhile');
 	eq(p.radio_hold('m1', {}), null, 'proxy+plugin: ...and free afterwards');
 	ok(length(filter(radio, (x) => x[0] == 'm1' && x[1])), 'proxy+plugin: the radio woken at the end');
+}
+
+// a modem with a remote SIM assigned does not run on its local card: its radio
+// is held until the modem has taken the remote one, and again once it lets go
+{
+	let t = { now: 1000 };
+	let reader = fake_reader(card_model());
+	let client = fake_client();
+	let p = mk(reader, (ref, schema, cb) => cb(null, client), t, { readers: () => ({}) });
+
+	eq(p.radio_hold('m7', EXT), 'its remote SIM phoenix:/dev/ttyUSB0 is not connected yet',
+	   'own hold: held from the start, before any session');
+	eq(p.radio_hold('m7', {}), null, 'own hold: a modem without a remote SIM is not');
+	eq(p.radio_hold('m7', { rsim: 'nosuch' }), 'its remote SIM cannot be used (SIM reader nosuch: not defined)',
+	   'own hold: a reader that cannot work holds it too — it must not fall back to its own card');
+
+	p.tick('m7', EXT);
+	run_for(20);
+	ok(p.radio_hold('m7', EXT) != null, 'own hold: offered, not yet taken — still held');
+
+	client.fire('CONNECT_IND', { slot: 1 });
+	run_for(20);
+	eq(p.radio_hold('m7', EXT), null, 'own hold: the modem took the remote card — its radio is free');
+
+	client.fire('DISCONNECT_IND', { slot: 1 });
+	run_for(20);
+	ok(p.radio_hold('m7', EXT) != null, 'own hold: it let go (back on its local card) — held again');
+}
+
+// ...a reader spelled wrongly is still a remote SIM assigned: held, and said
+{
+	let t = { now: 1000 };
+	let p = mk(fake_reader(card_model()), (ref, schema, cb) => cb(null, fake_client()), t, { readers: () => ({}) });
+	let bad = { rsim_reader: '/dev/ttyUSB0' };
+
+	eq(p.radio_hold('m7', bad), 'its remote SIM cannot be used (/dev/ttyUSB0 is not a reader)',
+	   'own hold: an unusable rsim_reader holds the radio — it must not fall back to its own card');
+	eq(p.status('m7', bad), { label: 'remote SIM',
+	                          text: 'its remote SIM cannot be used (/dev/ttyUSB0 is not a reader) — radio off', level: 'error' },
+	   'own hold: ...and the status says why the radio is off');
+	eq(p.radio_hold('m7', { rsim_reader: '' }), null, 'own hold: an empty one is none');
+}
+
+// ...a modem registered on its own card although held — a remote SIM configured
+// while it is online, or one it let go of — is parked by the plugin: the core
+// parks only at a NEW registration or an interface bring-up
+{
+	let t = { now: 1000 };
+	let radio = [];
+	let mods = { m8: { state: 'READY', lowpower_parked: false } };
+	let client = fake_client();
+	let p = rsim.create({
+		log: (l, m) => null, sim_changed: () => null,
+		open_helper: fake_reader(card_model()).open_helper, helper_path: '/x',
+		modem_of: (ref) => ({ modem: mods[ref] ?? modem_obj(ref) }),
+		qmi_client: (ref, schema, cb) => cb(null, client), qmi_release: () => null,
+		modem_radio: (ref, on, cb) => { push(radio, [ ref, on ]); mods[ref].lowpower_parked = !on; cb?.(null); },
+		readers: () => ({}), now: () => t.now,
+	});
+
+	p.tick('m8', {});
+	run_for(20);
+	eq(radio, [], 'own park: no remote SIM, nothing parked');
+
+	p.tick('m8', EXT);
+	run_for(20);
+	eq(radio, [ [ 'm8', false ] ], 'own park: registered on its own card with a remote SIM assigned — parked');
+	ok(index(p.status('m8', EXT).text, 'radio off until it is in use') >= 0, 'own park: the status row says so');
+
+	p.tick('m8', EXT);
+	run_for(20);
+	eq(radio, [ [ 'm8', false ] ], 'own park: once, not on every tick');
+
+	client.fire('CONNECT_IND', { slot: 1 });
+	run_for(20);
+	eq(p.radio_hold('m8', EXT), null, 'own park: the modem took the remote card — the core may wake it');
+	eq(index(p.status('m8', EXT).text, 'radio off') < 0, true, 'own park: ...and the status no longer says off');
+
+	// woken and registered on the remote card: left alone
+	mods.m8.lowpower_parked = false;
+	p.tick('m8', EXT);
+	run_for(20);
+	eq(radio, [ [ 'm8', false ] ], 'own park: registered on the remote card — not parked');
 }
 
 done('test_rsim');

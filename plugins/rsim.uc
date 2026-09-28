@@ -1670,6 +1670,47 @@ function create(deps)
 		return null;
 	};
 
+	// null, or why a modem with a remote SIM assigned must stay off the card
+	// in its own slot: it runs on the remote card or not at all — until the
+	// modem has taken that card (CONNECT_IND), also when the remote SIM
+	// failed, its reader cannot work, or the modem let go of it (it falls
+	// back to the local card then). No session yet is not connected: the
+	// hold stands from the daemon's first moment.
+	let own_hold = (ref, ext) => {
+		let rs = resolve(ext);
+
+		if (rs.error)
+			return sprintf('its remote SIM cannot be used (%s)', rs.error);
+
+		// spelled wrongly is still assigned: not a reason to use the local card
+		if (!rs.cfg) {
+			let r = ext?.rsim_reader;
+
+			return (type(r) == 'string' && length(r))
+				? sprintf('its remote SIM cannot be used (%s is not a reader)', r) : null;
+		}
+
+		let s = sessions[ref];
+
+		if (s && (s.state == 'connected' || s.state == 'powered'))
+			return null;
+
+		let name = rs.cfg.reader_name ?? rs.cfg.reader;
+		let n = notes[ref] ?? {};
+
+		if (!s && n.hold)
+			return sprintf('its remote SIM %s failed (%s) and is not retried until the configuration changes or `wwandctl rsim restart`',
+				name, n.last_error ?? '?');
+
+		if (!s && n.conflict)
+			return sprintf('its remote SIM %s is not used: %s', name, n.conflict);
+
+		return sprintf('its remote SIM %s is not connected yet', name);
+	};
+
+	// parks in flight (own_hold in tick), so a tick does not ask twice
+	let parking = {};
+
 	let stop_session;
 
 	let new_session = (ref, cfg) => ({
@@ -2229,6 +2270,25 @@ function create(deps)
 					l.card.check();
 			}
 
+			// Held off its own card (own_hold) but registered on it: the core
+			// parks only at a new registration or an interface bring-up, so a
+			// remote SIM configured while the modem is online, or one the
+			// modem let go of without registering anew, left it on its local
+			// card. Parked here; the core wakes it once the hold is gone.
+			if (deps.modem_radio && !parking[ref] && registered(ref)) {
+				let why = own_hold(ref, ext);
+
+				if (why) {
+					parking[ref] = true;
+					log('notice', sprintf('rsim %s: registered on its own card although %s — switching its radio off', ref, why));
+					deps.modem_radio(ref, false, (e) => {
+						delete parking[ref];
+						if (e)
+							log('warn', sprintf('rsim %s: switching the radio off failed: %J', ref, e));
+					});
+				}
+			}
+
 			// a hold is for the configuration that failed; a changed one
 			// (another slot, another mode) is tried afresh
 			if (!s && notes[ref]?.hold && (!cfg || notes[ref].hold_key != sprintf('%J', cfg)))
@@ -2358,7 +2418,8 @@ function create(deps)
 		},
 
 		// Why a modem's radio must stay off (plugins.uc radio_hold): it lends
-		// its card, and an interface bring-up must not switch it back on.
+		// its card, or waits for its remote one — and an interface bring-up
+		// must not switch it back on.
 		radio_hold: (ref, ext) => {
 			for (let other, os in sessions)
 				if (os.state != 'failed' && os.cfg.donor?.ref == ref)
@@ -2390,7 +2451,9 @@ function create(deps)
 					return sprintf('it is the SIM sponsor of %s', other);
 			}
 
-			return null;
+			// ...and a modem waiting for its own remote SIM: else it
+			// registers, and dials, with the card in its own slot
+			return own_hold(ref, ext);
 		},
 
 		// Where the modem's active card really is (plugins.uc card_source),
@@ -2436,8 +2499,12 @@ function create(deps)
 					                           ? ' — but it is registered on the network: its radio must stay off (take its interfaces down)' : '') };
 				}
 
-			if (!cfg)
-				return null;
+			// assigned but spelled wrongly: the radio is held, so say why
+			if (!cfg) {
+				let why = own_hold(ref, ext);
+
+				return why ? { label: 'remote SIM', text: why + ' — radio off', level: 'error' } : null;
+			}
 
 			let s = sessions[ref];
 			let n = notes[ref] ?? {};
@@ -2450,19 +2517,23 @@ function create(deps)
 				connected: 'modem connected, card not powered', powered: 'in use by the modem',
 			};
 
+			// the modem is held off its own card until the remote one is in
+			// use (own_hold): the row says so, the interfaces only fail
+			let off = own_hold(ref, ext) ? ' · radio off until it is in use' : '';
+
 			if (s && s.state != 'failed')
 				return { label: 'remote SIM',
-				         text: sprintf('%s · %s%s', name, what[s.state] ?? s.state,
-				                       s.apdus ? sprintf(' · %d commands', s.apdus) : ''),
+				         text: sprintf('%s · %s%s%s', name, what[s.state] ?? s.state,
+				                       s.apdus ? sprintf(' · %d commands', s.apdus) : '', off),
 				         level: (s.state == 'powered') ? 'ok' : 'warn' };
 
 			if (n.last_error)
 				return { label: 'remote SIM',
-				         text: sprintf('%s · %s%s', name, n.last_error,
-				                       (n.retry_at && n.retry_at > now()) ? sprintf(' (retry in %d s)', n.retry_at - now()) : ''),
+				         text: sprintf('%s · %s%s%s', name, n.last_error,
+				                       (n.retry_at && n.retry_at > now()) ? sprintf(' (retry in %d s)', n.retry_at - now()) : '', off),
 				         level: 'error' };
 
-			return { label: 'remote SIM', text: sprintf('%s · waiting to start', name), level: 'warn' };
+			return { label: 'remote SIM', text: sprintf('%s · waiting to start%s', name, off), level: 'warn' };
 		},
 
 		ops: {
@@ -2735,7 +2806,11 @@ function create(deps)
 					reader_name: cfg?.reader_name ?? ext?.rsim ?? null,
 					reader: cfg?.reader ?? null,
 					conflict: n.conflict ?? null,
-					config_error: rs.error ?? null,
+					// a reader that cannot work, named or spelled out
+					config_error: rs.error ?? (cfg ? null : own_hold(ref, ext)),
+					// the modem is held off its own card until the remote one
+					// is in use: its radio is off meanwhile
+					radio_held: !!own_hold(ref, ext),
 					slot: cfg?.slot ?? null,
 					state: s?.state ?? (cfg ? 'idle' : 'off'),
 					atr: s?.atr ?? null,

@@ -152,7 +152,7 @@ const page = new Function('view', 'form', 'rpc', 'ui', 'fs', 'uci', 'dom', 'poll
 		      atr: '3B9F', apdus: 12, last_sw: '9000', since: 900, now: 1000, lendable: false, lend_why: 'this modem uses a remote card itself' },
 		m1: { enabled: false, now: 1000, lent_to: { to: '10.0.0.2', remote: true, mode: 'sap', commands: 5, since: 940 }, lendable: false, lend_why: 'its card is lent to 10.0.0.2' },
 		m2: { enabled: true, reader: 'ssh:rsim@pc.lan:at:/dev/ttyUSB2', slot: 1, state: 'failed', last_error: 'no card', retry_at: 1030, now: 1000,
-		      lend_hold: true, lendable: false },
+		      lend_hold: true, radio_held: true, lendable: false },
 	};
 
 	ubus.status = () => status;
@@ -185,6 +185,12 @@ const page = new Function('view', 'form', 'rpc', 'ui', 'fs', 'uci', 'dom', 'poll
 	ok(st.indexOf('lent to 10.0.0.2 (another router)') >= 0 && st.indexOf('5 commands') >= 0, 'status: a card lent to another router');
 	ok(st.indexOf('no card (retry in 30 s)') >= 0, 'status: an error and when it is tried again');
 	ok(st.indexOf('lending stopped here') >= 0, 'status: lending stopped');
+	ok(st.indexOf('radio off until the remote SIM is in use') >= 0, 'status: a modem waiting for its remote SIM is held off its own');
+	ok(st.split('radio off until').length == 2, 'status: ...only that one, not the one whose remote SIM is in use');
+	view.renderStatus({ modems: [ 'm3' ], st: [ { enabled: false, config_error: 'its remote SIM cannot be used (x is not a reader)', radio_held: true, now: 1000 } ], info: status });
+	ok(text(view.statusBox).indexOf('x is not a reader') >= 0 && text(view.statusBox).indexOf('radio off') >= 0,
+	   'status: a reader that cannot work — the error, and the radio off');
+	view.renderStatus(data);
 	ok(st.indexOf('not lendable: this modem uses a remote card itself') >= 0, 'status: why a card cannot be lent');
 
 	const rows = find(view.statusBox, (x) => x.tag == 'tr').slice(1);

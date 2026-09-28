@@ -29,6 +29,11 @@ let prov = require('wwand.ctl.rsim_provider');
 	eq(ctl.status_lines({ enabled: true, reader: 'pcsc:0', slot: 1, state: 'idle',
 	                      last_error: 'no card', retry_at: 130, now: 100 })[1],
 	   [ 'last error', 'no card (retry in 30 s)' ], 'status: the error and when it tries again');
+	eq(ctl.status_lines({ enabled: true, reader: 'pcsc:0', slot: 1, state: 'waiting', radio_held: true })[1],
+	   [ 'radio', 'off until the remote SIM is in use — the modem does not use its own SIM' ],
+	   'status: a modem waiting for its remote SIM is held off its own');
+	eq(ctl.status_lines({ config_error: 'its remote SIM cannot be used (x is not a reader)', radio_held: true })[1][0], 'radio',
+	   'status: ...also when its reader cannot work');
 }
 
 {

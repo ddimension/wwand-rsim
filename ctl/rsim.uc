@@ -121,8 +121,11 @@ function status_lines(st)
 	if (st.lend_hold)
 		push(lend, [ 'lending', 'stopped here (`wwandctl rsim MODEM lend-allow` allows it again)' ]);
 
+	// held off its own card meanwhile: the plugin's radio_hold
+	let radio = st.radio_held ? [ [ 'radio', 'off until the remote SIM is in use — the modem does not use its own SIM' ] ] : [];
+
 	if (st.config_error)
-		return [ [ 'remote SIM', st.config_error ], ...lend ];
+		return [ [ 'remote SIM', st.config_error ], ...radio, ...lend ];
 
 	if (!st.enabled)
 		return [ [ 'remote SIM', 'not configured on this modem (option rsim, or rsim_reader)' ], ...lend ];
@@ -155,6 +158,8 @@ function status_lines(st)
 		push(out, [ 'last error', (st.retry_at != null && st.now != null && st.retry_at > st.now)
 			? sprintf('%s (retry in %d s)', st.last_error, st.retry_at - st.now)
 			: st.last_error ]);
+
+	push(out, ...radio);
 
 	return out;
 }

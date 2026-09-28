@@ -613,7 +613,8 @@ return view.extend({
 			var remote;
 
 			if (st.config_error)
-				remote = [ level('error', st.config_error) ];
+				remote = [ level('error', st.config_error),
+				           level('warn', _('radio off — the modem does not use its own SIM')) ];
 			else if (!st.enabled)
 				remote = [ E('span', {}, _('its own SIM')) ];
 			else {
@@ -639,6 +640,10 @@ return view.extend({
 				if (st.last_error)
 					remote.push(level('error', (st.retry_at && st.now && st.retry_at > st.now)
 						? _('%s (retry in %d s)').format(st.last_error, st.retry_at - st.now) : st.last_error));
+
+				/* it does not run on its own SIM meanwhile */
+				if (st.radio_held)
+					remote.push(level('warn', _('radio off until the remote SIM is in use — the modem does not use its own SIM')));
 
 				actions.push(button(_('Restart'), _('Give the modem its own SIM back for a moment, then offer the remote one again'),
 					function() { return callRsim(n, 'rsim', 'restart').then(L.bind(view.refresh, view)); }));

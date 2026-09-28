@@ -334,6 +334,14 @@ NCM modem that refuses 4 (wwand's `modem_ncm`); an `at:` port whose modem
 refuses `CFUN=4`, or does not read back 4, is not lent at all (unless
 `rsim_at_radio keep`). Two modems must never register with one card.
 
+**A modem with a remote SIM does not run on its local card:** from the
+daemon's first moment until the modem has taken the remote card, its radio
+is held off — wwand refuses its interfaces (`radio_held`) and parks any
+registration of it — and it goes online once the modem has connected to
+the remote card. The same when the remote SIM fails, its reader is
+misconfigured, or the modem lets go of it: the modem stays off rather than
+falling back to the card in its own slot. The status page says why.
+
 ## What works
 
 HW-tested on OpenWrt routers — MikroTik Chateau 5G (RG650E-EU, 245),
