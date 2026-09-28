@@ -328,10 +328,17 @@ yours.
 first APDU, before an AT port's first command — so the modem detaches from
 the network while it still has the card, instead of dropping off it with
 the card; the target then attaches with that IMSI on a network that has
-let go of it. Generic: the same park for QMI, MBIM and AT/NCM.
+let go of it. The park is the modem's own radio switch in wwand — QMI
+low power, `AT+CFUN=4` on NCM/AT. An **MBIM** modem has one only with a
+wwand whose MBIM backend switches the radio (radio state off); with an
+older one the park is refused there, and an MBIM sponsor lends over SIM
+Access without the detach (a warning in the log) and not at all APDU by
+APDU. The same holds for parking an MBIM *client* before its remote card
+goes (below).
 
 **While a card is lent, its modem's radio is off, the SIM left on** — on
-every path: QMI `LOW_POWER`, MBIM radio state off, `AT+CFUN=4` on an NCM
+every path: QMI `LOW_POWER`, MBIM radio state off (with a wwand that has
+it, see above), `AT+CFUN=4` on an NCM
 modem and on an AT port (rsim-card; deregistered with `AT+COPS=2` first,
 read back, parked again if something switches it on, radio and network
 selection put back as they were at the end). `CFUN=0` is used only on an

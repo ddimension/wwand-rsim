@@ -1218,8 +1218,13 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 	// and the target may attach with the same IMSI while the network still
 	// holds the sponsor's. So its radio goes off BEFORE the connect: low
 	// power / CFUN=4, which the modem carries out with a detach before it
-	// reports the new mode (the same park for every backend — QMI, MBIM,
-	// NCM/AT — through the daemon's modem_radio). APDU mode parks before
+	// reports the new mode, through the daemon's modem_radio — i.e. the
+	// modem's set_opmode, which QMI (modem.uc) and NCM/AT (modem_ncm.uc)
+	// have. An MBIM modem has one only with the wwand core that gives
+	// modem_mbim a set_opmode (radio state off); before that modem_radio
+	// answers `unsupported`, and a SIM Access sponsor on MBIM is lent
+	// WITHOUT the detach (the warning below), an APDU one not at all (up()
+	// refuses a donor whose radio cannot be parked). APDU mode parks before
 	// the first command anyway (up()).
 	let deregister_then = (then) => {
 		if (parked || !deps.modem_radio)
