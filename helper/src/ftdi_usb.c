@@ -10,6 +10,7 @@
 #include "ftdi_usb.h"
 #include "meta.h"
 #include "log.h"
+#include "sysio.h"
 
 /*
  * FT232BM over libusb, without ftdi_sio. Request numbers, request types and
@@ -93,12 +94,9 @@ static int ctrl_out(struct ftdi_io *f, uint8_t req, uint16_t value, uint16_t ind
 	return 0;
 }
 
-static long now_ms(void)
+static int64_t now_ms(void)
 {
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+	return rsim_now_ms();
 }
 
 static int fu_set_line(struct phx_io *io, unsigned baud, enum phx_parity parity,
@@ -202,7 +200,7 @@ static size_t take_pending(struct ftdi_io *f, uint8_t *buf, size_t len)
 static int fu_read(struct phx_io *io, uint8_t *buf, size_t len, unsigned timeout_ms)
 {
 	struct ftdi_io *f = (struct ftdi_io *)io;
-	long deadline = now_ms() + (long)timeout_ms;
+	int64_t deadline = now_ms() + timeout_ms;
 
 	if (f->pend_pos < f->pend_len)
 		return (int)take_pending(f, buf, len);
@@ -210,7 +208,7 @@ static int fu_read(struct phx_io *io, uint8_t *buf, size_t len, unsigned timeout
 	 * a status-only packet when the line was quiet, so this loop turns
 	 * over every 2 ms until data comes or the time is up. */
 	for (;;) {
-		long left = deadline - now_ms();
+		int64_t left = deadline - now_ms();
 		unsigned errs;
 		size_t n;
 		int got = 0, r;

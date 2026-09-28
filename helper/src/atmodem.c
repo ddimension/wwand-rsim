@@ -41,6 +41,7 @@
 #include "atmodem.h"
 #include "json.h"
 #include "log.h"
+#include "sysio.h"
 #include "meta.h"
 
 #define LINE_MAX_AT 1200	/* +CSIM with 258 bytes = 516 hex characters */
@@ -60,11 +61,11 @@ struct at_backend {
 	char mark[300];		/* where the mode before ours is kept */
 	/* who the modem is and which card it has, read once at the open */
 	char manuf[64], model[64], rev[96], imei[32], iccid[32];
-	long next_check;	/* the next look at the radio (at_tick) */
+	int64_t next_check;	/* the next look at the radio (at_tick) */
 	/* 0, or the moment by which every command must be done: a power-up,
 	 * a reset or a tick that re-parks the radio runs several commands, and
 	 * the plugin gives up on an answer after 15 s (see REPARK_BUDGET_MS) */
-	long until;
+	int64_t until;
 	char rbuf[4096];
 	size_t rlen;
 };
@@ -98,16 +99,13 @@ int atmodem_speed(unsigned baud)
 	}
 }
 
-static long now_ms(void)
+static int64_t now_ms(void)
 {
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+	return rsim_now_ms();
 }
 
 /* one line from the port, CR/LF stripped; 1 a line, 0 timeout, -1 error */
-static int read_line(struct at_backend *a, char *out, size_t cap, long deadline)
+static int read_line(struct at_backend *a, char *out, size_t cap, int64_t deadline)
 {
 	for (;;) {
 		char *nl = memchr(a->rbuf, '\n', a->rlen);
@@ -128,7 +126,7 @@ static int read_line(struct at_backend *a, char *out, size_t cap, long deadline)
 			continue;	/* the empty line between CR and LF */
 		}
 
-		long left = deadline - now_ms();
+		int64_t left = deadline - now_ms();
 		struct pollfd p = { .fd = a->fd, .events = POLLIN };
 		ssize_t r;
 
@@ -158,7 +156,7 @@ static int read_line(struct at_backend *a, char *out, size_t cap, long deadline)
 
 /* All of buf, on a non-blocking port: a short write or EAGAIN would send half
  * a command, or one without its CR, and the modem would never answer it. */
-static int write_all(int fd, const char *buf, size_t len, long deadline)
+static int write_all(int fd, const char *buf, size_t len, int64_t deadline)
 {
 	while (len) {
 		ssize_t w = write(fd, buf, len);
@@ -171,7 +169,7 @@ static int write_all(int fd, const char *buf, size_t len, long deadline)
 		if (w < 0 && errno != EAGAIN && errno != EINTR)
 			return -1;
 
-		long left = deadline - now_ms();
+		int64_t left = deadline - now_ms();
 		struct pollfd p = { .fd = fd, .events = POLLOUT };
 
 		if (left <= 0 || poll(&p, 1, (int)left) < 0)
@@ -196,7 +194,7 @@ static int cme_of(const char *line)
 static void resync(struct at_backend *a)
 {
 	char line[LINE_MAX_AT];
-	long deadline = now_ms() + 3000;
+	int64_t deadline = now_ms() + 3000;
 
 	if (a->until && deadline > a->until)
 		deadline = a->until;
@@ -252,7 +250,7 @@ static int at_cmd(struct at_backend *a, const char *cmd, const char *want, char 
 		  int timeout_ms, char *err, size_t errcap)
 {
 	char line[LINE_MAX_AT];
-	long deadline = now_ms() + timeout_ms;
+	int64_t deadline = now_ms() + timeout_ms;
 	int r;
 
 	if (got && gotcap)
@@ -476,7 +474,7 @@ static int park(struct at_backend *a, bool deregister, int cops_ms, int cfun_ms)
 
 	/* under a budget, COPS=2 must leave CFUN=4 its share */
 	if (deregister && a->until) {
-		long room = a->until - now_ms() - REPARK_CFUN_MS;
+		int64_t room = a->until - now_ms() - REPARK_CFUN_MS;
 
 		if (room < cops_ms)
 			cops_ms = (room > 0) ? (int)room : 0;
@@ -663,7 +661,7 @@ static void at_tick(struct rsim_backend *be)
 	struct at_backend *a = (struct at_backend *)be;
 	char c[40];
 	int mode;
-	long now = now_ms();
+	int64_t now = now_ms();
 
 	if (a->radio_keep || a->cfun_prev < 0 || now < a->next_check)
 		return;
@@ -788,7 +786,7 @@ struct rsim_backend *atmodem_open(const struct at_cfg *cfg)
 	/* Waited for, briefly: the previous helper on this port may still be
 	 * switching the radio back on (up to 15 s) after its session ended. */
 	{
-		long until = now_ms() + 20000;
+		int64_t until = now_ms() + 20000;
 
 		while (flock(a->fd, LOCK_EX | LOCK_NB) != 0) {
 			if (now_ms() >= until) {

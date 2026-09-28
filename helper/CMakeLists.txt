@@ -77,7 +77,7 @@ message(STATUS "rsim-card: Bluetooth SAP ${WITH_BLUETOOTH}")
 option(WITH_RSPRO "osmo-remsim SIM bank client (rspro:)" ON)
 message(STATUS "rsim-card: RSPRO (osmo-remsim) ${WITH_RSPRO}")
 
-add_library(rsimcore STATIC src/atr.c src/t0.c src/json.c src/jtok.c src/log.c src/ftdi_proto.c src/sap.c src/meta.c src/rspro.c)
+add_library(rsimcore STATIC src/atr.c src/t0.c src/json.c src/jtok.c src/log.c src/ftdi_proto.c src/sap.c src/meta.c src/rspro.c src/sysio.c)
 target_include_directories(rsimcore PUBLIC src)
 
 set(RSIM_SOURCES src/main.c src/phoenix.c src/phx_tty.c src/phoenix_baud.c src/atmodem.c src/scan.c src/serve.c)
@@ -126,7 +126,7 @@ install(TARGETS rsim-card RUNTIME DESTINATION bin)
 
 include(CTest)
 if(BUILD_TESTING)
-	foreach(t atr t0 json ftdi sap rspro jtok)
+	foreach(t atr t0 json ftdi sap rspro jtok sysio)
 		add_executable(test_${t} tests/test_${t}.c)
 		target_link_libraries(test_${t} rsimcore)
 		add_test(NAME ${t} COMMAND test_${t})

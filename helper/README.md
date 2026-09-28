@@ -166,8 +166,10 @@ returned them (25 s timeout; after one the bankd link is dropped and made
 again — an answer names no command, a late one would answer the next). Between requests (every 500 ms) the server's
 and bankd's messages are taken in: a mapping that arrives becomes
 `inserted`, one removed (or a bankd that went away) `removed`; a bankd that
-cannot be reached is tried again every 5 s. The server closing the
-connection ends the helper with 1.
+cannot be reached is tried again every 5 s. A message to the server or a
+bankd has 5 s in all to go out (a REST request as well) — one deadline for the
+whole send, so a peer that reads a byte now and then cannot hold the helper.
+The server closing the connection ends the helper with 1.
 With `/<bank>:<slot>` in the spec the helper first POSTs
 `{"bank":{"bankId","slotNr"},"client":{"clientId","slotNr"}}` to
 `/api/backend/v1/slotmaps` on the REST port; a refusal is looked up in

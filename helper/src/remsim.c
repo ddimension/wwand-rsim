@@ -46,6 +46,7 @@
 #include "atr.h"
 #include "jtok.h"
 #include "log.h"
+#include "sysio.h"
 #include "remsim.h"
 #include "rspro.h"
 
@@ -71,7 +72,7 @@
 struct conn {
 	int fd;			/* -1: not connected */
 	bool connecting;	/* connect() under way (the bankd's) */
-	long connect_deadline;
+	int64_t connect_deadline;
 	uint8_t buf[RSPRO_MSG_MAX + 8];
 	size_t len;
 };
@@ -90,7 +91,7 @@ struct rp {
 	/* the server took our slot away while the spec names it: mapped again,
 	 * at most every REMAP_MS */
 	bool lost_map;
-	long remap_at;
+	int64_t remap_at;
 	struct rspro_slot want;
 
 	struct conn srv, bank;
@@ -104,7 +105,7 @@ struct rp {
 	char bank_ip[INET6_ADDRSTRLEN];
 	uint16_t bank_port;
 	bool bank_ready;		/* the bankd accepted us */
-	long bank_retry_at;
+	int64_t bank_retry_at;
 
 	uint8_t atr[ATR_MAX];
 	size_t atr_len;
@@ -121,12 +122,9 @@ struct rp {
 	size_t resp_len;
 };
 
-static long now_ms(void)
+static int64_t now_ms(void)
 {
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+	return rsim_now_ms();
 }
 
 /* ---- TCP ----------------------------------------------------------------- */
@@ -175,29 +173,6 @@ static int tcp_connect(const char *host, uint16_t port, int timeout_ms, char *wh
 	return fd;
 }
 
-/* the whole buffer, the socket being non-blocking */
-static int send_all(int fd, const uint8_t *b, size_t n, int timeout_ms)
-{
-	while (n) {
-		ssize_t w = send(fd, b, n, MSG_NOSIGNAL);
-
-		if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-			struct pollfd pfd = { .fd = fd, .events = POLLOUT };
-
-			if (poll(&pfd, 1, timeout_ms) != 1)
-				return -1;
-			continue;
-		}
-		if (w < 0 && errno == EINTR)
-			continue;
-		if (w <= 0)
-			return -1;
-		b += w;
-		n -= (size_t)w;
-	}
-	return 0;
-}
-
 /* ---- RSPRO over IPA ------------------------------------------------------ */
 
 static void conn_close(struct conn *c)
@@ -211,7 +186,7 @@ static void conn_close(struct conn *c)
 
 static int conn_send_frame(struct conn *c, const uint8_t *frame, size_t n)
 {
-	if (c->fd < 0 || send_all(c->fd, frame, n, 5000))
+	if (c->fd < 0 || rsim_send_all(c->fd, frame, n, 5000))
 		return -1;
 	return 0;
 }
@@ -559,14 +534,14 @@ static void on_bank(struct rp *rp, const struct rspro_pdu *p)
  * there now): 1 done, 0 not (yet), -1 the server is gone. */
 static int pump(struct rp *rp, int timeout_ms, bool (*done)(struct rp *))
 {
-	long deadline = now_ms() + timeout_ms;
+	int64_t deadline = now_ms() + timeout_ms;
 	bool last = false;
 
 	for (;;) {
 		struct rspro_pdu p;
 		struct pollfd pfd[2];
 		int n = 0, r;
-		long rem;
+		int64_t rem;
 
 		while ((r = conn_take(&rp->srv, &p, "the server")) == 1)
 			on_server(rp, &p);
@@ -645,7 +620,7 @@ static int http(const char *host, uint16_t port, const char *method, const char 
 	char req[1024];
 	size_t len = 0;
 	int fd, status = -1, n;
-	long deadline = now_ms() + HTTP_TIMEOUT_MS;
+	int64_t deadline = now_ms() + HTTP_TIMEOUT_MS;
 	char *hdr_end;
 	bool v6 = strchr(host, ':') != NULL;
 
@@ -663,14 +638,14 @@ static int http(const char *host, uint16_t port, const char *method, const char 
 				     "Content-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
 				     strlen(body), body)
 			  : snprintf(req + n, sizeof(req) - (size_t)n, "\r\n");
-	if (n < 0 || (size_t)n >= sizeof(req) || send_all(fd, (const uint8_t *)req, (size_t)n, HTTP_TIMEOUT_MS)) {
+	if (n < 0 || (size_t)n >= sizeof(req) || rsim_send_all(fd, req, (size_t)n, HTTP_TIMEOUT_MS)) {
 		snprintf(why, whylen, "%s port %u: request not sent", host, port);
 		close(fd);
 		return -1;
 	}
 	for (;;) {
 		struct pollfd pfd = { .fd = fd, .events = POLLIN };
-		long rem = deadline - now_ms();
+		int64_t rem = deadline - now_ms();
 		ssize_t r;
 
 		if (rem <= 0 || poll(&pfd, 1, (int)rem) != 1) {

@@ -39,6 +39,7 @@
 #include "bt.h"
 #include "json.h"
 #include "log.h"
+#include "sysio.h"
 #include "sap.h"
 
 #ifndef AF_BLUETOOTH
@@ -105,18 +106,15 @@ struct bt_backend {
 	bool served;		/* an ATR went out since the target last saw no card */
 	bool bounce;		/* reset by the phone behind the target's back */
 	bool gone;		/* the link ended */
-	long bringup_until;	/* the open as a whole ends by then (BRINGUP_MS) */
+	int64_t bringup_until;	/* the open as a whole ends by then (BRINGUP_MS) */
 	uint8_t rbuf[4096];
 	size_t rlen;
 	uint8_t msg[4096];	/* the message being looked at, sap_msg points here */
 };
 
-static long now_ms(void)
+static int64_t now_ms(void)
 {
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+	return rsim_now_ms();
 }
 
 int bt_parse_addr(const char *s, unsigned char out[6])
@@ -169,7 +167,7 @@ static int sdp_channel(const uint8_t bdaddr[6], const char *addr)
 	uint8_t req[64], rsp[1024], attrs[2048];
 	size_t alen = 0, cont_len = 0;
 	uint8_t cont[16];
-	long deadline = now_ms() + SDP_TIMEOUT_MS;
+	int64_t deadline = now_ms() + SDP_TIMEOUT_MS;
 	uint16_t tid = 1;
 	int fd, ch = -1;
 
@@ -195,7 +193,7 @@ static int sdp_channel(const uint8_t bdaddr[6], const char *addr)
 		struct pollfd p = { .fd = fd, .events = POLLIN };
 		int n = sdp_search_req(req, sizeof(req), tid, SAP_UUID16, cont, cont_len);
 		ssize_t r;
-		long left = deadline - now_ms();
+		int64_t left = deadline - now_ms();
 
 		if (n < 0 || send(fd, req, (size_t)n, 0) != n || left <= 0 || poll(&p, 1, (int)left) <= 0 ||
 		    (r = recv(fd, rsp, sizeof(rsp), 0)) <= 0) {
@@ -280,7 +278,7 @@ static int send_msg(struct bt_backend *b, uint8_t id, const struct sap_param *p,
 {
 	uint8_t out[SAP_MSG_WANT + 16];
 	int len = sap_encode(out, sizeof(out), id, p, n), o = 0;
-	long deadline = now_ms() + REQUEST_TIMEOUT_MS;
+	int64_t deadline = now_ms() + REQUEST_TIMEOUT_MS;
 
 	if (len < 0 || (b->max_msg && len > b->max_msg)) {
 		snprintf(b->be.detail, RSIM_DETAIL_MAX, "a %s larger than the phone takes", sap_msg_name(id));
@@ -311,7 +309,7 @@ static int send_msg(struct bt_backend *b, uint8_t id, const struct sap_param *p,
 /* The next message, within deadline (0: only what is already there).
  * RSIM_OK with m filled, 1 when nothing came, an error when the link failed
  * (then b->gone). */
-static int read_msg(struct bt_backend *b, long deadline, struct sap_msg *m)
+static int read_msg(struct bt_backend *b, int64_t deadline, struct sap_msg *m)
 {
 	for (;;) {
 		int f = sap_frame(b->rbuf, b->rlen);
@@ -331,7 +329,7 @@ static int read_msg(struct bt_backend *b, long deadline, struct sap_msg *m)
 		}
 
 		struct pollfd p = { .fd = b->fd, .events = POLLIN };
-		long left = deadline ? deadline - now_ms() : 0;
+		int64_t left = deadline ? deadline - now_ms() : 0;
 		ssize_t r;
 		int pr;
 
@@ -417,7 +415,7 @@ static void drain(struct bt_backend *b)
 static int request(struct bt_backend *b, uint8_t id, const struct sap_param *p, int n, uint8_t want,
 		   int timeout_ms, struct sap_msg *m)
 {
-	long deadline = now_ms() + timeout_ms;
+	int64_t deadline = now_ms() + timeout_ms;
 	int r;
 
 	if (b->gone) {
@@ -614,7 +612,7 @@ static void bt_close(struct rsim_backend *be)
 	 * a disconnect (adb logcat of a Galaxy S20 FE, 2026-09-27) and has
 	 * the card back regardless — no answer here is no fault. */
 	if (!b->gone && send_msg(b, SAP_DISCONNECT_REQ, NULL, 0) == RSIM_OK) {
-		long deadline = now_ms() + 2000;
+		int64_t deadline = now_ms() + 2000;
 		int r;
 
 		while ((r = read_msg(b, deadline, &m)) == RSIM_OK && m.id != SAP_DISCONNECT_RESP)
@@ -654,7 +652,7 @@ static int sap_connect(struct bt_backend *b)
 	static const uint16_t sizes[] = { SAP_MSG_WANT, 512, 300, SAP_MSG_MIN, SAP_MSG_LOW };
 	uint16_t want = sizes[0];
 	size_t next = 1;
-	long deadline;
+	int64_t deadline;
 	int tries;
 
 	for (tries = 0; tries < 8; tries++) {
@@ -664,7 +662,7 @@ static int sap_connect(struct bt_backend *b)
 		struct sap_msg m;
 		int st;
 
-		long left = b->bringup_until - now_ms();
+		int64_t left = b->bringup_until - now_ms();
 
 		if (left < 1000) {
 			log_err("bt: %s: no SIM access within %d s — given up for now", b->addr, BRINGUP_MS / 1000);
@@ -1055,13 +1053,13 @@ static int mgmt_cmd(int fd, uint16_t op, uint16_t index, uint8_t *out, size_t ca
 {
 	uint8_t req[6] = { (uint8_t)op, (uint8_t)(op >> 8), (uint8_t)index, (uint8_t)(index >> 8), 0, 0 };
 	uint8_t buf[1024];
-	long deadline = now_ms() + 1000;
+	int64_t deadline = now_ms() + 1000;
 
 	if (write(fd, req, sizeof(req)) != (ssize_t)sizeof(req))
 		return -1;
 	for (;;) {
 		struct pollfd p = { .fd = fd, .events = POLLIN };
-		long left = deadline - now_ms();
+		int64_t left = deadline - now_ms();
 		ssize_t n;
 		uint16_t ev, len, rop;
 
