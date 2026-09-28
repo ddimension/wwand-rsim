@@ -61,11 +61,27 @@ struct at_backend {
 	/* who the modem is and which card it has, read once at the open */
 	char manuf[64], model[64], rev[96], imei[32], iccid[32];
 	long next_check;	/* the next look at the radio (at_tick) */
+	/* 0, or the moment by which every command must be done: a power-up,
+	 * a reset or a tick that re-parks the radio runs several commands, and
+	 * the plugin gives up on an answer after 15 s (see REPARK_BUDGET_MS) */
+	long until;
 	char rbuf[4096];
 	size_t rlen;
 };
 
 static const uint8_t ATR_T0_MINIMAL[] = { 0x3B, 0x00 };
+
+/* A power-up or reset from the target must be answered within the wwand
+ * plugin's HELPER_TIMEOUT_MS, 15 s (plugins/rsim.uc) — past it the plugin
+ * restarts the helper, and that restores the radio of the very modem the
+ * re-park was switching off. The re-park chain there (CPIN?, CFUN?, ATE0,
+ * CMEE, COPS=2, CFUN=4) has per-command timeouts that add up to 29 s, so it
+ * runs under one deadline instead, with room left for an SSH round trip.
+ * The same for the tick: a request that arrives during it waits for it. */
+#define REPARK_BUDGET_MS 12000
+/* what CFUN=4 keeps of that budget when COPS=2 is slow: the radio off is
+ * the part that matters, the deregistration only makes it cleaner */
+#define REPARK_CFUN_MS 4000
 
 int atmodem_speed(unsigned baud)
 {
@@ -181,6 +197,9 @@ static void resync(struct at_backend *a)
 {
 	char line[LINE_MAX_AT];
 	long deadline = now_ms() + 3000;
+
+	if (a->until && deadline > a->until)
+		deadline = a->until;
 	int r;
 
 	a->dirty = false;
@@ -218,6 +237,14 @@ static int at_cmd(struct at_backend *a, const char *cmd, const char *want, char 
 		got[0] = '\0';
 	if (err && errcap)
 		snprintf(err, errcap, "no answer");
+	if (a->until && deadline > a->until)
+		deadline = a->until;
+	/* the budget is spent: not sent at all, so no late answer to resync */
+	if (deadline <= now_ms()) {
+		if (err && errcap)
+			snprintf(err, errcap, "no time left");
+		return RSIM_E_TIMEOUT;
+	}
 	if (a->dirty)
 		resync(a);
 	tcflush(a->fd, TCIFLUSH);
@@ -367,16 +394,28 @@ int atmodem_cops_restore(const char *line, char *out, size_t cap)
 
 /* Deregister, then RF off: the park. A refused or unanswered COPS=2 (not
  * registered, a modem without it, a detach the network is slow with) is no
- * reason not to park — CFUN=4 still takes the radio off. cops_ms: at the
- * open the helper has time (the plugin waits 60 s for its first answer); a
- * re-park inside a power-up must stay within the plugin's 15 s for that
- * answer. deregister false: a modem whose selection we have nothing to put
- * back for (it was off already when we came) gets CFUN=4 alone. */
-static int park(struct at_backend *a, bool deregister, int cops_ms)
+ * reason not to park — CFUN=4 still takes the radio off. cops_ms/cfun_ms:
+ * at the open the helper has time (the plugin waits 60 s for its first
+ * answer); a re-park inside a power-up runs under a->until and gets what is
+ * left of REPARK_BUDGET_MS. deregister false: a modem whose selection we
+ * have nothing to put back for (it was off already when we came) gets
+ * CFUN=4 alone. */
+static int park(struct at_backend *a, bool deregister, int cops_ms, int cfun_ms)
 {
 	char err[120] = "";
 	int r;
 
+	/* under a budget, COPS=2 must leave CFUN=4 its share */
+	if (deregister && a->until) {
+		long room = a->until - now_ms() - REPARK_CFUN_MS;
+
+		if (room < cops_ms)
+			cops_ms = (room > 0) ? (int)room : 0;
+	}
+	if (deregister && cops_ms <= 0) {
+		log_notice("%s: no time left for AT+COPS=2 — parked with CFUN=4 alone", a->be.reader);
+		deregister = false;
+	}
 	if (deregister) {
 		r = at_cmd(a, "AT+COPS=2", NULL, NULL, 0, cops_ms, err, sizeof(err));
 		if (r == RSIM_OK)
@@ -384,7 +423,7 @@ static int park(struct at_backend *a, bool deregister, int cops_ms)
 		else
 			log_notice("%s: AT+COPS=2 not taken (%s) — parked with CFUN=4 alone", a->be.reader, err);
 	}
-	return at_cmd(a, "AT+CFUN=4", NULL, NULL, 0, deregister ? 5000 : 15000, NULL, 0);
+	return at_cmd(a, "AT+CFUN=4", NULL, NULL, 0, cfun_ms, NULL, 0);
 }
 
 /* The value of a query answered with one line (+CGMI: "Quectel", or just
@@ -446,9 +485,22 @@ static void at_info(struct rsim_backend *be, struct jw *w)
 	jw_str(w, "radio", a->radio_keep ? "kept" : (a->cfun_prev >= 0 ? "off while lent" : "was off already"));
 }
 
+static int at_power_up_in(struct at_backend *a, uint8_t *atr, size_t *atr_len);
+
 static int at_power_up(struct rsim_backend *be, uint8_t *atr, size_t *atr_len)
 {
 	struct at_backend *a = (struct at_backend *)be;
+	int r;
+
+	a->until = now_ms() + REPARK_BUDGET_MS;
+	r = at_power_up_in(a, atr, atr_len);
+	a->until = 0;
+	return r;
+}
+
+static int at_power_up_in(struct at_backend *a, uint8_t *atr, size_t *atr_len)
+{
+	struct rsim_backend *be = &a->be;
 	char got[200], err[120] = "";
 	int r = at_cmd(a, "AT+CPIN?", "+CPIN:", got, sizeof(got), 5000, err, sizeof(err));
 
@@ -480,7 +532,7 @@ static int at_power_up(struct rsim_backend *be, uint8_t *atr, size_t *atr_len)
 			/* refused or unanswered: the card is not lent — two modems
 			 * must not register with it — until a later power-up gets
 			 * the radio off */
-			if (park(a, a->cops_restore[0] != '\0', 8000) != RSIM_OK) {
+			if (park(a, a->cops_restore[0] != '\0', 8000, 5000) != RSIM_OK) {
 				snprintf(be->detail, RSIM_DETAIL_MAX, "cannot switch the radio of this modem off again (CFUN=%d)", mode);
 				return RSIM_E_IO;
 			}
@@ -547,11 +599,13 @@ static void at_tick(struct rsim_backend *be)
 	if (a->radio_keep || a->cfun_prev < 0 || now < a->next_check)
 		return;
 	a->next_check = now + 10000;
+	a->until = now + REPARK_BUDGET_MS;
 	if (at_cmd(a, "AT+CFUN?", "+CFUN:", c, sizeof(c), 5000, NULL, 0) == RSIM_OK &&
 	    sscanf(c, "+CFUN: %d", &mode) == 1 && mode != 4 && mode != 0) {
 		log_warn("%s: radio is on again (CFUN=%d) while its card is lent — parking it again", be->reader, mode);
-		park(a, a->cops_restore[0] != '\0', 8000);
+		park(a, a->cops_restore[0] != '\0', 8000, 5000);
 	}
+	a->until = 0;
 }
 
 static int at_present(struct rsim_backend *be)
@@ -795,7 +849,9 @@ struct rsim_backend *atmodem_open(const struct at_cfg *cfg)
 				free(a);
 				return NULL;
 			}
-			int rc = park(a, true, 30000);
+			/* no budget here: the plugin waits 60 s for this first
+			 * answer, and a slow detach is the modem's to finish */
+			int rc = park(a, true, 30000, 15000);
 
 			/* confirmed, like a QMI park: the mode read back */
 			if (rc == RSIM_OK) {

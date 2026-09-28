@@ -96,7 +96,9 @@ they were afterwards, also when the helper is stopped or its SSH
 link drops. One helper per AT port (a lock; a second one waits up to 20 s,
 long enough for the previous one to finish restoring the radio). A modem
 that rebooted while its card is lent is switched off again on the target's
-next power-up or reset. Killed hard (SIGKILL, power loss), it cannot: the mode it had is
+next power-up or reset — within 12 s, deregistration included, so the
+plugin's 15 s for that answer hold (a park that does not make it fails the
+power-up; the card is not lent until one does). Killed hard (SIGKILL, power loss), it cannot: the mode it had is
 kept in `/tmp/rsim-card-cfun-<port>`, and the next run restores that one at
 its end (`rsim_at_radio keep` leaves the radio alone, `rsim_at_baud` for a
 real UART). The ATR is the minimal T=0 ATR `3B00`: plain AT has no command for the

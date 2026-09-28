@@ -65,6 +65,10 @@ class FakeModem(threading.Thread):
             if cmd.startswith("AT+CSIM"):
                 return self.say("ERROR")
             return self.say("+CME Error:PACM(AP),UNREGISTED", "OK")
+        # a modem that still answers the queries but nothing that changes
+        # its state (hung in a detach): the commands that time out
+        if getattr(self, "mute", False) and cmd not in ("AT+CPIN?", "AT+CFUN?"):
+            return
         if self.urc:
             self.say("+QIND: \"csq\",20,99")
         if cmd == "ATE0":
@@ -353,6 +357,21 @@ r = rig.ask({"op": "reset"})
 check(r and not r.get("ok") and r.get("error") == "io",
       "reboot: a radio that cannot be switched off again fails the reset, no ATR (%r)" % r)
 rig.modem.cfun_refuse = False
+rig.close()
+
+# ...and a re-park that hangs is answered within the plugin's 15 s for a
+# power-up or reset: past it the plugin restarts the helper, which restores
+# the radio it was switching off
+rig = Rig()
+rig.ask({"op": "power_up"})
+rig.modem.cfun = 1
+rig.modem.mute = True
+t0 = time.monotonic()
+r = rig.ask({"op": "reset"}, timeout=30)
+took = time.monotonic() - t0
+check(r is not None and took < 14, "reboot: a hanging re-park is answered within the plugin's 15 s (%.1f s, %r)" % (took, r))
+check(r and not r.get("ok") and r.get("error") == "io", "reboot: ...as a failure, no ATR (%r)" % r)
+rig.modem.mute = False
 rig.close()
 
 # --- what the modem says, classified ---------------------------------------------------
