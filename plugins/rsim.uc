@@ -838,6 +838,7 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 	let upping = false;
 	// the SAP connect is asked a second time once, after a busy refusal
 	let retried_busy = false;
+	let without_cond = false;
 
 	// The SPONSOR's side of a card change. Over SIM Access it hands its card
 	// over and gets it back: both times it runs wwand's card-change process
@@ -1257,7 +1258,7 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 
 		// TLV 0x12 first appears in the 2013 Gobi drop; older firmware may
 		// not know it, so it can be left out (rsim_donor_cond 'none')
-		if (dcfg.cond != 'none')
+		if (dcfg.cond != 'none' && !without_cond)
 			conn.cond = +(dcfg.cond ?? 3);
 
 		connect_sent = true;
@@ -1307,6 +1308,18 @@ function donor_card(deps, donor, dcfg, on_event, on_exit, log)
 					parked = true;
 					uloop.timer(3000, () => (dead || !c) ? null : connect());
 				});
+			}
+
+			// 1 MALFORMED_MESSAGE (libqmi 1.38.0 qmi-errors.h:231) to a connect
+			// that carried the condition TLV: firmware that does not know it
+			// refuses the whole request (HW-seen on the ZyXEL NR7101's RG502Q,
+			// RG502QEAACR13A04M4G_ZYXEL, 2026-10-30, every lend). Asked once
+			// more without it — what rsim_donor_cond 'none' does by hand. Not
+			// when a condition was configured: that one was asked for.
+			if (e?.error == 'qmi' && e?.code == 1 && conn.cond != null && dcfg.cond == null && !without_cond) {
+				without_cond = true;
+				log('notice', sprintf('rsim: %s refuses the SIM Access condition TLV as malformed — asking without it (rsim_donor_cond none)', donor));
+				return connect();
 			}
 
 			if (e)

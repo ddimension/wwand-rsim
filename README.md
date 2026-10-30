@@ -453,7 +453,10 @@ modems without the passthrough; other Qualcomm modems are untested.
   or not (read first, written only when it differs, then one modem reset) —
   except where the modem's UIM is known to lack SIM Access; per modem off
   with `option rsim_sap_auto '0'` on its `wwand_modem`. The connect's condition
-  TLV is refused as malformed by some firmware (`rsim_donor_cond none`); a
+  TLV is refused as malformed (QMI 1) by some firmware, the NR7101's RG502Q
+  among them: the connect is then asked once more without it
+  (`rsim_donor_cond none` leaves it out from the start, and a configured
+  condition is never dropped); a
   sponsor busy with a data session (QMI 52) has its radio parked and is
   asked once more.
 - *Huawei E392 as sponsor:* its SIM Access takes the card and never answers

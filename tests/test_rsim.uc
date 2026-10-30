@@ -1432,6 +1432,45 @@ let donor_plugin = (o) => { let targets = {}; return rsim.create({
 	run_for(50);
 }
 
+// a sponsor whose firmware refuses the condition TLV as malformed (QMI 1, the
+// NR7101's RG502Q): asked once more without it, and the link comes up; with a
+// condition configured there is no second ask
+{
+	let mk = () => {
+		let st = 0;
+		return fake_client({ answer: (name, a) => {
+			if (name == 'SAP_CONNECTION' && a.conn.op == 1) {
+				if (a.cond != null) return { __err: { error: 'qmi', code: 1 } };
+				st = 2;
+			}
+			if (name == 'SAP_REQUEST' && st == 2) {
+				if (a.req.op == 0) return { atr: rsim.bytes(ATR) };
+				if (a.req.op == 1) return { rapdu: rsim.bytes((a.apdu[1] == 0xA4) ? '9F17' : '9000') };
+			}
+			return (name == 'SAP_CONNECTION') ? { state: st } : {};
+		} });
+	};
+	let connects = (d) => map(filter(d.sent, (x) => x.name == 'SAP_CONNECTION' && x.args.conn.op == 1), (x) => x.args.cond);
+
+	let t = { now: 1000 }, donor = mk(), radio = [];
+	let p = donor_plugin({ t: t, donor: donor, target: fake_client(), radio: radio });
+	p.tick('m0', { rsim_reader: 'modem:m1', rsim_donor_mode: 'sap' });
+	run_for(1500);
+	eq(connects(donor), [ 3, null ], 'condition TLV refused as malformed: asked once more without it');
+	eq(radio, [ [ 'm1', false ] ], '...and the link stands: the sponsor stays parked, nothing handed back');
+	p.stop();
+	run_for(50);
+
+	t = { now: 1000 }; donor = mk(); radio = [];
+	p = donor_plugin({ t: t, donor: donor, target: fake_client(), radio: radio });
+	p.tick('m0', { rsim_reader: 'modem:m1', rsim_donor_mode: 'sap', rsim_donor_cond: '3' });
+	run_for(1500);
+	eq(connects(donor), [ 3 ], 'a configured condition is not dropped: one connect, refused');
+	eq(radio, [ [ 'm1', false ], [ 'm1', true ] ], '...the lending ends and the sponsor is woken again');
+	p.stop();
+	run_for(50);
+}
+
 // a lent card: the target's client first — without one the sponsor is not
 // touched (no park, no connect), where it used to be on every retry
 {
