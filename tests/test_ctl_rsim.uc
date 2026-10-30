@@ -145,6 +145,80 @@ function fake_ctx(start)
 	ok(index(err ?? '', 'not changed') >= 0, 'enable: an ignored write is reported, not claimed as done');
 }
 
+// --- Foxconn/Fibocom: the switch lives behind AT^EFS, not AT+QNVFR ----------------
+{
+	eq(ctl.efs_foxconn_value([ sprintf('^EFS: %s, 01', ctl.EFS_ENABLE) ]), '01', 'efs ^EFS: the value');
+	eq(ctl.efs_foxconn_value([ sprintf('^EFS: %s, "00"', ctl.EFS_ENABLE) ]), '00', 'efs ^EFS: quoted too');
+	eq(ctl.efs_foxconn_value([ sprintf('^EFS: %s, not exist!', ctl.EFS_ENABLE) ]), '', 'efs ^EFS: absent is the empty string, not null');
+	eq(ctl.efs_foxconn_value([ 'OK' ]), null, 'efs ^EFS: no ^EFS line is no value');
+	eq(ctl.efs_foxconn_value([ sprintf('^EFS: %s, xyz', ctl.EFS_ENABLE) ]), null, 'efs ^EFS: an unparseable value is null (an error), not a false read');
+}
+
+// a Foxconn modem: QNVFR/QNVFW are unknown, AT^EFS reads/writes, and the item
+// is absent until written (Dell DW5932e). `reflect: false` is firmware whose
+// ^EFS read does not show the write until a modem reset.
+function fake_ctx_foxconn(start, reflect)
+{
+	let efs = { value: start };
+	let c = { at: [], resets: 0, out: '' };
+
+	c.status = () => ({ modems: { m0: {} } });
+	c.resolve_modem = (st, a) => ({ modem: 'm0', consumed: a == 'm0' });
+	c.call = (method, args) => {
+		push(c.at, args.command);
+
+		if (match(args.command, /^AT\+QNVF/))
+			return { ok: false, error: 'at_error', response: [ 'ERROR' ] };
+
+		let m = match(args.command, /^AT\^EFS="([^"]+)",0$/);
+
+		if (m)
+			return { ok: true, response: [ (efs.value == null)
+				? sprintf('^EFS: %s, not exist!', m[1])
+				: sprintf('^EFS: %s, %s', m[1], efs.value) ] };
+
+		m = match(args.command, /^AT\^EFS="([^"]+)",1,"([0-9A-Fa-f]+)"$/);
+
+		if (m) {
+			if (reflect != false)
+				efs.value = uc(m[2]);
+			return { ok: true, response: [] };
+		}
+
+		return { ok: false, error: 'at_error' };
+	};
+	c.call_ok = (method, args) => { if (method == 'modem_reset') c.resets++; return {}; };
+	c.efs = efs;
+
+	return c;
+}
+
+{
+	let c = fake_ctx_foxconn(null);
+
+	ctl.run(c, [ 'enable' ]);
+	eq(c.efs.value, '01', 'enable (Foxconn): written through AT^EFS');
+	eq(length(filter(c.at, (a) => a == sprintf('AT^EFS="%s",1,"01"', ctl.EFS_ENABLE))), 1,
+	   'enable (Foxconn): with the vendor write command, once');
+	eq(c.resets, 0, 'enable (Foxconn): no reset unless asked');
+
+	// a Foxconn whose ^EFS read does not reflect the write until reset: the
+	// write returned OK, so enable reports it rather than failing "not changed"
+	let c2 = fake_ctx_foxconn(null, false);
+	let err = null;
+
+	try { ctl.run(c2, [ 'enable' ]); } catch (e) { err = e.message; }
+	eq(err, null, 'enable (Foxconn, deferred read-back): the accepted write is reported, not failed');
+	eq(length(filter(c2.at, (a) => a == sprintf('AT^EFS="%s",1,"01"', ctl.EFS_ENABLE))), 1,
+	   'enable (Foxconn, deferred read-back): the write was still issued');
+
+	// already on: read is enough, nothing written
+	let c3 = fake_ctx_foxconn('01');
+
+	ctl.run(c3, [ 'enable' ]);
+	eq(length(filter(c3.at, (a) => index(a, ',1,') >= 0)), 0, 'enable (Foxconn): already on, nothing written');
+}
+
 // sap-enable writes the SIM Access item and reads it back
 {
 	let efs = {};

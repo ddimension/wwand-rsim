@@ -14,6 +14,11 @@
 // Setting it is a change to the modem's own configuration, so it happens only
 // when an operator runs `enable`, never from the plugin.
 //
+// The switch lives in EFS behind a vendor AT command that differs by maker:
+// Quectel uses AT+QNVFR/AT+QNVFW, Foxconn/Fibocom use AT^EFS (the Dell DW5932e
+// keeps UIM Remote off there by default). efs_read/efs_write try Quectel
+// first and fall back to the Foxconn command, so `enable` works on both.
+//
 // Plain script: require() returns { run, help } plus the pure pieces the
 // tests reach.
 
@@ -50,23 +55,75 @@ function qnvfr_value(lines)
 	return null;
 }
 
+// Foxconn/Fibocom modems reach EFS through a vendor command instead of
+// Quectel's +QNVFR/+QNVFW: `AT^EFS="<path>",0` reads and answers
+// `^EFS: <path>, <value>` (value as hex), or `^EFS: <path>, not exist!` when
+// the item is absent. Returns the uppercased hex, the empty string for the
+// absent answer (a known state, not an error) or null when no ^EFS line is
+// present. (HW-observed on the Dell DW5932e / Snapdragon X62 / Foxconn
+// T99W373, FDE.F0.3.0.1.1.DF.006, 2026-10-30.)
+function efs_foxconn_value(lines)
+{
+	for (let l in (lines ?? [])) {
+		if (!match(l, /^\^EFS:/))
+			continue;
+
+		if (match(l, /not exist/))
+			return '';
+
+		let m = match(l, /,\s*"?([0-9A-Fa-f]+)"?\s*$/);
+
+		if (m)
+			return uc(m[1]);
+	}
+
+	return null;
+}
+
+// Read an EFS item, Quectel first (+QNVFR), then the Foxconn vendor command
+// (^EFS) when the modem did not understand it. The result carries `dialect`
+// so a caller can treat the Foxconn read-back — which does not always reflect
+// a write before a modem reset — differently; `absent: true` is the Foxconn
+// "not exist!" answer (value null, but a definite state, not an error).
 function efs_read(ctx, modem, path)
 {
 	let r = ctx.call('modem_at', { modem: modem, command: sprintf('AT+QNVFR="%s"', path), timeout: 5000 });
 
-	if (!r?.ok)
-		return { error: r?.error ?? 'no answer', lines: r?.response };
+	if (r?.ok) {
+		let v = qnvfr_value(r.response);
 
-	let v = qnvfr_value(r.response);
+		return (v == null) ? { error: 'unexpected answer', lines: r.response } : { value: v, dialect: 'quectel' };
+	}
 
-	return (v == null) ? { error: 'unexpected answer', lines: r.response } : { value: v };
+	let f = ctx.call('modem_at', { modem: modem, command: sprintf('AT^EFS="%s",0', path), timeout: 5000 });
+
+	if (f?.ok) {
+		let v = efs_foxconn_value(f.response);
+
+		if (v === '')
+			return { value: null, absent: true, dialect: 'foxconn' };
+
+		if (v != null)
+			return { value: v, dialect: 'foxconn' };
+
+		// ^EFS answered but with no value we recognise — a real error, and a
+		// more accurate one than echoing the Quectel command's failure below.
+		return { error: 'unexpected answer', lines: f.response };
+	}
+
+	return { error: r?.error ?? 'no answer', lines: r?.response };
 }
 
 function efs_write(ctx, modem, path, hexval)
 {
 	let r = ctx.call('modem_at', { modem: modem, command: sprintf('AT+QNVFW="%s",%s', path, hexval), timeout: 5000 });
 
-	return r?.ok ? {} : { error: r?.error ?? 'no answer', lines: r?.response };
+	if (r?.ok)
+		return { dialect: 'quectel' };
+
+	let f = ctx.call('modem_at', { modem: modem, command: sprintf('AT^EFS="%s",1,"%s"', path, hexval), timeout: 5000 });
+
+	return f?.ok ? { dialect: 'foxconn' } : { error: f?.error ?? r?.error ?? 'no answer', lines: f?.response ?? r?.response };
 }
 
 function state_word(v)
@@ -906,7 +963,7 @@ function set_switch(ctx, modem, on, reset)
 	let cur = efs_read(ctx, modem, EFS_ENABLE);
 
 	if (cur.error)
-		die(sprintf('modem %s: cannot read the UIM Remote switch (%s)%s — this needs a Quectel modem with AT+QNVFR',
+		die(sprintf('modem %s: cannot read the UIM Remote switch (%s)%s — this needs a Quectel modem (AT+QNVFR) or a Foxconn/Fibocom modem (AT^EFS)',
 			modem, cur.error, cur.lines ? sprintf(': %s', join(' | ', cur.lines)) : ''));
 
 	if (cur.value == want) {
@@ -920,11 +977,20 @@ function set_switch(ctx, modem, on, reset)
 
 		let back = efs_read(ctx, modem, EFS_ENABLE);
 
-		if (back.value != want)
+		if (back.value == want) {
+			printf('modem %s: UIM Remote switched %s in the firmware (%s: %s -> %s)\n',
+				modem, state_word(want), EFS_ENABLE, cur.value ?? '(absent)', want);
+		}
+		else if (w.dialect == 'foxconn') {
+			// Foxconn's ^EFS read does not reliably reflect the write until the
+			// modem has restarted; the write itself returned OK, so report that
+			// and let the reset confirm it rather than fail a true write.
+			printf('modem %s: UIM Remote write accepted (%s="%s"); this firmware applies and shows it after a modem reset\n',
+				modem, EFS_ENABLE, want);
+		}
+		else {
 			die(sprintf('modem %s: the switch reads %s after writing %s — not changed', modem, back.value ?? '?', want));
-
-		printf('modem %s: UIM Remote switched %s in the firmware (%s: %s -> %s)\n',
-			modem, state_word(want), EFS_ENABLE, cur.value, want);
+		}
 	}
 
 	// read at modem boot only: the running firmware does not change until
@@ -1097,6 +1163,7 @@ function proxy(ctx, args, sys)
 
 return {
 	qnvfr_value: qnvfr_value,
+	efs_foxconn_value: efs_foxconn_value,
 	proxy: proxy,
 	provider: provider,
 	PROVIDER_PKG: PROVIDER_PKG,

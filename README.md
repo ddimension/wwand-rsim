@@ -15,13 +15,16 @@ Design notes: [docs/plan.md](docs/plan.md).
 > **Modem support: HW-verified clients are Quectel.** The modem that runs
 > on the remote card has to offer Qualcomm's QMI UIM Remote. wwand-rsim's
 > client side is vendor-neutral QMI; only switching the service ON is
-> vendor-specific — an EFS item that wwand-rsim can write on Quectel alone
-> (`wwandctl rsim MODEM enable --reset`, `AT+QNVFW`). HW-verified clients:
-> Quectel RG650E-EU (QMI) and RM520N-GL (MBIM, through the QMI
-> passthrough). On another vendor's Qualcomm modem UIM Remote has to be on
-> in its firmware already (wwand-rsim cannot switch it) — untested, **tbd**;
-> so are Telit/u-blox SAP client modes and Osmocom SIMtrace2 card
-> emulation: [docs/modems.md](docs/modems.md). The card *source* is not
+> vendor-specific — an EFS item that wwand-rsim writes through the maker's
+> own AT command (`wwandctl rsim MODEM enable --reset`): Quectel `AT+QNVFW`,
+> Foxconn/Fibocom `AT^EFS`. HW-verified clients: Quectel RG650E-EU (QMI) and
+> RM520N-GL (MBIM, through the QMI passthrough); the switch write is also
+> HW-verified on the Foxconn T99W373 (Dell DW5932e, Snapdragon X62), where
+> the modem keeps UIM Remote off by default. On a Qualcomm modem from a maker
+> whose EFS command wwand-rsim does not know, UIM Remote has to be on in its
+> firmware already — untested, **tbd**; so are Telit/u-blox SAP client modes
+> and Osmocom SIMtrace2 card emulation: [docs/modems.md](docs/modems.md).
+> The card *source* is not
 > limited this way: a reader, a phone, or a Huawei, MeiG or other modem that
 > answers `AT+CSIM` can lend its card.
 
@@ -403,8 +406,9 @@ authenticated with it and registered; *card only* that the card was read
 and used but the network refused the subscription (an inactive SIM).
 
 **Clients — a modem that runs on a remote card** (QMI UIM Remote; Qualcomm
-modems, the service switched on in the firmware — Quectel: `wwandctl rsim
-enable --reset`):
+modems, the service switched on in the firmware — `wwandctl rsim enable
+--reset`, which writes the maker's EFS switch: Quectel `AT+QNVFW`,
+Foxconn/Fibocom `AT^EFS`):
 
 | Modem | Card from | Result |
 |---|---|---|
