@@ -508,6 +508,8 @@ function cfg_of(ext)
 		// a modem's card on ANOTHER wwand router, lent by its wwand-rsim
 		proxy = (substr(remote.reader, 0, 6) == 'wwand:');
 	}
+	else if (substr(r, 0, 4) == 'tcp:' && !match(r, /^tcp:[0-9A-Za-z._-]+:[0-9]{1,5}$/))
+		return null;
 	else if (!match(r, LOCAL_READER) && !rspro_ok(r))
 		return null;
 
