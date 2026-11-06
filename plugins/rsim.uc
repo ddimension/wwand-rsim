@@ -41,7 +41,7 @@ function helper_found()
 const SSH_KEY_DIR = '/etc/wwand/rsim';
 // rspro: a card in an osmo-remsim SIM bank; the helper is the remsim client
 // and reaches the server itself, so it is never run over SSH
-const LOCAL_READER = /^((phoenix|pcsc|at|bt):.|wbsm:)/;
+const LOCAL_READER = /^((phoenix|pcsc|at|bt|tcp):.|wbsm:)/;
 const RSPRO_READER = /^rspro:(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(:[0-9]{1,5})?(\/[0-9]{1,5}:[0-9]{1,5})?$/;
 
 // the numbers too, as rsim-card checks them: a port 1..65535, an id or a
@@ -562,7 +562,16 @@ function cfg_of(ext)
 function helper_argv(cfg, path, sys)
 {
 	let reader = cfg.local_reader ?? cfg.reader;
-	let argv = [ cfg.ssh ? (cfg.ssh.helper ?? 'rsim-card') : (path ?? HELPER), reader ];
+	let argv;
+
+	// bench wifi-sim prototype: a tcp:host:port reader is a raw line-JSON
+	// relay (SapRelay / fake-phone-sim) - netcat is the channel, no helper
+	if (substr(reader, 0, 4) == 'tcp:') {
+		let tp = split(substr(reader, 4), ':');
+		argv = [ 'nc', tp[0], tp[1] ];
+	} else {
+		argv = [ cfg.ssh ? (cfg.ssh.helper ?? 'rsim-card') : (path ?? HELPER), reader ];
+	}
 
 	// the other router's wwand lends the card: its proxy speaks the helper's
 	// protocol, so only the command differs
