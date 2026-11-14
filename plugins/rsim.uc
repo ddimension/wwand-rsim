@@ -2144,6 +2144,18 @@ function create(deps)
 				// its wwand_sim, not in the status (the password)
 				delete i.sim;
 				s.reader_info = i;
+
+				// bench patch (2026-11-14, router→router lending): publish the
+				// reader's card identity on the modem object. The modem's own
+				// identity reads (UIM EF, DMS cache, AT) cannot see a card that
+				// rides a reader session — it never appears in the modem's UIM
+				// slots (HW-proven: `wwandctl slots` shows the active remote
+				// slot as absent while its APDU session runs). sim.uc's unlock
+				// and read_identity consult this to let a reader card through.
+				let m = deps.modem_of?.(ref)?.modem;
+				if (m)
+					m.reader_card = { iccid: i.iccid ?? null, imsi: i.imsi ?? null };
+
 				keep_settings(ref, ev.iccid, ev.sim);
 				return;
 			}
@@ -2342,6 +2354,13 @@ function create(deps)
 
 		s.state = 'failed';
 		s.queue = [];
+
+		// bench patch (2026-11-14): the reader card is gone — clear the
+		// identity the plugin published on the modem object (see the info
+		// event handler)
+		let m = deps.modem_of?.(s.ref)?.modem;
+		if (m)
+			m.reader_card = null;
 
 		let c = s.client;
 
