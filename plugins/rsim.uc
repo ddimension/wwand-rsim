@@ -1957,6 +1957,18 @@ function create(deps)
 			s.card_failed = null;
 			s.state = 'powered';
 			s.powered_at ??= now();
+
+			// bench patch 2026-11-15 (phone relays): a reader that sends no
+			// info event (SapRelay over TCP) never sets modem.reader_card, so
+			// the core's synth unlock never fires even though the card is
+			// demonstrably powered and serving APDUs. Push a minimal marker
+			// now — identity stays null here; read_identity's channel reads
+			// (EF-ICCID demonstrably works through such relays) supply what
+			// they can.
+			let m = deps.modem_of?.(s.ref)?.modem;
+			if (m && !m.reader_card)
+				m.reader_card = { iccid: null, imsi: null };
+
 			log('notice', sprintf('rsim %s: card %s, ATR %s', s.ref,
 				(op == 'reset') ? 'reset' : 'powered up', s.atr));
 			event(s, EV_CARD_RESET, { atr: bytes(s.atr) });
