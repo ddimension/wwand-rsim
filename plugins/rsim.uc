@@ -1959,15 +1959,46 @@ function create(deps)
 			s.powered_at ??= now();
 
 			// bench patch 2026-11-15 (phone relays): a reader that sends no
-			// info event (SapRelay over TCP) never sets modem.reader_card, so
-			// the core's synth unlock never fires even though the card is
-			// demonstrably powered and serving APDUs. Push a minimal marker
-			// now — identity stays null here; read_identity's channel reads
-			// (EF-ICCID demonstrably works through such relays) supply what
-			// they can.
+			// info event (SapRelay over TCP, the BT helper) never sets
+			// modem.reader_card, so the core's synth unlock never fires even
+			// though the card is demonstrably powered and serving APDUs.
+			// Push the marker AND read EF-ICCID through the channel — the
+			// ICCID identifies the card to the core (identity adoption and
+			// per-SIM matching) without which the daemon wedges REGISTERING
+			// with empty identity.
 			let m = deps.modem_of?.(s.ref)?.modem;
 			if (m && !m.reader_card)
 				m.reader_card = { iccid: null, imsi: null };
+
+			if (m && m.reader_card?.iccid == null) {
+				// EF-ICCID read via the channel: SELECT MF (3F00), SELECT
+				// 2FE2, READ BINARY 10 — the channel is transparent for file
+				// ops (proven: SELECT SW 9000 through every relay class).
+				let rd_iccid = (done) => {
+					s.rpc.call({ op: 'tpdu', data: '00A4000C023F00' }, (e1) => {
+						s.rpc.call({ op: 'tpdu', data: '00A4000C022FE2' }, (e2) => {
+							s.rpc.call({ op: 'tpdu', data: '00B000000A' }, (e3, r3) => {
+								let hex = r3?.data ?? '';
+								// SW 9000 + 10 data bytes = the ICCID
+								if (!e3 && length(hex) >= 24 && substr(hex, -4) == '9000') {
+									let raw = substr(hex, 0, 20);
+									// swap nibbles, drop the first (length) byte
+									let iccid = '';
+									for (let i = 2; i < length(raw); i += 2) {
+										iccid += substr(raw, i + 1, 1) + substr(raw, i, 1);
+									}
+									if (length(iccid) >= 18) {
+										m.reader_card.iccid = iccid;
+										log('notice', sprintf('rsim %s: channel-read ICCID %s (EF-ICCID through the reader)', s.ref, iccid));
+									}
+								}
+								done();
+							});
+						});
+					});
+				};
+				rd_iccid(() => null);
+			}
 
 			log('notice', sprintf('rsim %s: card %s, ATR %s', s.ref,
 				(op == 'reset') ? 'reset' : 'powered up', s.atr));
