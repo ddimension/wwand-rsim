@@ -1789,6 +1789,26 @@ let donor_plugin = (o) => { let targets = {}; return rsim.create({
 	eq(filter(c.at, (x) => substr(x, 0, 8) == 'AT+CPIN='), [ 'AT+CPIN=1111', 'AT+CPIN=1111', 'AT+CPIN=1111' ],
 	   'ledger: after pin-clear the configured pin is tried again — once per power-up, as always (success, refusal, retry)');
 
+	// the one-shot force vouches past the ledger — and is consumed by the
+	// one entry it buys
+	let d = mkp({ now: 40000 });
+	d.ok = false;
+	d.p.tick('m0', { ...EXT, pincode: '2345' });
+	run_for(20);
+	d.client.fire('CONNECT_IND', { slot: 1 });
+	run_for(60);
+	eq(d.at, [ 'AT+CPIN?', 'AT+CPIN=2345' ], 'ledger: (d) the first refusal');
+	d.at = [];
+
+	d.p.ops.pin_force('m0', { ...EXT, pincode: '2345' }, {}, (e, r2) => { cleared = r2; });
+	d.client.fire('CARD_RESET_IND', { slot: 1 });
+	run_for(60);
+	eq(d.at, [ 'AT+CPIN?', 'AT+CPIN=2345' ], 'ledger: pin-force buys exactly one entry past the refusal');
+	d.at = [];
+	d.client.fire('CARD_RESET_IND', { slot: 1 });
+	run_for(60);
+	eq(d.at, [], 'ledger: ...and is spent: the session latches, the next power-up sends nothing');
+
 	fs.unlink(LED);
 }
 

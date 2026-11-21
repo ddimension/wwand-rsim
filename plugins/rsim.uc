@@ -2058,8 +2058,9 @@ function create(deps)
 	let ask;
 	ask = (s, epoch, tries) => {
 		// the session moved on: a later card power-up owns the next ask,
-		// a completed or refused entry ends the dance
-		if (s.state == 'failed' || s.pin_epoch != epoch || s.pin_done == epoch || s.pin_bad)
+		// a completed or refused entry ends the dance (a pin-force vouches
+		// past a refusal of THIS session too)
+		if (s.state == 'failed' || s.pin_epoch != epoch || s.pin_done == epoch || (s.pin_bad && !s.pin_force))
 			return;
 
 		// CPIN? answers the modem's SIM manager, which holds the card only
@@ -2112,13 +2113,6 @@ function create(deps)
 					s.ref, s.card_iccid ? sprintf(' %s…', substr(iccid_digits(s.card_iccid), 0, 6)) : '', s.pin_count, s.ref));
 			}
 
-			// The one-shot force: the operator explicitly asked for this
-			// entry despite the guards. Consume it — it buys exactly one.
-			if (s.pin_force) {
-				s.pin_force = false;
-				log('notice', sprintf('rsim %s: pin-force — the operator asked for this entry despite the guards', s.ref));
-			}
-
 			let p = pin_of(s);
 
 			if (!p) {
@@ -2136,10 +2130,20 @@ function create(deps)
 			// a refused (card, PIN) pair is never tried again — not by this
 			// session, not by the next one, not after a reboot. The session
 			// latch stays UNSET: the block is per (card, pin), so a pin
-			// that CHANGES gets its own one chance on the next power-up
-			if (refused?.pin == p.pin)
+			// that CHANGES gets its own one chance on the next power-up.
+			// The operator's one-shot pin-force vouches past this too.
+			if (refused?.pin == p.pin && !s.pin_force)
 				return log('err', sprintf('rsim %s: the card%s asks for its PIN and the configured one was REFUSED before — not tried again; fix the pin, then `wwandctl rsim %s pin-clear`',
 					s.ref, s.card_iccid ? sprintf(' %s…', substr(iccid_digits(s.card_iccid), 0, 6)) : '', s.ref));
+
+			// The one-shot force: the operator explicitly asked for this
+			// entry despite the guards (retry count, ledger). Consumed
+			// HERE — where an entry is actually about to leave — so a
+			// force that never reaches a send is not spent.
+			if (s.pin_force) {
+				s.pin_force = false;
+				log('notice', sprintf('rsim %s: pin-force — the operator asked for this entry despite the guards', s.ref));
+			}
 
 			// the configured PIN changed since the refusal: the refused
 			// pair is gone, the new one gets its one chance
