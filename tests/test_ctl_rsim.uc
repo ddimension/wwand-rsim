@@ -485,6 +485,11 @@ function fake_ctx_foxconn(start, reflect)
 	eq(rows[0].config, { name: 'work', apn: 'internet.work', pdp_type: 'ipv4v6', auth: null, username: null, password: true, pin: true },
 	   'proxy list: its wwand_sim settings (matched with the trailing F), the PIN and password only as "set"');
 	eq([ rows[1].lendable, index(rows[1].why, 'only that one') >= 0 ], [ false, true ], 'proxy list: an inactive slot\'s card, and why not');
+	ok(index(rows[1].why, 'rsim_lend_switch') >= 0, 'proxy list: ...naming the option that would allow it');
+	let rows_sw = ctl.lend_rows(call, sims, (m) => m == 'm1');
+	eq([ rows_sw[1].lendable, rows_sw[1].switch, rows_sw[1].why ], [ true, true, null ],
+		'proxy list: with rsim_lend_switch on its modem the inactive card is lendable, after a switch');
+	eq(rows_sw[0].switch, false, 'proxy list: the active card needs no switch');
 
 	// a session: open by ICCID, relay, close
 	let out = [];
@@ -500,6 +505,7 @@ function fake_ctx_foxconn(start, reflect)
 	   { apn: 'internet.m1', pdp_type: null, auth: 'pap', username: null, password: null, source: 'interface' },
 	   'proxy: no wwand_sim for the card: the modem\'s interface');
 	eq(prov.lend_settings([], [ { proto: 'wwand', modem: 'm1' } ], ICC, 'm1'), null, 'proxy: no APN anywhere: nothing');
+
 	eq(slice(out, 1), [ { ok: true, atr: '3B00' }, { ok: true, data: '9000' }, { ok: false, error: 'bad_request', detail: 'not a request object with an op' } ],
 	   'proxy: every request answered, one line each');
 	let open = filter(calls, (c) => c[1] == 'lend_open')[0];
@@ -566,6 +572,42 @@ function fake_ctx_foxconn(start, reflect)
 		'{"done":true}' ]) + '\n', null);
 	eq([ far.rows[0].in_use, far.rows[1].in_use ], [ 'AT port of wwand modem wwmodem0 there', null ],
 	   'scan of another router: the ports its wwand uses are marked, from its own list');
+}
+
+// a card the modem has but does not run on (rsim_lend_switch on the lender)
+{
+	// a card the modem has but does not run on: lend_prepare until ready,
+	// then the lend — or the refusal, word for word
+	let B = '89882390001598474352';
+	let pcalls = [], prep = [ { ready: false, step: 'switching to SIM slot 2' }, { ready: true } ];
+	let pcall = (m, a) => {
+		push(pcalls, (m == 'modem_plugin') ? a.op : m);
+		if (m == 'sim_inventory')
+			return { cards: [ { iccid: '89490200001022832490', present: true, active: true, modem: 'm1', slot: 1 },
+			                  { iccid: B, present: true, active: false, modem: 'm1', slot: 2 } ] };
+		if (m == 'modem_plugin' && a.op == 'lend_prepare')
+			return shift(prep) ?? { ok: false, error: 'switch_failed', detail: 'x' };
+		if (m == 'modem_plugin' && a.op == 'lend_open')
+			return { id: '1-1', mode: 'sap' };
+		return {};
+	};
+	let slept = 0;
+	let ps = prov.proxy_session(pcall, { target: 'iccid:' + B, mode: 'sap', pid: 1, sleep: () => slept++, now: () => 0 });
+	eq(ps.open(), null, 'proxy: a card in another slot is switched to, then lent');
+	eq(filter(pcalls, (c) => index([ 'lend_prepare', 'lend_open' ], c) >= 0), [ 'lend_prepare', 'lend_prepare', 'lend_open' ],
+		'proxy: ...lend_prepare until ready, then the lend');
+	eq([ ps.modem(), slept ], [ 'm1', 1 ], 'proxy: the modem that has the card, one wait in between');
+
+	prep = [ { ok: false, error: 'not_allowed', detail: 'm1 does not run on card ' + B + ' — option rsim_lend_switch' } ];
+	ps = prov.proxy_session(pcall, { target: 'iccid:' + B, mode: 'sap', pid: 1, sleep: () => null, now: () => 0 });
+	ok(index(ps.open() ?? '', 'option rsim_lend_switch') >= 0, 'proxy: without the option the refusal names it');
+
+	let n = 0;
+	prep = [];
+	let call2 = (m, a) => (m == 'modem_plugin' && a.op == 'lend_prepare') ? { ready: false, step: 'enabling eSIM profile' } : pcall(m, a);
+	ps = prov.proxy_session(call2, { target: 'iccid:' + B, mode: 'sap', pid: 1, sleep: () => null,
+		now: () => (n += 60), switch_wait: 150 });
+	ok(index(ps.open() ?? '', 'did not switch to card') >= 0, 'proxy: a switch that does not finish ends the open, named');
 }
 
 // --- readers: what each named reader is ------------------------------------------------

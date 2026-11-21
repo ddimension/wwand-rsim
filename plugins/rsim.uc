@@ -1726,6 +1726,92 @@ function create(deps)
 	//                  the modem back once its session has let go (busy())
 	let switched = {}, slot_ok = {}, restore_at_exit = {};
 
+	// A lend of a card the lending modem does NOT run on — another physical
+	// slot, or an eSIM profile not enabled — with option rsim_lend_switch '1'
+	// on that modem (off by default: the switch costs the lending modem its
+	// own connection, on the internet fallback that is the router's link).
+	// lend_prepare takes it there one step at a time (wwand's sim_bring: the
+	// slot, then the profile, as an ICCID-bound interface does) and records
+	// the card it ran on; once no lend of it is running any more, the tick
+	// takes it back to that card the same way.
+	//   lend_switch[ref] { want, prev, state: 'switching'|'ready'|'restoring',
+	//                      steps, busy, since, used, what }
+	let lend_switch = {};
+	// steps out; a ready card no lend took within UNUSED_S goes back; a switch
+	// nobody asks about for LEASE_S (the proxy asks every 3 s) is abandoned;
+	// the way back retries with a backoff up to BACK_MAX_S and is never given
+	// up — a modem left on a lent card is the one thing this must not do
+	const LEND_SWITCH_STEPS = 4, LEND_SWITCH_UNUSED_S = 120, LEND_SWITCH_LEASE_S = 30, LEND_SWITCH_BACK_MAX_S = 900;
+	let to_restoring = (st) => {
+		st.state = 'restoring';
+		st.back_steps = 0;
+		st.back_fail = 0;
+		st.next_try = 0;
+	};
+	let iccid_of = (v) => {
+		let x = uc(replace(sprintf('%s', v ?? ''), /[^0-9A-Fa-f]/g, ''));
+
+		if (substr(x, -1) == 'F')
+			x = substr(x, 0, length(x) - 1);
+
+		return (length(x) >= 18) ? x : null;
+	};
+	let lent_now = (ref) => {
+		for (let id, l in lends)
+			if (l.ref == ref && !l.ended)
+				return true;
+		for (let d in draining)
+			if (d.cfg.donor?.ref == ref && d.rpc.busy())
+				return true;
+		return false;
+	};
+	// one step back to the card the modem ran on before (tick). The record
+	// goes only when the modem runs that card again; a refusal or too many
+	// steps back off and try again later, visible in the status meanwhile.
+	let lend_switch_back = (ref) => {
+		let st = lend_switch[ref];
+
+		if (!st || st.busy || st.state != 'restoring' || lent_now(ref) || now() < (st.next_try ?? 0))
+			return;
+
+		let later = (why) => {
+			st.back_fail = (st.back_fail ?? 0) + 1;
+			st.back_steps = 0;
+
+			let wait = 60;
+			for (let i = 1; i < st.back_fail && wait < LEND_SWITCH_BACK_MAX_S; i++)
+				wait *= 2;
+
+			st.next_try = now() + ((wait > LEND_SWITCH_BACK_MAX_S) ? LEND_SWITCH_BACK_MAX_S : wait);
+			st.what = why;
+			log('warn', sprintf('rsim %s: back to card %s: %s — trying again in %d s', ref, st.prev, why, st.next_try - now()));
+		};
+
+		if (st.back_steps >= LEND_SWITCH_STEPS + 2)
+			return later(sprintf('still not on it after %d steps', st.back_steps));
+
+		st.busy = true;
+		deps.sim_bring(ref, st.prev, (e, p) => {
+			st.busy = false;
+
+			if (lend_switch[ref] !== st)
+				return;
+			if (e)
+				return later(sprintf('%J', e));
+			if (p?.action == 'ok') {
+				log('notice', sprintf('rsim %s: back on card %s, the one it ran on before the lend', ref, st.prev));
+				return delete lend_switch[ref];
+			}
+			if (p?.action == 'refuse')
+				return later(p.detail ?? 'not reachable');
+			if (p?.action == 'slot' || p?.action == 'enable') {
+				st.back_steps++;
+				st.what = (p.action == 'slot') ? sprintf('switching to SIM slot %d', p.slot) : 'enabling its eSIM profile';
+				log('notice', sprintf('rsim %s: back to card %s: %s', ref, st.prev, st.what));
+			}
+		});
+	};
+
 	// back to the slot the modem ran on before its remote card took it over.
 	// The record stays until the switch went through — a modem that is
 	// resetting refuses it, and a forgotten record left the modem on the
@@ -2532,6 +2618,19 @@ function create(deps)
 				});
 			}
 
+			// a card switched to for a lend goes back once no lend of it runs
+			// any more — or when the proxy never opened one
+			let ls = lend_switch[ref];
+
+			if (ls && ls.state == 'ready' && !lent_now(ref) &&
+			    (ls.used || now() - ls.since >= LEND_SWITCH_UNUSED_S))
+				to_restoring(ls);
+			// abandoned on the way there: the proxy gave up or died
+			if (ls && ls.state == 'switching' && !ls.busy && now() - (ls.touched ?? ls.since) >= LEND_SWITCH_LEASE_S)
+				to_restoring(ls);
+			if (ls && ls.state == 'restoring')
+				lend_switch_back(ref);
+
 			// a card lent to another router: its proxy must still be there
 			for (let id, l in lends) {
 				if (l.ref != ref)
@@ -2880,6 +2979,102 @@ function create(deps)
 		ops: {
 			// ---- lending to another router: `wwandctl rsim proxy` ----------
 			// Read-only: null, or why this modem's card cannot be lent now.
+			// For a lend of a card the modem does not run on (rsim_lend_switch,
+			// lend_switch above): one step towards it per call. args: { iccid }.
+			// -> { ready: true } once the modem runs it, { ready: false, step }
+			// while it is on its way (ask again in a few seconds), or an error
+			// naming why not.
+			lend_prepare: (ref, ext, args, cb) => {
+				let want = iccid_of(args?.iccid);
+
+				if (!want)
+					return cb({ error: 'bad_request', detail: 'no ICCID' });
+				if (ext?.rsim_lend_switch != '1' && ext?.rsim_lend_switch !== true)
+					return cb({ error: 'not_allowed', detail: sprintf('%s does not run on card %s — option rsim_lend_switch \'1\' on its wwand_modem lets it switch to that card for a lend, and back after', ref, want) });
+				if (type(deps.sim_bring) != 'function')
+					return cb({ error: 'unsupported', detail: 'wwand here is too old to switch to a card for a lend (needs sim_bring)' });
+
+				let why = lend_refusal(ref, ext);
+
+				if (why)
+					return cb({ error: 'busy', detail: why });
+
+				let st = lend_switch[ref];
+
+				// on its way back while the same card is asked for again: the
+				// switch is picked up again (the tick and this would otherwise
+				// pull the modem two ways); another card waits until it is back
+				if (st && st.state == 'restoring') {
+					if (st.want != want || st.busy)
+						return cb({ error: 'busy', detail: sprintf('it is going back to card %s after a lend', st.prev) });
+					st.state = 'switching';
+					st.used = false;
+					st.since = now();
+				}
+
+				// one switched card at a time, ready or not: another one waits
+				// until the modem is back (a ready card taken away before its
+				// lend opened would hand that lend the wrong card)
+				if (st && st.want != want)
+					return cb({ error: 'busy', detail: sprintf('it runs on, or switches to, card %s for another lend', st.want) });
+
+				if (!st) {
+					let cur = iccid_of(deps.modem_of?.(ref)?.modem?.info?.iccid);
+
+					// the card to go back to must be known before anything moves
+					if (!cur)
+						return cb(null, { ready: false, step: 'its current card is being read' });
+
+					st = lend_switch[ref] = { want: want, prev: cur, state: 'switching',
+					                          steps: 0, busy: false, since: now(), used: false, what: null };
+				}
+
+				// the lease: a switch nobody asks about any more goes back (tick)
+				st.touched = now();
+
+				if (st.state == 'ready')
+					return cb(null, { ready: true });
+				if (st.busy)
+					return cb(null, { ready: false, step: st.what ?? 'switching' });
+				if (st.steps >= LEND_SWITCH_STEPS) {
+					to_restoring(st);
+					return cb({ error: 'switch_failed', detail: sprintf('card %s not in use after %d steps', want, st.steps) });
+				}
+
+				st.busy = true;
+				deps.sim_bring(ref, want, (e, p) => {
+					st.busy = false;
+
+					if (lend_switch[ref] !== st)
+						return cb({ error: 'busy', detail: 'the switch was given up meanwhile' });
+
+					// a step that failed, or a card that cannot be reached:
+					// the modem goes back to what it ran on (the tick)
+					if (e || p?.action == 'refuse') {
+						to_restoring(st);
+						return cb({ error: 'switch_failed', detail: e ? sprintf('%J', e) : (p.detail ?? 'not reachable') });
+					}
+
+					if (p?.action == 'ok') {
+						st.state = 'ready';
+						// the unused-ready time counts from here, not from the
+						// start: a switch may take most of the 150 s
+						st.since = now();
+						log('notice', sprintf('rsim %s: runs on card %s now, for a lend (it ran on %s)', ref, want, st.prev ?? '?'));
+						return cb(null, { ready: true });
+					}
+
+					if (p?.action == 'slot' || p?.action == 'enable') {
+						st.steps++;
+						st.what = (p.action == 'slot') ? sprintf('switching to SIM slot %d', p.slot)
+							: sprintf('enabling eSIM profile %s', want);
+						log('notice', sprintf('rsim %s: for a lend of card %s: %s', ref, want, st.what));
+					}
+
+					cb(null, { ready: false, step: st.what ?? 'the card is being read' });
+				});
+			},
+
 			lend_check: (ref, ext, args, cb) => {
 				let why = lend_refusal(ref, ext);
 
@@ -2897,6 +3092,17 @@ function create(deps)
 
 				if (why)
 					return cb({ error: 'busy', detail: why });
+
+				// a switched card is lent only to the lend it was switched for,
+				// and only once it is in use: not while switching or going back,
+				// and not to a lend of another card (or of "the modem")
+				let ls = lend_switch[ref];
+
+				if (ls && (ls.state != 'ready' || iccid_of(args?.iccid) != ls.want))
+					return cb({ error: 'busy', detail: (ls.state == 'ready')
+						? sprintf('it runs on card %s for another lend', ls.want)
+						: sprintf('it is %s card %s', (ls.state == 'restoring') ? 'going back to' : 'switching to',
+							(ls.state == 'restoring') ? ls.prev : ls.want) });
 
 				// its process is what tells a proxy that is gone from one
 				// that is idle — the only sign of life it gives
@@ -2929,6 +3135,9 @@ function create(deps)
 					delete lends[id];
 					return cb({ error: 'refused', detail: l.why });
 				}
+
+				if (lend_switch[ref]?.state == 'ready')
+					lend_switch[ref].used = true;
 
 				log('notice', sprintf('rsim %s: lending the card to %s (%s)', ref, l.client,
 					{ sap: 'SIM Access', apdu: 'APDU' }[l.mode] ?? 'SIM Access, or APDU without it'));
@@ -3142,6 +3351,10 @@ function create(deps)
 					lendable: !refused,
 					lend_why: refused,
 					lend_hold: !!lend_hold[ref],
+					// a card switched to for a lend, and the one it goes back to
+					lend_switch: lend_switch[ref] ? { card: lend_switch[ref].want, back_to: lend_switch[ref].prev,
+					                                  state: lend_switch[ref].state, step: lend_switch[ref].what } : null,
+					lend_switch_allowed: ext?.rsim_lend_switch == '1',
 					// whether another router can be served at all: the
 					// proxy is package wwand-rsim-provider's
 					lend_provider: !!fs.access(PROVIDER_PATH),
@@ -3267,6 +3480,9 @@ return {
 	           'rsim_ssh_port', 'rsim_ssh_key', 'rsim_ssh_helper', 'rsim_donor_mode', 'rsim_donor_slot', 'rsim_donor_cond', 'rsim_donor_apdu',
 	           // off | local: what the modem runs on while its remote SIM is not connected
 	           'rsim_fallback',
+	           // '1': a lend may switch this modem to the card asked for (another
+	           // slot, an eSIM profile) and back after
+	           'rsim_lend_switch',
 	           // a named SIM reader (config wwand_simreader) instead of the above
 	           'rsim' ],
 	create: create,

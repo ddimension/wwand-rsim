@@ -1096,6 +1096,7 @@ let donor_plugin = (o) => { let targets = {}; return rsim.create({
 	qmi_release: () => null,
 	modem_radio: (ref, on, cb) => { push(o.radio ?? [], [ ref, on ]); if (o.mods?.[ref]) o.mods[ref].lowpower_parked = !on; cb?.(null); },
 	sim_slots: o.sim_slots,
+	sim_bring: o.sim_bring,
 	modem_sections: o.modem_sections ?? (() => ({})),
 	pid_alive: o.pid_alive,
 	now: () => o.t.now,
@@ -1965,6 +1966,132 @@ let off_ext = { rsim_fallback: 'local' };
 	eq(length(ups), 1, 'lender settings: none sent, nothing written');
 	p.stop();
 	run_for(50);
+}
+
+// --- a lend of a card the modem does not run on (rsim_lend_switch) -------------
+// Another slot or an eSIM profile: lend_prepare takes the modem there one
+// step at a time (wwand's sim_bring), only with the option set; once no lend
+// of it runs any more, the tick takes it back to the card it ran on.
+{
+	let t = { now: 1000 };
+	let A = '89490200001022832490', B = '89882390001598474352';
+	let brings = [];
+	let mo = modem_obj('m1');
+	mo.info = { iccid: A };
+	// B is in slot 2 as an eSIM profile: a slot switch, the card read, the
+	// profile enabled, then the modem runs it; and back: the slot switch only
+	let bring = (ref, iccid, cb) => {
+		push(brings, iccid);
+		let n = length(filter(brings, (x) => x == iccid));
+		if (iccid == B)
+			return (n == 1) ? cb(null, { action: 'slot', slot: 2 })
+				: (n == 2) ? cb(null, { action: 'enable', slot: 2 })
+				: ((mo.info.iccid = B), cb(null, { action: 'ok' }));
+		if (n == 1)
+			return cb(null, { action: 'slot', slot: 1 });
+		mo.info.iccid = A;
+		cb(null, { action: 'ok' });
+	};
+	let p = donor_plugin({ t: t, target: fake_client(), donor: sap_donor([]), sim_bring: bring });
+	let op = (name, ref, ext, args) => {
+		let res = null;
+		p.ops[name](ref, ext, args, (e, r) => { res = e ? { err: e } : r; });
+		run_for(200);
+		return res;
+	};
+	let on = { rsim_lend_switch: '1' };
+
+	eq(op('lend_prepare', 'm1', {}, { iccid: B })?.err?.error, 'not_allowed',
+		'lend switch: refused without option rsim_lend_switch');
+	eq(brings, [], 'lend switch: ...and nothing switched');
+
+	eq(op('lend_prepare', 'm1', on, { iccid: B + 'F' }), { ready: false, step: 'switching to SIM slot 2' },
+		'lend switch: the first step, the slot');
+	eq(op('lend_prepare', 'm1', on, { iccid: B }), { ready: false, step: 'enabling eSIM profile ' + B },
+		'lend switch: the next step, the profile');
+	eq(op('lend_prepare', 'm1', on, { iccid: B }), { ready: true }, 'lend switch: then the modem runs it');
+	eq(op('lend_prepare', 'm1', on, { iccid: B }), { ready: true }, 'lend switch: asked again, nothing more to do');
+	eq(length(brings), 3, 'lend switch: three steps, no more');
+
+	eq(op('lend_open', 'm1', on, { mode: 'sap', client: '10.0.0.8', pid: 4799 })?.err?.error, 'busy',
+		'lend switch: a lend that does not name the switched card is refused');
+	let o = op('lend_open', 'm1', on, { mode: 'sap', client: '10.0.0.9', pid: 4800, iccid: B });
+	ok(o?.id, 'lend switch: the lend of the card it was switched for opens');
+	p.tick('m1', on); run_for(50);
+	eq(length(brings), 3, 'lend switch: no way back while it is lent');
+
+	eq(op('lend_close', 'm1', on, { id: o.id }), { closed: true }, 'lend switch: the lend ends');
+	for (let i = 0; i < 4; i++) { t.now += 10; p.tick('m1', on); run_for(200); }
+	eq(slice(brings, 3), [ A, A ], 'lend switch: back to the card it ran on, step by step');
+	eq(mo.info.iccid, A, 'lend switch: ...and it runs on it again');
+
+	// a switch the proxy never used goes back too
+	brings = [];
+	let mo2 = modem_obj('m2');
+	mo2.info = { iccid: A };
+	let used = 0;
+	let p2 = donor_plugin({ t: t, target: fake_client(), donor: sap_donor([]),
+		sim_bring: (ref, iccid, cb) => { push(brings, iccid); used++; mo2.info.iccid = iccid; cb(null, { action: 'ok' }); } });
+	let r = null;
+	p2.ops.lend_prepare('m2', on, { iccid: B }, (e, x) => { r = x; });
+	eq(r, { ready: true }, 'unused switch: the card was in reach at once');
+	t.now += 130;
+	p2.tick('m2', on); run_for(200);
+	eq(brings, [ B, A ], 'unused switch: no lend opened within 120 s — back to the card it ran on');
+}
+
+// the lend switch's way back, made safe (Codex review)
+{
+	let t = { now: 5000 };
+	let A = '89490200001022832490', B = '89882390001598474352', C = '89882390001598474360';
+	let on = { rsim_lend_switch: '1' };
+	let mk = (ref, bring) => donor_plugin({ t: t, target: fake_client(), donor: sap_donor([]), sim_bring: bring });
+	let prep = (p, ref, iccid) => { let r = null; p.ops.lend_prepare(ref, on, { iccid: iccid }, (e, x) => { r = e ? { err: e } : x; }); run_for(50); return r; };
+
+	// the current card unknown (being read): nothing starts
+	let m3 = modem_obj('m3');
+	m3.info = { iccid: null };
+	let b3 = [];
+	let p3 = mk('m3', (ref, iccid, cb) => { push(b3, iccid); cb(null, { action: 'ok' }); });
+	eq(prep(p3, 'm3', B), { ready: false, step: 'its current card is being read' }, 'safe: no switch while its own card is unknown');
+	eq(b3, [], 'safe: ...nothing moved');
+
+	// abandoned on the way there: back after the lease
+	let m4 = modem_obj('m4');
+	m4.info = { iccid: A };
+	let b4 = [];
+	let p4 = mk('m4', (ref, iccid, cb) => { push(b4, iccid); (iccid == A) ? cb(null, { action: 'ok' }) : cb(null, { action: 'slot', slot: 2 }); });
+	eq(prep(p4, 'm4', B)?.ready, false, 'safe: on the way there');
+	t.now += 35;
+	p4.tick('m4', on); run_for(50);
+	eq(b4, [ B, A ], 'safe: a switch nobody asks about for 30 s goes back');
+
+	// another card while one is ready: busy, until it is back
+	let m5 = modem_obj('m5');
+	m5.info = { iccid: A };
+	let p5 = mk('m5', (ref, iccid, cb) => { m5.info.iccid = iccid; cb(null, { action: 'ok' }); });
+	eq(prep(p5, 'm5', B), { ready: true }, 'safe: card B ready');
+	eq(prep(p5, 'm5', C)?.err?.error, 'busy', 'safe: card C waits — B is not taken away before its lend');
+
+	// the way back refused: kept, tried again later
+	let m6 = modem_obj('m6');
+	m6.info = { iccid: A };
+	let refuse = 1, b6 = [];
+	let p6 = mk('m6', (ref, iccid, cb) => {
+		push(b6, iccid);
+		if (iccid == A && refuse-- > 0) return cb(null, { action: 'refuse', detail: 'inventory not read yet' });
+		m6.info.iccid = iccid; cb(null, { action: 'ok' });
+	});
+	eq(prep(p6, 'm6', B), { ready: true }, 'safe: card B ready on m6');
+	t.now += 130;
+	p6.tick('m6', on); run_for(50);
+	eq([ slice(b6, 1), m6.info.iccid ], [ [ A ], B ], 'safe: the way back refused once — still on B');
+	t.now += 30;
+	p6.tick('m6', on); run_for(50);
+	eq(length(b6), 2, 'safe: ...not hammered before its backoff');
+	t.now += 40;
+	p6.tick('m6', on); run_for(50);
+	eq(m6.info.iccid, A, 'safe: tried again after the backoff, and back on A');
 }
 
 // --- a card lent to another router (wwandctl rsim proxy) -------------------------

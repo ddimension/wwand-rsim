@@ -498,8 +498,20 @@ function modem_meta(m)
 	};
 }
 
-function lend_rows(call, sims)
+// lend_switch(modem) -> bool: whether option rsim_lend_switch lets that modem
+// switch to a card it does not run on for a lend (injectable for the tests)
+function lend_switch_of(modem)
 {
+	let c = libuci.cursor();
+
+	c.load('network');
+	return c.get('network', modem, 'rsim_lend_switch') == '1';
+}
+
+function lend_rows(call, sims, lend_switch)
+{
+	lend_switch ??= lend_switch_of;
+
 	let inv = call('sim_inventory', {});
 	let mods = call('status', {})?.modems ?? {};
 	let rows = [];
@@ -509,11 +521,14 @@ function lend_rows(call, sims)
 		if (!c.present || c.reader || !c.modem)
 			continue;
 
-		let why = null, sap = null;
+		let why = null, sap = null, switching = false;
 
-		if (!c.active)
-			why = sprintf('not the card %s runs on — only that one can be lent', c.modem);
+		// not the card its modem runs on: lendable only where the modem may
+		// switch to it for the lend (rsim_lend_switch) — and back after
+		if (!c.active && !lend_switch(c.modem))
+			why = sprintf('not the card %s runs on — only that one can be lent (option rsim_lend_switch \'1\' on %s lets a lend switch to it, and back after)', c.modem, c.modem);
 		else {
+			switching = !c.active;
 			let r = call('modem_plugin_status', { modem: c.modem, plugin: 'rsim', op: 'lend_check' });
 
 			why = (r == null) ? 'wwand does not answer'
@@ -526,6 +541,9 @@ function lend_rows(call, sims)
 			backend: 'wwand', spec: 'wwand:iccid:' + c.iccid, device: c.modem, modem: c.modem,
 			slot: c.slot ?? null, iccid: c.iccid, imsi: c.imsi ?? null, eid: c.eid ?? null,
 			profile: c.profile?.name ?? null, lendable: !why, why: why,
+			// lent only after a switch to it: the lending modem loses its own
+			// connection for the time of the lend
+			switch: switching,
 			// the ways it can be lent: SIM Access when its UIM has it
 			modes: (sap === true) ? [ 'sap', 'apdu' ] : (sap === false) ? [ 'apdu' ] : null,
 			config: sim_config(sims, c.iccid),

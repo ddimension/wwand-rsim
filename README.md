@@ -151,7 +151,25 @@ included), or — killed hard — when the daemon there sees its process gone
 (connected to it or not), lends its card
 to a modem there, or is configured as a sponsor there is not lent. This
 needs **wwand-rsim-provider** on that router (the proxy; it pulls in
-wwand-rsim) — without it, `wwandctl rsim scan` from here says so and lists
+wwand-rsim).
+
+**A card the lending modem does not run on** — the one in its other slot,
+or an eSIM profile that is not enabled — is lent only with `option
+rsim_lend_switch '1'` on that modem's `wwand_modem` (off by default; LuCI:
+*Switch to the card for a lend*). Asked for it by ICCID
+(`wwand:iccid:<ICCID>`), the modem switches to it one step at a time — the
+slot, then the profile, as an ICCID-bound interface does — and the lend
+opens once it runs on it (at most 150 s); once no lend of it runs any more,
+or none was opened within 120 s, it goes back to the card it ran on, the
+same way. While it lends that card it has **no connection of its own**: on
+a router whose only link is that modem (an internet fallback), a lend cuts
+it off. A card an eIM plugin manages, or one an ICCID-bound interface is
+using, is not switched away from (the lend is refused with the reason).
+The scan lists such cards as lendable "after a switch". Without the option,
+the refusal names it. Not done at the daemon's exit: a modem that is
+switched to a lent card when wwand stops stays on it until its next
+bring-up (`option sim_slot`, a bound interface). Without wwand-rsim-provider
+on that router, `wwandctl rsim scan` from here says so and lists
 none of its modems' cards, only their AT ports; a router with only
 rsim-card has no modems to lend. As a named reader: `option type
 'wwand'`, `option host`, `option device '<modem>|iccid:<ICCID>'`, and the

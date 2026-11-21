@@ -572,6 +572,14 @@ return view.extend({
 				: _('Expecting off (keep the radio off) or local (the modem\'s own SIM)');
 		};
 
+		/* the lending side: a lend may switch this modem to the card asked
+		   for (another slot, an eSIM profile) and back after — off by
+		   default, since the modem loses its own connection meanwhile */
+		o = s.option(form.Flag, 'rsim_lend_switch', _('Switch to the card for a lend'),
+			_('When another router asks for a card this modem has but does not run on — the one in its other slot, or an eSIM profile that is not enabled — switch to it for the lend and back to the card it ran on afterwards. Off by default: while it lends that card this modem has no connection of its own, and on a router whose only link is this modem that cuts it off.'));
+		o.default = o.disabled;
+		o.optional = true;
+
 		var view = this;
 
 		return m.render().then(function(node) {
@@ -731,6 +739,13 @@ return view.extend({
 			else if (st.lend_hold) {
 				lending.push(level('warn', _('lending stopped here')));
 			}
+			else if (st.lend_switch && st.lend_switch.state != 'restoring') {
+				lending.push(level('warn', (st.lend_switch.state == 'ready')
+					? _('runs on card %s for a lend').format(st.lend_switch.card)
+					: _('switching to card %s for a lend: %s').format(st.lend_switch.card, st.lend_switch.step || '…')));
+				if (st.lend_switch.back_to)
+					lending.push(E('div', { 'style': 'opacity:.75;font-size:92%' }, [ _('back to card %s after').format(st.lend_switch.back_to) ]));
+			}
 			else if (st.lendable === false && st.lend_why) {
 				lending.push(E('span', { 'style': 'opacity:.75;font-size:92%' }, [ _('not lendable: %s').format(st.lend_why) ]));
 			}
@@ -738,8 +753,13 @@ return view.extend({
 				lending.push(E('span', { 'style': 'opacity:.75;font-size:92%' }, _('to modems of this router only — wwand-rsim-provider is not installed')));
 			}
 			else if (st.lendable) {
-				lending.push(E('span', { 'style': 'opacity:.75;font-size:92%' }, _('can be lent to another router')));
+				lending.push(E('span', { 'style': 'opacity:.75;font-size:92%' }, st.lend_switch_allowed
+					? _('can be lent to another router — also its other cards, after a switch')
+					: _('can be lent to another router')));
 			}
+
+			if (st.lend_switch && st.lend_switch.state == 'restoring')
+				lending.push(E('div', { 'style': 'opacity:.75;font-size:92%' }, [ _('back to card %s after a lend…').format(st.lend_switch.back_to || '?') ]));
 
 			if (st.lend_hold)
 				actions.push(button(_('Allow lending'), _('Let another router borrow this card again'),
@@ -863,7 +883,11 @@ return view.extend({
 			return E('tr', { 'class': 'tr' }, [
 				E('td', { 'class': 'td' }, [ KIND[x.backend] || x.backend ]),
 				E('td', { 'class': 'td', 'style': 'font-family:monospace;word-break:break-all' }, [ x.spec || x.device || '' ]),
-				E('td', { 'class': 'td' }, what.concat(blocked ? [ level('warn', blocked) ] : [])),
+				E('td', { 'class': 'td' }, what.concat(blocked ? [ level('warn', blocked) ]
+					/* not the card that router's modem runs on: lent after it
+					   switches to it, and its own connection is gone meanwhile */
+					: (x.backend == 'wwand' && x.switch) ? [ level('warn', _('lent after that modem switches to it — it has no connection of its own meanwhile')) ]
+					: [])),
 				E('td', { 'class': 'td' }, [
 					/* explicit: only this source is opened — the scan never
 					   speaks to a port on its own; a wwand router's card is

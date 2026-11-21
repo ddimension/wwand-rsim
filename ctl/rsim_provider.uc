@@ -66,7 +66,9 @@ function lend_settings(sims, ifaces, iccid, modem)
 }
 
 // the modem a target names: a modem, or iccid:<ICCID> — the modem that RUNS
-// on that card now
+// on that card now, or one that HAS it in another slot or as an eSIM profile
+// not enabled ({ modem, switch_to }: the plugin's lend_prepare decides whether
+// it may switch to it — option rsim_lend_switch on that modem)
 function lend_target(call, target)
 {
 	if (substr(target ?? '', 0, 6) == 'iccid:') {
@@ -75,9 +77,18 @@ function lend_target(call, target)
 		if (!id)
 			return { error: sprintf('%s is not an ICCID', substr(target, 6)) };
 
-		for (let c in (call('sim_inventory', {})?.cards ?? []))
-			if (c.iccid == id && c.present && c.active && c.modem && !c.reader)
+		let other = null;
+
+		for (let c in (call('sim_inventory', {})?.cards ?? [])) {
+			if (c.iccid != id || !c.present || !c.modem || c.reader)
+				continue;
+			if (c.active)
 				return { modem: c.modem };
+			other ??= c.modem;
+		}
+
+		if (other)
+			return { modem: other, switch_to: id };
 
 		return { error: sprintf('no modem here runs on the card %s', id) };
 	}
@@ -112,8 +123,34 @@ function proxy_session(call, o)
 
 			modem = t.modem;
 
+			// the card is there but not the one the modem runs on: the plugin
+			// switches to it step by step (each step a card change, read
+			// again) and says when it is ready; the lend opens only then
+			if (t.switch_to) {
+				let until = (o.now ?? time)() + (o.switch_wait ?? 150);
+
+				for (;;) {
+					let p = plugin('lend_prepare', { iccid: t.switch_to });
+
+					if (p == null)
+						return 'wwand does not answer (is it running?)';
+					if (p.ok === false)
+						return sprintf('%s cannot lend card %s: %s', modem, t.switch_to,
+							(p.error == 'invalid_op') ? 'wwand-rsim here is too old to switch to a card' : (p.detail ?? p.error ?? '?'));
+					if (p.ready)
+						break;
+					if ((o.now ?? time)() >= until)
+						return sprintf('%s did not switch to card %s within %d s (%s)', modem, t.switch_to,
+							o.switch_wait ?? 150, p.step ?? '?');
+
+					// seconds: ucode's own sleep() takes milliseconds
+					(o.sleep ?? ((n) => system(sprintf('sleep %d', n))))(3);
+				}
+			}
+
+			// the card it was switched for: a switched modem lends it only to that lend
 			let r = plugin('lend_open', { mode: o.mode, slot: o.slot, apdu: o.apdu, cond: o.cond,
-			                              client: o.client, pid: o.pid });
+			                              client: o.client, pid: o.pid, ...(t.switch_to ? { iccid: t.switch_to } : {}) });
 
 			if (r == null)
 				return 'wwand does not answer (is it running?)';
