@@ -96,9 +96,10 @@ card's three, and the third ends in PUK; a refused entry (a wrong PIN)
 is never repeated for the life of the session, and a card asking for its
 PUK is never sent anything (unblock it off-router). After a successful
 entry the plugin asks the core to resume a modem that had stopped for
-want of a card (`deps.retry_sim`). Host-tested; the donor bench
-(NR7101/RG502Q-EA) runs PIN-less cards through the modem's own SIM
-manager.
+want of a card (`deps.retry_sim`). Hardware-proven 2026-11-21 on the
+bench chain (a Pixel 10's PIN-enabled SIM over Bluetooth SAP to an
+NR7101/RG502Q-EA): one entry per card power-up across three offerings,
+HOME registration on the card's network, the PIN never logged.
 
 Readers: `phoenix:<tty>` (a Phoenix/Smartmouse serial reader with switches),
 `wbsm:[USB serial]` (WB Electronics Smartmouse USB: clock and mode set by
