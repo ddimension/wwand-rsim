@@ -1709,6 +1709,45 @@ function create(deps)
 	let fallbacks = {};
 	// per modem: the unknown rsim_fallback value already warned about
 	let fallback_warned = {};
+	// The physical slot the modem runs on decides whether it uses the remote
+	// card at all: the RG502Q-EA takes UIM Remote slot 1 only while it runs on
+	// physical slot 1. On slot 2 (its own card, option sim_slot '2') it did one
+	// SELECT MF on the remote card, got a correct 61xx / 9000 answer, sent
+	// nothing more and powered the card down 7 s later, for ever; on slot 1
+	// it read the card completely (NR7101, an RG650E eUICC and a plain UICC
+	// lent over SSH, 2026-11-21). So a session first puts the modem on the
+	// physical slot its remote card is offered on, and answers sim_slot so a
+	// modem reset does not switch it back; once no remote card is wanted, or a
+	// failed one waits for its retry with rsim_fallback local, it goes back.
+	//   switched[ref]  { from, to }: the plugin moved the modem from `from`
+	//   slot_ok[ref]   the remote card's slot, once the modem is known to have
+	//                  that physical slot (the hook answers only then)
+	//   restore_at_exit[ref]  the daemon stops with rsim_fallback local: put
+	//                  the modem back once its session has let go (busy())
+	let switched = {}, slot_ok = {}, restore_at_exit = {};
+
+	// back to the slot the modem ran on before its remote card took it over.
+	// The record stays until the switch went through — a modem that is
+	// resetting refuses it, and a forgotten record left the modem on the
+	// remote card's slot for good (Codex review) — and one request at a time.
+	let restore_slot = (ref) => {
+		let sw = switched[ref];
+
+		if (!sw || sw.busy || type(deps.sim_switch_slot) != 'function')
+			return;
+
+		sw.busy = true;
+		log('notice', sprintf('rsim %s: back to physical slot %d, the modem\'s own card', ref, sw.from));
+		deps.sim_switch_slot(ref, sw.from, (e) => {
+			sw.busy = false;
+
+			if (e)
+				return log('warn', sprintf('rsim %s: switching back to slot %d failed: %J — trying again', ref, sw.from, e));
+
+			if (switched[ref] === sw)
+				delete switched[ref];
+		});
+	};
 
 	// null, or why this modem's card cannot be lent to another router now
 	let lend_refusal = (ref, ext) => {
@@ -2303,10 +2342,66 @@ function create(deps)
 		// found no client (an MBIM modem whose QMI passthrough was not up)
 		// did that on every retry for nothing (HW-seen on the GL-X3000,
 		// 2026-09-27).
+		// the modem on the remote card's physical slot first (switched,
+		// above); a switch ends this attempt, the next one finds the slot right
+		let ensure_slot = (go) => {
+			if (type(deps.sim_slots) != 'function' || type(deps.sim_switch_slot) != 'function')
+				return go();
+
+			deps.sim_slots(ref, (e, r) => {
+				if (s.state == 'failed' || sessions[ref] != s)
+					return;
+
+				let list = e ? [] : (r?.slots ?? []);
+				let want = cfg.slot;
+				let has = filter(list, (x) => +x.physical == want && !x.inferred)[0];
+				let cur = filter(list, (x) => x.active)[0];
+
+				// one slot, an unreadable list, or no such slot: as before
+				if (!has || !cur || length(list) < 2)
+					return go();
+
+				slot_ok[ref] = want;
+
+				if (+cur.physical == want) {
+					// already there and no record: a daemon that restarted after
+					// moving it. The slot to go back to is the configured one
+					let own = +(deps.modem_of?.(ref)?.modem?.config?.sim_slot ?? 0);
+
+					if (!switched[ref] && own > 0 && own != want &&
+					    filter(list, (x) => +x.physical == own && !x.inferred)[0])
+						switched[ref] = { from: own, to: want };
+
+					return go();
+				}
+
+				log('notice', sprintf('rsim %s: the modem runs on physical slot %d and the remote card is offered on slot %d, which it uses only from that slot — switching it to slot %d while the remote card is in use',
+					ref, +cur.physical, want, want));
+				// a second move (rsim_slot changed) keeps where it all began
+				let before = switched[ref];
+
+				switched[ref] = { from: before?.from ?? +cur.physical, to: want };
+				deps.sim_switch_slot(ref, want, (e2) => {
+					if (s.state == 'failed' || sessions[ref] != s)
+						return;
+					if (e2) {
+						// the modem did not move: what it ran on before still holds
+						if (before)
+							switched[ref] = before;
+						else
+							delete switched[ref];
+						log('warn', sprintf('rsim %s: switching to slot %d failed: %J — offering the remote card anyway', ref, want, e2));
+						return go();
+					}
+					soft(s, sprintf('switched the modem to physical slot %d for the remote card', want));
+				});
+			});
+		};
+
 		if (cfg.donor || cfg.proxy)
-			with_client(() => with_card(offer));
+			ensure_slot(() => with_client(() => with_card(offer)));
 		else
-			with_card(() => with_client(offer));
+			ensure_slot(() => with_card(() => with_client(offer)));
 	};
 
 	// polite: tell the modem the card is gone and the connection with it, so
@@ -2535,6 +2630,14 @@ function create(deps)
 			if (s && s.state == 'powered' && s.powered_at != null && now() - s.powered_at >= 60 && notes[ref]?.failures)
 				note(ref, { failures: 0 });
 
+			// back to the slot the modem ran on before its remote card took it
+			// over: no remote card wanted any more, or a failed one waiting for
+			// its retry (or held) with rsim_fallback local — the local card is
+			// the way out meanwhile. The next session switches again.
+			if (switched[ref] && !s && !stopping[ref] && (!cfg || (fb.mode == 'local' &&
+			    (notes[ref]?.hold || (notes[ref]?.retry_at != null && now() < notes[ref].retry_at)))))
+				restore_slot(ref);
+
 			if (!cfg || s || stopping[ref])
 				return;
 
@@ -2636,6 +2739,28 @@ function create(deps)
 		// Why a modem's radio must stay off (plugins.uc radio_hold): it lends
 		// its card, or waits for its remote one — and an interface bring-up
 		// must not switch it back on.
+		// the physical slot the modem must run on while its remote card is in
+		// use (switched, above) — asserted by the core at every bring-up
+		// Answered while a remote card is WANTED, not only while a session
+		// object exists: a modem reset ends the session ("the modem restarted
+		// — offering the remote card again") and the next one starts a tick
+		// later, and the bring-up in between asserted option sim_slot — the
+		// slot switched 1 -> 2 -> 1 on every reset (NR7101, 2026-11-21).
+		// Not answered while a failed card waits for its retry, or is held,
+		// with rsim_fallback local: the local card is the way out then.
+		sim_slot: (ref, ext) => {
+			let cfg = resolve(ext).cfg;
+
+			if (!cfg || slot_ok[ref] != cfg.slot)
+				return null;
+
+			if (fallback_of(ext).mode == 'local' && !sessions[ref] &&
+			    (notes[ref]?.hold || (notes[ref]?.retry_at != null && now() < notes[ref].retry_at)))
+				return null;
+
+			return { slot: cfg.slot, why: sprintf('the remote card is offered on slot %d, which the modem uses only from physical slot %d', cfg.slot, cfg.slot) };
+		},
+
 		radio_hold: (ref, ext) => {
 			for (let other, os in sessions)
 				if (os.state != 'failed' && os.cfg.donor?.ref == ref)
@@ -3066,7 +3191,15 @@ function create(deps)
 		busy: () => {
 			draining = filter(draining, (d) => d.rpc.busy());
 
-			return length(keys(stopping)) > 0 || length(draining) > 0;
+			// the slot back once the session let go of the remote card
+			for (let ref in keys(restore_at_exit)) {
+				if (!switched[ref])
+					delete restore_at_exit[ref];
+				else if (!stopping[ref] && !sessions[ref])
+					restore_slot(ref);
+			}
+
+			return length(keys(stopping)) > 0 || length(draining) > 0 || length(keys(restore_at_exit)) > 0;
 		},
 
 		// the daemon exits (plugins.uc plugins_stop): every modem gets its
@@ -3089,6 +3222,15 @@ function create(deps)
 				pending = true;
 				stop_session(s, true, fallbacks[ref] != 'local');
 			}
+
+			// ...and on the slot that card is in: busy() switches it back once
+			// the session has let go (without a fallback the radio stays off
+			// and the next start's bring-up decides)
+			for (let ref, sw in switched)
+				if (fallbacks[ref] == 'local') {
+					restore_at_exit[ref] = true;
+					pending = true;
+				}
 
 			return pending;
 		},

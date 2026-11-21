@@ -1101,6 +1101,141 @@ let donor_plugin = (o) => { let targets = {}; return rsim.create({
 	now: () => o.t.now,
 }); };
 
+// --- the CLIENT's physical slot: the RG502Q-EA uses UIM Remote slot 1 only
+// while it runs on physical slot 1 (NR7101, 2026-11-21: on slot 2 one SELECT
+// MF, then a power-down every 7 s). The session puts it there first, answers
+// sim_slot for the bring-ups meanwhile, and puts it back once no remote card
+// is wanted.
+{
+	let t = { now: 1000 };
+	let target = fake_client(), donor = apdu_donor();
+	let m0_active = 2, switches = [];
+	let slots_of = (ref) => (ref == 'm0')
+		? [ { physical: 1, active: m0_active == 1, logical_slot: 1, card: 'absent' },
+		    { physical: 2, active: m0_active == 2, logical_slot: 1, card: 'present', iccid: '89490200001022832490' } ]
+		: slots_242;
+	let p = donor_plugin({ t: t, target: target, donor: donor,
+		sim_slots: (ref, cb) => cb(null, { slots: slots_of(ref) }) });
+	// sim_switch_slot is a dep the fake does not give by default
+	p = null;
+	let targets = {};
+	p = rsim.create({
+		log: (l, m) => null, sim_changed: () => null,
+		modem_of: (ref) => ({ modem: (ref == 'm0') ? (targets[ref] ??= { state: 'READY', lowpower_parked: true }) : modem_obj(ref) }),
+		qmi_client: (ref, schema, cb) => cb(null, (ref == 'm1') ? donor : target),
+		qmi_release: () => null,
+		modem_radio: (ref, on, cb) => cb?.(null),
+		sim_slots: (ref, cb) => cb(null, { slots: slots_of(ref) }),
+		sim_switch_slot: (ref, phys, cb) => { push(switches, [ ref, phys ]); if (ref == 'm0') m0_active = phys; cb(null, {}); },
+		modem_sections: () => ({}),
+		now: () => t.now,
+	});
+	let ext = { rsim_reader: 'modem:m1', rsim_donor_mode: 'apdu', rsim_donor_slot: '2', rsim_fallback: 'local' };
+
+	p.tick('m0', ext);
+	run_for(50);
+	eq(switches, [ [ 'm0', 1 ] ], 'client slot: the modem is switched to the remote card\'s physical slot first');
+	eq(target.events(), [], 'client slot: ...and that attempt ends there, nothing offered yet');
+
+	t.now += 30;
+	p.tick('m0', ext);
+	run_for(50);
+	ok(length(target.events()) > 0, 'client slot: on the right slot the remote card is offered');
+	eq(p.sim_slot('m0', ext)?.slot, 1, 'client slot: sim_slot answers the remote card\'s slot for the bring-ups');
+	eq(length(switches), 1, 'client slot: no second switch while it is right');
+
+	// the modem restarted: the session ends and the next starts a tick later —
+	// the bring-up in between must still hear the remote card's slot
+	target.destroyed = true;
+	p.tick('m0', ext);
+	run_for(50);
+	eq(p.sim_slot('m0', ext)?.slot, 1, 'client slot: between two sessions (a modem restart) still the remote card\'s slot');
+	target.destroyed = false;
+
+	// the remote card switched off: back to the modem's own card's slot
+	let off = { rsim_fallback: 'local' };
+	p.tick('m0', off);
+	run_for(50);
+	t.now += 30;
+	p.tick('m0', off);
+	run_for(50);
+	eq(switches[length(switches) - 1], [ 'm0', 2 ], 'client slot: back to physical slot 2 once no remote card is wanted');
+	eq(p.sim_slot('m0', off), null, 'client slot: ...and sim_slot answers nothing any more');
+}
+
+// the switch back, made robust (Codex review): retried when refused, the
+// first slot kept over a second move, rebuilt from option sim_slot after a
+// daemon restart, and done at the daemon's exit with rsim_fallback local
+let slot_client = (o) => {
+	let st = { active: o.active ?? 2, switches: [], fail_back: o.fail_back ?? 0, t: { now: 1000 } };
+	let target = fake_client(), donor = apdu_donor();
+	let targets = {};
+	st.target = target;
+	st.p = rsim.create({
+		log: (l, m) => null, sim_changed: () => null,
+		modem_of: (ref) => ({ modem: (ref == 'm0')
+			? (targets[ref] ??= { state: 'READY', lowpower_parked: true, config: { sim_slot: o.sim_slot ?? 2 } })
+			: modem_obj(ref) }),
+		qmi_client: (ref, schema, cb) => cb(null, (ref == 'm1') ? donor : target),
+		qmi_release: () => null,
+		modem_radio: (ref, on, cb) => cb?.(null),
+		sim_slots: (ref, cb) => cb(null, { slots: (ref == 'm0')
+			? [ { physical: 1, active: st.active == 1, logical_slot: 1, card: 'absent' },
+			    { physical: 2, active: st.active == 2, logical_slot: 1, card: 'present', iccid: '89490200001022832490' } ]
+			: slots_242 }),
+		sim_switch_slot: (ref, phys, cb) => {
+			push(st.switches, phys);
+			if (phys != 1 && st.fail_back > 0) { st.fail_back--; return cb({ error: 'busy' }); }
+			if (ref == 'm0') st.active = phys;
+			cb(null, {});
+		},
+		modem_sections: () => ({}),
+		now: () => st.t.now,
+	});
+	st.tick = (ext) => { st.p.tick('m0', ext); run_for(50); st.t.now += 30; };
+	return st;
+};
+let on_ext = { rsim_reader: 'modem:m1', rsim_donor_mode: 'apdu', rsim_donor_slot: '2', rsim_fallback: 'local' };
+let off_ext = { rsim_fallback: 'local' };
+{
+	let c = slot_client({ fail_back: 1 });
+	c.tick(on_ext); c.tick(on_ext);
+	c.tick(off_ext); c.tick(off_ext);
+	eq(c.switches, [ 1, 2 ], 'switch back: tried once the remote card is off');
+	eq(c.active, 1, 'switch back: ...refused by the modem');
+	c.tick(off_ext);
+	eq([ c.switches, c.active ], [ [ 1, 2, 2 ], 2 ], 'switch back: tried again on the next tick, and done');
+}
+{
+	// rsim_slot changed to 2 after a 2 -> 1 move, and that second move is
+	// refused: the first record stays, so switching off still finds slot 2
+	let c = slot_client({ fail_back: 1 });
+	c.tick(on_ext); c.tick(on_ext);
+	let on2 = { ...on_ext, rsim_slot: '2' };
+	c.tick(on2); c.tick(on2); c.tick(on2);
+	eq(c.switches[1], 2, 'second move: tried');
+	c.tick(off_ext); c.tick(off_ext); c.tick(off_ext);
+	eq(c.active, 2, 'second move refused: switching off still goes back to the first slot');
+}
+{
+	// a daemon that restarted after moving it: the modem is on slot 1 already
+	let c = slot_client({ active: 1, sim_slot: 2 });
+	c.tick(on_ext); c.tick(on_ext);
+	eq(c.switches, [], 'restart: already on the remote card\'s slot, nothing switched');
+	c.tick(off_ext); c.tick(off_ext);
+	eq(c.active, 2, 'restart: switching it off goes back to option sim_slot');
+}
+{
+	// the daemon stops with rsim_fallback local: the modem gets its own slot back
+	let c = slot_client({});
+	c.tick(on_ext); c.tick(on_ext);
+	eq(c.active, 1, 'exit: on the remote card\'s slot');
+	ok(c.p.stop(), 'exit: stop has work on its way');
+	for (let i = 0; i < 5 && c.p.busy(); i++)
+		run_for(50);
+	eq([ c.active, c.p.busy() ], [ 2, false ], 'exit: back on slot 2 before the daemon is let go');
+}
+
 {
 	let t = { now: 1000 };
 	let target = fake_client(), donor = apdu_donor();

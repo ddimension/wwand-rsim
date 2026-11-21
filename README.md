@@ -419,6 +419,15 @@ Foxconn/Fibocom `AT^EFS`):
 | | Galaxy A5 (2016) over Bluetooth SAP, via a PC | card only (inactive SIM) |
 | Quectel RM520N-GL (MBIM, GL-X3000) | Smartmouse USB on a PC over SSH, through the QMI-over-MBIM passthrough | card only (a test card without service there; 431 commands, identity read) |
 | | the Chateau's Huawei E392 over SSH, APDU over QMI UIM | works (registered, connected with the card's own APN; no data with that SIM's plan) |
+| Quectel RG502Q-EA (QMI, NR7101) | the Chateau's RG650E over SSH (its eUICC, and a plain UICC), SIM Access and APDU | works **only while it runs on physical slot 1** (2026-11-21): on slot 2 it powers the remote card down 7 s after its first SELECT, for ever. The plugin now switches it to the remote card's slot for the session and back after (host-tested; on the hardware so far with `sim_slot '1'` set by hand) |
+
+**The client's physical slot.** A session first puts the modem on the
+physical slot its remote card is offered on (`rsim_slot`, default 1) and
+answers the core's `sim_slot` hook while the card is in use, so a modem reset
+does not switch it back to `option sim_slot`; once no remote card is wanted,
+or a failed one waits for its retry with `rsim_fallback local`, it goes back
+to the slot it ran on. A modem with one slot, or one whose slot list cannot
+be read, is left as it is.
 
 An MBIM modem is a client through its QMI-over-MBIM passthrough (wwand's
 `qmi_client` there): on the RM520N the UIM Remote indications come over it,
