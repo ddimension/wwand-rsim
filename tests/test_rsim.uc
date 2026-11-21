@@ -280,7 +280,12 @@ const ATR = '3B9F96801FC78031A073BE21136743200718000001A5';
 
 let card_model = () => ({
 	present: true, atr: ATR, hang: false,
-	answer: (d) => (substr(d, 0, 10) == 'A0A4000002') ? '9F17' : '9000',
+	// SELECT MF / SELECT 2FE2 answer 9000 by default; READ BINARY (the
+	// power-up EF-ICCID read) answers an ICCID: 98 10 21 43 ... swaps to
+	// 011234567890123421 — the marker publishes once, later power-ups skip it
+	answer: (d) => (substr(d, 0, 10) == 'A0A4000002') ? '9F17'
+		: (d == '00B000000A') ? '981021436587092143129000'
+		: '9000',
 });
 
 let changes = [];
@@ -351,8 +356,11 @@ const EXT = { rsim_reader: 'phoenix:/dev/ttyUSB0' };
 	eq(rsim.hexs(answers[0].args.response), '9F17', 'session: with what the card said, 9Fxx included (the modem does GET RESPONSE)');
 	eq(answers[0].args.info, { total: 2, offset: 0 }, 'session: in one segment');
 	eq(answers[0].args.status, 0, 'session: status success');
-	eq(map(filter(reader.lines, (l) => l.op == 'tpdu'), (l) => l.data), [ 'A0A40000023F00', 'A0C0000017' ],
-	   'session: the TPDUs reach the card unchanged');
+	eq(map(filter(reader.lines, (l) => l.op == 'tpdu'), (l) => l.data),
+	   [ '00A4000C023F00', '00A4000C022FE2', '00B000000A', 'A0A40000023F00', 'A0C0000017' ],
+	   'session: the TPDUs reach the card unchanged (the first three are the power-up EF-ICCID read)');
+	eq(modem_obj('m0').reader_card?.iccid, '011234567890123421',
+	   'session: the card\'s ICCID, read through the reader at power-up — the identity the core adopts');
 
 	client.fire('APDU_IND', { slot: 2, apdu_id: 13, command: rsim.bytes('A0F2000016') });
 	run_for(20);
@@ -755,8 +763,9 @@ function sap_donor(log)
 
 	eq(filter(donor.sent, (x) => x.name == 'SAP_CONNECTION'), [], 'apdu donor: no SIM Access link');
 	ok(length(filter(donor.sent, (x) => x.name == 'GET_ATR')) >= 1, 'apdu donor: the ATR the donor reports');
-	eq(rsim.hexs(filter(donor.sent, (x) => x.name == 'SEND_APDU')[0]?.args?.apdu), 'A0B0000002',
-	   'apdu donor: the command goes through SEND_APDU unchanged');
+	eq(map(filter(donor.sent, (x) => x.name == 'SEND_APDU'), (x) => rsim.hexs(x.args?.apdu)),
+	   [ '00A4000C023F00', '00A4000C022FE2', '00B000000A', 'A0B0000002' ],
+	   'apdu donor: the command goes through SEND_APDU unchanged (after the power-up EF-ICCID read)');
 	eq(rsim.hexs(filter(target.sent, (x) => x.name == 'APDU')[0]?.args?.response), '9000',
 	   'apdu donor: and its answer back to the target');
 }
@@ -805,7 +814,9 @@ function sap_donor(log)
 		target.fire('APDU_IND', { slot: 1, apdu_id: 9, command: rsim.bytes('A0B0000002') });
 		run_for(50);
 
-		eq(at_log, [ 'AT+CSIM=10,"A0B0000002"' ], sprintf('at donor (%s): the command goes over AT+CSIM', variant));
+		eq(at_log, [ 'AT+CSIM=14,"00A4000C023F00"', 'AT+CSIM=14,"00A4000C022FE2"', 'AT+CSIM=10,"00B000000A"',
+		             'AT+CSIM=10,"A0B0000002"' ],
+		   sprintf('at donor (%s): the command goes over AT+CSIM (after the power-up EF-ICCID read)', variant));
 		eq(rsim.hexs(filter(target.sent, (x) => x.name == 'APDU')[0]?.args?.response), '9000',
 		   sprintf('at donor (%s): and its answer back to the target', variant));
 	}
@@ -1285,7 +1296,9 @@ let donor_plugin = (o) => { let targets = {}; return rsim.create({
 
 			let ans = filter(target.sent, (x) => x.name == 'APDU');
 
-			eq(sent, [ 'AT+CSIM=14,"00A40004023F00"' ], 'NCM donor, auto: the command goes over AT+CSIM');
+			eq(sent, [ 'AT+CSIM=14,"00A4000C023F00"', 'AT+CSIM=14,"00A4000C022FE2"', 'AT+CSIM=10,"00B000000A"',
+			           'AT+CSIM=14,"00A40004023F00"' ],
+			   'NCM donor, auto: the command goes over AT+CSIM (after the power-up EF-ICCID read)');
 			eq(rsim.hexs(ans[0]?.args?.response), '9000', 'NCM donor, auto: ...and its answer back to the target');
 		}
 		else {
