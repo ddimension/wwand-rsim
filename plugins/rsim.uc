@@ -1930,6 +1930,23 @@ function create(deps)
 			}, { no_recovery: true });
 	};
 
+	// The identity of the card this modem runs remotely, published the
+	// core's way where it has the seam (deps.reader_card, the documented
+	// plugin card-identity interface) and straight onto the modem object
+	// where it does not — the core's sim.uc unlock/read_identity read
+	// modem.reader_card either way.
+	let publish_card = (ref, card) => {
+		if (deps.reader_card)
+			return deps.reader_card(ref, card);
+
+		let m = deps.modem_of?.(ref)?.modem;
+
+		if (m)
+			m.reader_card = card;
+
+		return !!m;
+	};
+
 	// the card's ATR to the modem, after it (re)powered or reset the card
 	// Every card operation the modem asks for supersedes the ones before it:
 	// a power-up still on its way when a power-down (or a disconnect) comes
@@ -1959,18 +1976,19 @@ function create(deps)
 			s.powered_at ??= now();
 
 			// bench patch 2026-11-15 (phone relays): a reader that sends no
-			// info event (SapRelay over TCP, the BT helper) never sets
-			// modem.reader_card, so the core's synth unlock never fires even
+			// info event (SapRelay over TCP, the BT helper) never sets the
+			// card identity, so the core's synth unlock never fires even
 			// though the card is demonstrably powered and serving APDUs.
 			// Push the marker AND read EF-ICCID through the channel — the
 			// ICCID identifies the card to the core (identity adoption and
 			// per-SIM matching) without which the daemon wedges REGISTERING
 			// with empty identity.
 			let m = deps.modem_of?.(s.ref)?.modem;
-			if (m && !m.reader_card)
-				m.reader_card = { iccid: null, imsi: null };
+			let card = m?.reader_card ?? { iccid: null, imsi: null };
 
-			if (m && m.reader_card?.iccid == null) {
+			publish_card(s.ref, card);
+
+			if (card.iccid == null) {
 				// EF-ICCID read via the channel: SELECT MF (3F00), SELECT
 				// 2FE2, READ BINARY 10 — the channel is transparent for file
 				// ops (proven: SELECT SW 9000 through every relay class).
@@ -1988,7 +2006,7 @@ function create(deps)
 										iccid += substr(raw, i + 1, 1) + substr(raw, i, 1);
 									}
 									if (length(iccid) >= 18) {
-										m.reader_card.iccid = iccid;
+										publish_card(s.ref, { iccid: iccid, imsi: card.imsi ?? null });
 										log('notice', sprintf('rsim %s: channel-read ICCID %s (EF-ICCID through the reader)', s.ref, iccid));
 									}
 								}
@@ -2189,15 +2207,13 @@ function create(deps)
 				s.reader_info = i;
 
 				// bench patch (2026-11-14, router→router lending): publish the
-				// reader's card identity on the modem object. The modem's own
-				// identity reads (UIM EF, DMS cache, AT) cannot see a card that
-				// rides a reader session — it never appears in the modem's UIM
-				// slots (HW-proven: `wwandctl slots` shows the active remote
-				// slot as absent while its APDU session runs). sim.uc's unlock
+				// reader's card identity. The modem's own identity reads (UIM
+				// EF, DMS cache, AT) cannot see a card that rides a reader
+				// session — it never appears in the modem's UIM slots
+				// (HW-proven: `wwandctl slots` shows the active remote slot
+				// as absent while its APDU session runs). sim.uc's unlock
 				// and read_identity consult this to let a reader card through.
-				let m = deps.modem_of?.(ref)?.modem;
-				if (m)
-					m.reader_card = { iccid: i.iccid ?? null, imsi: i.imsi ?? null };
+				publish_card(ref, { iccid: i.iccid ?? null, imsi: i.imsi ?? null });
 
 				keep_settings(ref, ev.iccid, ev.sim);
 				return;
@@ -2398,12 +2414,9 @@ function create(deps)
 		s.state = 'failed';
 		s.queue = [];
 
-		// bench patch (2026-11-14): the reader card is gone — clear the
-		// identity the plugin published on the modem object (see the info
-		// event handler)
-		let m = deps.modem_of?.(s.ref)?.modem;
-		if (m)
-			m.reader_card = null;
+		// bench patch (2026-11-14): the reader card is gone — withdraw the
+		// identity the plugin published (see the info event handler)
+		publish_card(s.ref, null);
 
 		let c = s.client;
 
