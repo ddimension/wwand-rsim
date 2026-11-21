@@ -119,9 +119,15 @@ over AT on every firmware (the RG502Q answers `AT+CPINR` with ERROR);
 the manager ecosystem — ModemManager, oFono — therefore stores no PIN
 to enter at all and leaves verification to explicit calls, and where a
 stored PIN does meet a modem it has reached the wrong SIM
-(openwrt/packages#28540). Auto-entering a configured PIN is this
-plugin's headless choice, so it carries the memory that choice obliges:
-a refused pair is refused forever.
+(openwrt/packages#28540: a proto-held PIN delivered to whichever modem
+`-i any` resolved to, and re-sent at every setup retry). Auto-entering
+a configured PIN is this plugin's headless choice, so it carries the
+memory that choice obliges: a refused pair is refused forever. The rule
+generalizes to any automation that sends a credential: bind the
+credential to the identity it belongs to (it cannot reach the wrong
+device), latch the attempt before it leaves (a lost answer cannot be
+retried blind), and remember refusals across restarts (a wrong
+credential fails once, loudly — not quietly forever).
 
 Readers: `phoenix:<tty>` (a Phoenix/Smartmouse serial reader with switches),
 `wbsm:[USB serial]` (WB Electronics Smartmouse USB: clock and mode set by

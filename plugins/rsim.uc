@@ -1683,6 +1683,10 @@ function create(deps)
 	// event, or the power-up EF-ICCID read), else by the reader it came
 	// through. The file holds the refused PIN — the same secret the
 	// config already carries, on the same box, root-readable like it.
+	// The rule, for any automation that sends a credential: bind the
+	// credential to the identity it belongs to (pin_of below), latch the
+	// attempt before it leaves (pin_done, set before the command runs),
+	// and remember refusals across restarts (this ledger).
 	let PIN_LEDGER = deps.pin_ledger ?? '/etc/wwand/rsim/pin-refused';
 	let pin_ledger = null;
 
