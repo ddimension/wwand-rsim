@@ -1573,6 +1573,105 @@ let donor_plugin = (o) => { let targets = {}; return rsim.create({
 	   'stale commands: a card inserted meanwhile — the command queued for the old one is dropped');
 }
 
+// --- the card's PIN, entered once when the card is offered ---------------------------
+// The shape the wwand#80 review asked for, plugin-side: AT+CPIN? over the core's
+// modem_at once the modem has the card; AT+CPIN=<pin> ONCE per card power-up,
+// latched before the command leaves; a refusal never again this session;
+// deps.retry_sim once the card took it.
+{
+	let t = { now: 1000 };
+	let at = [], resumed = [];
+	let cpin_state = 'SIM PIN', cpin_ok = true;
+	let reader = fake_reader(card_model());
+	let client = fake_client();
+	let p = mk(reader, (ref, schema, cb) => cb(null, client), t, {
+		pin_settle_ms: 20, pin_ask_wait_ms: 20,
+		modem_at: (ref, cmd, cb) => {
+			push(at, cmd);
+
+			if (cmd == 'AT+CPIN?')
+				return cb(null, { lines: [ sprintf('+CPIN: %s', cpin_state), 'OK' ] });
+
+			cb(cpin_ok ? null : { error: 'cme', code: 16 }, cpin_ok ? { lines: [ 'OK' ] } : null);
+		},
+		retry_sim: (ref) => push(resumed, ref),
+	});
+
+	p.tick('m0', { ...EXT, pincode: '2345' });
+	run_for(20);
+	client.fire('CONNECT_IND', { slot: 1 });
+	run_for(50);
+
+	eq(at, [ 'AT+CPIN?', 'AT+CPIN=2345' ], 'pin: offered, and SIM PIN -> the configured PIN entered, once');
+	eq(resumed, [ 'm0' ], 'pin: ...and the core asked to resume the modem that had waited for the card');
+
+	// a card power cycle genuinely re-arms the card's PIN: one fresh entry
+	at = [];
+	client.fire('CARD_RESET_IND', { slot: 1 });
+	run_for(50);
+	eq(at, [ 'AT+CPIN?', 'AT+CPIN=2345' ], 'pin: a power cycle offers the card again -> one fresh entry');
+
+	// READY: nothing of ours to enter
+	cpin_state = 'READY';
+	at = [];
+	client.fire('CARD_RESET_IND', { slot: 1 });
+	run_for(50);
+	eq(at, [ 'AT+CPIN?' ], 'pin: a READY card is only asked');
+
+	// a PUK is never touched: the attempts are spent, unblocking is the
+	// operator's
+	cpin_state = 'SIM PUK';
+	at = [];
+	client.fire('CARD_RESET_IND', { slot: 1 });
+	run_for(50);
+	eq(at, [ 'AT+CPIN?' ], 'pin: a PUK card is sent nothing but the question');
+
+	// an unreadable PIN state: the question repeats a few times, then stops —
+	// never answered by entering anything blind
+	cpin_state = '';
+	at = [];
+	client.fire('CARD_RESET_IND', { slot: 1 });
+	run_for(150);
+	eq(at, [ 'AT+CPIN?', 'AT+CPIN?', 'AT+CPIN?' ], 'pin: no +CPIN answer -> asked three times, nothing entered');
+
+	// a refused entry (a wrong PIN) burns its attempt and latches: this
+	// power cycle's entry goes out — and is refused
+	cpin_state = 'SIM PIN';
+	cpin_ok = false;
+	at = [];
+	client.fire('CARD_RESET_IND', { slot: 1 });
+	run_for(50);
+	eq(at, [ 'AT+CPIN?', 'AT+CPIN=2345' ], 'pin: the entry of its power cycle is sent — and refused');
+	at = [];
+	client.fire('CARD_RESET_IND', { slot: 1 });
+	run_for(50);
+	eq(at, [], 'pin: ...then never again this session, not even the question');
+	at = [];
+	client.fire('CARD_RESET_IND', { slot: 1 });
+	run_for(50);
+	eq(at, [], 'pin: ...nor after another');
+
+	// nothing configured: the modem is not asked at all
+	{
+		let at2 = [];
+		let reader2 = fake_reader(card_model());
+		let client2 = fake_client();
+		let p2 = mk(reader2, (ref, schema, cb) => cb(null, client2), { now: 5000 }, {
+			pin_settle_ms: 20, pin_ask_wait_ms: 20,
+			modem_at: (ref, cmd, cb) => {
+				push(at2, cmd);
+				cb(null, { lines: [ '+CPIN: SIM PIN', 'OK' ] });
+			},
+		});
+
+		p2.tick('m9', EXT);
+		run_for(20);
+		client2.fire('CONNECT_IND', { slot: 1 });
+		run_for(50);
+		eq(at2, [], 'pin: no pincode configured -> not even asked');
+	}
+}
+
 // --- review round: races and leftovers ----------------------------------------------
 
 // the link ends while the sponsor's radio is still being parked: the late

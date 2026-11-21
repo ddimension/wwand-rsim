@@ -1659,6 +1659,10 @@ function create(deps)
 
 	// per modem: the session with the modem and the card
 	let sessions = {};
+	// the configured PIN per modem (option pincode on its wwand_modem),
+	// refreshed by every tick — the card's, entered at most once per card
+	// power-up (pin_offer below)
+	let pins = {};
 	// per modem: the session whose teardown is still in flight. Its
 	// card-removed / connection-unavailable reach the modem asynchronously,
 	// so a new session started meanwhile would be withdrawn by the old one's
@@ -1866,6 +1870,11 @@ function create(deps)
 		ref: ref, cfg: cfg, key: sprintf('%J', cfg),
 		state: 'starting',     // starting | waiting | connected | powered | failed
 		rpc: null, client: null, atr: null, card_gen: 0,
+		// the PIN dance's latch: pin_epoch counts card power-ups (each one
+		// may re-arm the card's PIN), pin_done the epoch it last entered
+		// the PIN for, pin_bad a refusal (a wrong PIN) — never again then
+		pin_epoch: 0, pin_done: null, pin_bad: false,
+		modem_had: false,      // the modem took the card at least once
 		apdus: 0, last_sw: null, last_error: null, since: now(),
 		queue: [], busy: false,
 	});
@@ -1947,6 +1956,114 @@ function create(deps)
 		return !!m;
 	};
 
+	// The PIN entry for the card this modem runs remotely — the half of the
+	// PIN story the core deliberately has none of (ddimension/wwand#80: PIN
+	// entry belongs in the plugin). The card never appears in the modem's
+	// UIM slots, so the core's unlock cannot offer the configured pincode to
+	// it; the modem's own SIM manager asks on its AT layer, which the core's
+	// modem_at dep reaches.
+	//
+	// ONCE, by design, per card power-up: every entry attempt burns one of
+	// the card's three attempts and the third ends in PUK — so the entry is
+	// latched BEFORE the command leaves (an answer that never comes back may
+	// still have reached the card), a refused entry (a wrong PIN) is never
+	// repeated for the life of the session, and only the QUESTION (AT+CPIN?,
+	// which burns nothing) is asked again, a few times, while it fails to
+	// answer. A card power cycle genuinely re-arms the card's PIN and allows
+	// one fresh entry — a power cycle is not an error, it is the card being
+	// offered again ("once, with no retry on any error that may have reached
+	// the card"). A PUK the plugin never touches: that is the operator's to
+	// unblock, off-router.
+	let PIN_SETTLE = +(deps.pin_settle_ms ?? 5000);
+	let PIN_ASK_WAIT = +(deps.pin_ask_wait_ms ?? 5000);
+	let PIN_ASKS = 3;
+
+	let ask;
+	ask = (s, epoch, tries) => {
+		// the session moved on: a later card power-up owns the next ask,
+		// a completed or refused entry ends the dance
+		if (s.state == 'failed' || s.pin_epoch != epoch || s.pin_done == epoch || s.pin_bad)
+			return;
+
+		// CPIN? answers the modem's SIM manager, which holds the card only
+		// once the modem connected: wait for that, quietly (no AT traffic)
+		if (!s.modem_had)
+			return uloop.timer(PIN_ASK_WAIT, () => ask(s, epoch, tries));
+
+		if (!deps.modem_at)
+			return;
+
+		deps.modem_at(s.ref, 'AT+CPIN?', (e, r) => {
+			if (s.state == 'failed' || s.pin_epoch != epoch || s.pin_done == epoch || s.pin_bad)
+				return;
+
+			let st = null;
+
+			for (let l in (r?.lines ?? [])) {
+				let m = match(l, /^\+CPIN:\s*(.+?)\s*$/);
+
+				if (m) {
+					st = trim(m[1]) || null;
+					break;
+				}
+			}
+
+			if (e || st == null) {
+				// the question burnt nothing; asked again a few times, then
+				// left alone — never answered by entering anything blind
+				if (++tries < PIN_ASKS)
+					return uloop.timer(PIN_ASK_WAIT, () => ask(s, epoch, tries));
+
+				return log('warn', sprintf('rsim %s: the card\'s PIN state stayed unreadable (%s) — nothing entered', s.ref, e?.error ?? 'no +CPIN answer'));
+			}
+
+			if (st != 'SIM PIN') {
+				// READY, PH-NET PIN, ...: nothing of ours to enter. A PUK
+				// means the attempts are spent already; only its operator
+				// can unblock the card, never this router
+				if (st == 'SIM PUK')
+					log('err', sprintf('rsim %s: the card asks for its PUK — not entered; the card must be unblocked off-router', s.ref));
+				return;
+			}
+
+			let pin = pins[s.ref];
+
+			if (!pin)
+				return;
+
+			// ONE entry, latched before the command leaves: whatever comes
+			// back — OK, a refusal, nothing — this card power-up is done
+			s.pin_done = epoch;
+			deps.modem_at(s.ref, sprintf('AT+CPIN=%s', pin), (e2) => {
+				if (e2) {
+					// refused: a wrong PIN stays wrong; repeating it would
+					// burn the remaining attempts to PUK. Never again this
+					// session, whatever power cycles follow
+					s.pin_bad = true;
+					return log('err', sprintf('rsim %s: the card refused the configured PIN (%s) — not tried again this session; check option pincode', s.ref, e2.error ?? 'refused'));
+				}
+
+				log('notice', sprintf('rsim %s: the card\'s PIN entered (AT+CPIN)', s.ref));
+
+				// a modem that had stopped for want of a usable card takes
+				// it from here (the core's dep; a modem mid-init ignores it)
+				deps.retry_sim?.(s.ref);
+			}, 10000);
+		}, 10000);
+	};
+
+	let pin_offer = (s) => {
+		let epoch = s.pin_epoch = +(s.pin_epoch ?? 0) + 1;
+
+		// nothing configured: nothing to enter, and no reason to ask
+		if (!pins[s.ref])
+			return;
+
+		// the modem's SIM manager needs a moment with the card before its
+		// PIN state is there to ask about
+		uloop.timer(PIN_SETTLE, () => ask(s, epoch, 0));
+	};
+
 	// the card's ATR to the modem, after it (re)powered or reset the card
 	// Every card operation the modem asks for supersedes the ones before it:
 	// a power-up still on its way when a power-down (or a disconnect) comes
@@ -2017,6 +2134,10 @@ function create(deps)
 				};
 				rd_iccid(() => null);
 			}
+
+			// a card power-up is the offering the PIN rule keys on (the
+			// card re-arms its PIN each time); nothing configured -> a no-op
+			pin_offer(s);
 
 			log('notice', sprintf('rsim %s: card %s, ATR %s', s.ref,
 				(op == 'reset') ? 'reset' : 'powered up', s.atr));
@@ -2101,6 +2222,7 @@ function create(deps)
 
 			s.state = 'connected';
 			s.card_failed = null;
+			s.modem_had = true;
 			log('notice', sprintf('rsim %s: the modem connected to the remote card (slot %d)', s.ref, s.cfg.slot));
 			card_up(s, 'power_up');
 
@@ -2493,6 +2615,10 @@ function create(deps)
 		// every 10 s per modem (plugins.uc): bring the session in line with
 		// the configuration and the modem's life
 		tick: (ref, ext) => {
+			// the PIN the card may ask for (option pincode, the modem's own —
+			// the core's unlock never sees this card, so it is entered here)
+			pins[ref] = ext?.pincode ?? null;
+
 			let rs = resolve(ext);
 			let cfg = rs.cfg;
 			let s = sessions[ref];
@@ -3212,6 +3338,12 @@ return {
 	           // off | local: what the modem runs on while its remote SIM is not connected
 	           'rsim_fallback',
 	           // a named SIM reader (config wwand_simreader) instead of the above
-	           'rsim' ],
+	           'rsim',
+	           // the modem's own option, read here too: the PIN of the card it
+	           // runs remotely — that card never reaches the core's unlock
+	           // (it does not appear in the modem's UIM slots), so the plugin
+	           // enters it: once per card power-up, never retried on a
+	           // refusal (pin_offer)
+	           'pincode' ],
 	create: create,
 };

@@ -86,6 +86,20 @@ Options on the `wwand_modem` section: `rsim_reader` (`phoenix:<tty>` or
 below), and for Phoenix readers `rsim_clock` (kHz, 3579), `rsim_reset`
 (`auto|rts|rts_inv|dtr|dtr_inv`), `rsim_detect` (`none|cts|dsr|cd`).
 
+A remote card that needs its PIN: set the modem's own `option pincode`
+— the core's unlock never sees a reader card (it does not appear in the
+modem's UIM slots), so the plugin enters it on the modem's AT layer:
+once the card is offered and `AT+CPIN?` answers `SIM PIN`, `AT+CPIN=<pin>`
+is sent **once per card power-up**. No entry is ever retried on an error
+that may have reached the card — each blind attempt burns one of the
+card's three, and the third ends in PUK; a refused entry (a wrong PIN)
+is never repeated for the life of the session, and a card asking for its
+PUK is never sent anything (unblock it off-router). After a successful
+entry the plugin asks the core to resume a modem that had stopped for
+want of a card (`deps.retry_sim`). Host-tested; the donor bench
+(NR7101/RG502Q-EA) runs PIN-less cards through the modem's own SIM
+manager.
+
 Readers: `phoenix:<tty>` (a Phoenix/Smartmouse serial reader with switches),
 `wbsm:[USB serial]` (WB Electronics Smartmouse USB: clock and mode set by
 software, `rsim_clock` 3580/3680/6000, `rsim_mode` phoenix/smartmouse),
