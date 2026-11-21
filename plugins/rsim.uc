@@ -2341,11 +2341,21 @@ function create(deps)
 			// Track the card's remaining PIN attempts: every VERIFY (INS
 			// 20) response carries them in SW 63CX (X = remaining). A
 			// successful verify (9000) resets to 3 — the card is open.
-			if ((a.command[1] ?? 0) == 0x20) {
+			// P2 says WHICH password was verified — 00/01 is the (first)
+			// PIN across both card generations (GSM 11.11 CHV1, TS 31.102
+			// PIN1); 81 is the second (fixed dialing). A refused PIN2 says
+			// nothing about OUR PIN's counter, so it is not tracked —
+			// without the filter, a burned PIN2 elsewhere would block the
+			// PIN1 entry here.
+			if ((a.command[1] ?? 0) == 0x20 && (a.command[3] ?? 0) <= 1) {
 				if (s.last_sw == '9000')
 					s.pin_count = 3;
 				else if (substr(s.last_sw, 0, 2) == '63')
-					s.pin_count = hexdec(substr(s.last_sw, 2, 2));
+					// 63Cx: the count is the LOW NIBBLE of SW2 (63C1 = one
+					// attempt left) — read as a NUMBER: hexdec() is a hex
+					// to BINARY string function here, and the whole SW2
+					// would read "C1" as 193 attempts
+					s.pin_count = int(substr(s.last_sw, 3, 1), 16);
 			}
 
 			for (let seg in segments(resp))

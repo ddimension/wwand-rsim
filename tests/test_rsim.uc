@@ -1812,6 +1812,76 @@ let donor_plugin = (o) => { let targets = {}; return rsim.create({
 	fs.unlink(LED);
 }
 
+// --- the card-side retry guard: 63Cn read from the card's own VERIFY answers ---
+// The count the card itself reports guards the entry: a PIN1 burned elsewhere
+// (63C1 = one attempt left) is not entered — and a PIN2 (fixed dialing) refusal
+// says nothing about PIN1's counter, so it must NOT block (the P2 filter).
+{
+	let LED = '/tmp/test-rsim-pin-guard.json';
+
+	fs.unlink(LED);
+
+	let mk_guard = (t0, card) => {
+		let r = { at: [], logs: [], cpin: 'SIM PIN', ok: true,
+			reader: fake_reader(card), client: fake_client() };
+
+		r.p = rsim.create({
+			pin_settle_ms: 20, pin_ask_wait_ms: 20, pin_ledger: LED,
+			log: (l, m) => push(r.logs, m),
+			sim_changed: () => null,
+			open_helper: r.reader.open_helper, helper_path: '/usr/lib/wwand/rsim-card',
+			modem_of: (ref) => ({ modem: modem_obj(ref) }),
+			qmi_client: (ref, schema, cb) => cb(null, r.client),
+			qmi_release: (ref, c) => { c.released = true; },
+			now: () => t0.now,
+			modem_at: (ref, cmd, cb) => {
+				push(r.at, cmd);
+
+				if (cmd == 'AT+CPIN?')
+					return cb(null, { lines: [ sprintf('+CPIN: %s', r.cpin), 'OK' ] });
+
+				cb(r.ok ? null : { error: 'cme', code: 16 }, r.ok ? { lines: [ 'OK' ] } : null);
+			},
+			retry_sim: () => null,
+		});
+
+		return r;
+	};
+
+	// a card whose VERIFY answers 63C1 (one attempt left), whatever P2 it names
+	let burned = () => {
+		let base = card_model();
+
+		return { ...base, answer: (d) => (substr(d, 2, 2) == '20') ? '63C1' : base.answer(d) };
+	};
+
+	// a PIN1 VERIFY burned elsewhere: the entry is refused here, with the way out
+	let g1 = mk_guard({ now: 1000 }, burned());
+	g1.p.tick('m0', { ...EXT, pincode: '2345' });
+	run_for(20);
+	g1.client.fire('CONNECT_IND', { slot: 1 });
+	run_for(10);
+	g1.client.fire('APDU_IND', { slot: 1, apdu_id: 50, command: rsim.bytes('00200001083132333435363738') });
+	run_for(60);
+
+	eq(g1.at, [ 'AT+CPIN?' ], 'guard: one PIN attempt left on the card -> asked, not entered');
+	ok(length(filter(g1.logs, (m) => index(m, 'attempts remaining') >= 0)) == 1,
+	   'guard: ...and the log says so, with pin-force as the way out');
+
+	// a PIN2 (fixed dialing) VERIFY burned: PIN1's counter is untouched
+	let g2 = mk_guard({ now: 9000 }, burned());
+	g2.p.tick('m0', { ...EXT, pincode: '2345' });
+	run_for(20);
+	g2.client.fire('CONNECT_IND', { slot: 1 });
+	run_for(10);
+	g2.client.fire('APDU_IND', { slot: 1, apdu_id: 51, command: rsim.bytes('00200081083132333435363738') });
+	run_for(60);
+
+	eq(g2.at, [ 'AT+CPIN?', 'AT+CPIN=2345' ], 'guard: a refused PIN2 does not block the PIN1 entry');
+
+	fs.unlink(LED);
+}
+
 // --- review round: races and leftovers ----------------------------------------------
 
 // the link ends while the sponsor's radio is still being parked: the late
