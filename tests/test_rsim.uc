@@ -88,6 +88,14 @@ uloop.init();
 	// a paired phone's SIM over the Bluetooth SIM Access Profile
 	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: 'bt:00:11:22:AA:BB:CC' }), '/x'), [ '/x', 'bt:00:11:22:AA:BB:CC' ],
 	   'cfg bt: the phone\'s address; its channel from SDP by the helper\'s default');
+	// a raw line-JSON relay (SapRelay / fake-phone-sim) — netcat is the channel
+	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: 'tcp:192.168.5.51:8802' }), '/x'),
+	   [ 'nc', '192.168.5.51', '8802' ],
+	   'cfg tcp: netcat to the relay, no helper binary and no ssh');
+	eq(rsim.cfg_of({ rsim_reader: 'tcp:192.168.5.51:8802' })?.local_reader, 'tcp:192.168.5.51:8802',
+	   'cfg tcp: a local reader (no ssh dest parsed out)');
+	eq(rsim.cfg_of({ rsim_reader: 'tcp:fe80::1:8802' }), null,
+	   'cfg tcp: bare IPv6 is not supported (brackets unspecified) — refused, not misparsed');
 	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: 'bt:00:11:22:AA:BB:CC', rsim_bt_channel: '8', rsim_bt_security: 'high',
 	                                  rsim_bt_apdu: '7816', rsim_at_radio: 'keep', rsim_clock: '6000' }), '/x'),
 	   [ '/x', 'bt:00:11:22:AA:BB:CC', '--bt-channel', '8', '--bt-security', 'high', '--bt-apdu', '7816' ],
@@ -272,11 +280,21 @@ const ATR = '3B9F96801FC78031A073BE21136743200718000001A5';
 
 let card_model = () => ({
 	present: true, atr: ATR, hang: false,
-	answer: (d) => (substr(d, 0, 10) == 'A0A4000002') ? '9F17' : '9000',
+	// SELECT MF / SELECT 2FE2 answer 9000 by default; READ BINARY (the
+	// power-up EF-ICCID read) answers an ICCID: 98 10 21 43 ... swaps to
+	// 011234567890123421 — the marker publishes once, later power-ups skip it
+	answer: (d) => (substr(d, 0, 10) == 'A0A4000002') ? '9F17'
+		: (d == '00B000000A') ? '981021436587092143129000'
+		: '9000',
 });
 
 let changes = [];
+let MK_LEDGER = '/tmp/test-rsim-pin-ledger-mk.json';
 let mk = (reader, client_of, t, more) => rsim.create({
+	// the refusal ledger: a per-run path, so the suite never touches
+	// /etc and a refusal in one scenario cannot silence the next run
+	pin_ledger: MK_LEDGER,
+	...(more ?? {}),
 	...(more ?? {}),
 	log: (l, m) => null,
 	sim_changed: (ref, why) => push(changes, why),
@@ -343,8 +361,11 @@ const EXT = { rsim_reader: 'phoenix:/dev/ttyUSB0' };
 	eq(rsim.hexs(answers[0].args.response), '9F17', 'session: with what the card said, 9Fxx included (the modem does GET RESPONSE)');
 	eq(answers[0].args.info, { total: 2, offset: 0 }, 'session: in one segment');
 	eq(answers[0].args.status, 0, 'session: status success');
-	eq(map(filter(reader.lines, (l) => l.op == 'tpdu'), (l) => l.data), [ 'A0A40000023F00', 'A0C0000017' ],
-	   'session: the TPDUs reach the card unchanged');
+	eq(map(filter(reader.lines, (l) => l.op == 'tpdu'), (l) => l.data),
+	   [ '00A4000C023F00', '00A4000C022FE2', '00B000000A', 'A0A40000023F00', 'A0C0000017' ],
+	   'session: the TPDUs reach the card unchanged (the first three are the power-up EF-ICCID read)');
+	eq(modem_obj('m0').reader_card?.iccid, '011234567890123421',
+	   'session: the card\'s ICCID, read through the reader at power-up — the identity the core adopts');
 
 	client.fire('APDU_IND', { slot: 2, apdu_id: 13, command: rsim.bytes('A0F2000016') });
 	run_for(20);
@@ -747,8 +768,9 @@ function sap_donor(log)
 
 	eq(filter(donor.sent, (x) => x.name == 'SAP_CONNECTION'), [], 'apdu donor: no SIM Access link');
 	ok(length(filter(donor.sent, (x) => x.name == 'GET_ATR')) >= 1, 'apdu donor: the ATR the donor reports');
-	eq(rsim.hexs(filter(donor.sent, (x) => x.name == 'SEND_APDU')[0]?.args?.apdu), 'A0B0000002',
-	   'apdu donor: the command goes through SEND_APDU unchanged');
+	eq(map(filter(donor.sent, (x) => x.name == 'SEND_APDU'), (x) => rsim.hexs(x.args?.apdu)),
+	   [ '00A4000C023F00', '00A4000C022FE2', '00B000000A', 'A0B0000002' ],
+	   'apdu donor: the command goes through SEND_APDU unchanged (after the power-up EF-ICCID read)');
 	eq(rsim.hexs(filter(target.sent, (x) => x.name == 'APDU')[0]?.args?.response), '9000',
 	   'apdu donor: and its answer back to the target');
 }
@@ -797,7 +819,9 @@ function sap_donor(log)
 		target.fire('APDU_IND', { slot: 1, apdu_id: 9, command: rsim.bytes('A0B0000002') });
 		run_for(50);
 
-		eq(at_log, [ 'AT+CSIM=10,"A0B0000002"' ], sprintf('at donor (%s): the command goes over AT+CSIM', variant));
+		eq(at_log, [ 'AT+CSIM=14,"00A4000C023F00"', 'AT+CSIM=14,"00A4000C022FE2"', 'AT+CSIM=10,"00B000000A"',
+		             'AT+CSIM=10,"A0B0000002"' ],
+		   sprintf('at donor (%s): the command goes over AT+CSIM (after the power-up EF-ICCID read)', variant));
 		eq(rsim.hexs(filter(target.sent, (x) => x.name == 'APDU')[0]?.args?.response), '9000',
 		   sprintf('at donor (%s): and its answer back to the target', variant));
 	}
@@ -1413,7 +1437,9 @@ let off_ext = { rsim_fallback: 'local' };
 
 			let ans = filter(target.sent, (x) => x.name == 'APDU');
 
-			eq(sent, [ 'AT+CSIM=14,"00A40004023F00"' ], 'NCM donor, auto: the command goes over AT+CSIM');
+			eq(sent, [ 'AT+CSIM=14,"00A4000C023F00"', 'AT+CSIM=14,"00A4000C022FE2"', 'AT+CSIM=10,"00B000000A"',
+			           'AT+CSIM=14,"00A40004023F00"' ],
+			   'NCM donor, auto: the command goes over AT+CSIM (after the power-up EF-ICCID read)');
 			eq(rsim.hexs(ans[0]?.args?.response), '9000', 'NCM donor, auto: ...and its answer back to the target');
 		}
 		else {
@@ -1686,6 +1712,310 @@ let off_ext = { rsim_fallback: 'local' };
 	run_for(20);
 	eq(length(filter(reader.lines, (l) => l.op == 'tpdu')) - before, 1,
 	   'stale commands: a card inserted meanwhile — the command queued for the old one is dropped');
+}
+
+// --- the card's PIN, entered once when the card is offered ---------------------------
+// The shape the wwand#80 review asked for, plugin-side: AT+CPIN? over the core's
+// modem_at once the modem has the card; AT+CPIN=<pin> ONCE per card power-up,
+// latched before the command leaves; a refusal never again this session;
+// deps.retry_sim once the card took it.
+{
+	fs.unlink(MK_LEDGER);
+	let t = { now: 1000 };
+	let at = [], resumed = [];
+	let cpin_state = 'SIM PIN', cpin_ok = true;
+	let reader = fake_reader(card_model());
+	let client = fake_client();
+	let p = mk(reader, (ref, schema, cb) => cb(null, client), t, {
+		pin_settle_ms: 20, pin_ask_wait_ms: 20,
+		modem_at: (ref, cmd, cb) => {
+			push(at, cmd);
+
+			if (cmd == 'AT+CPIN?')
+				return cb(null, { lines: [ sprintf('+CPIN: %s', cpin_state), 'OK' ] });
+
+			cb(cpin_ok ? null : { error: 'cme', code: 16 }, cpin_ok ? { lines: [ 'OK' ] } : null);
+		},
+		retry_sim: (ref) => push(resumed, ref),
+	});
+
+	p.tick('m0', { ...EXT, pincode: '2345' });
+	run_for(20);
+	client.fire('CONNECT_IND', { slot: 1 });
+	run_for(50);
+
+	eq(at, [ 'AT+CPIN?', 'AT+CPIN=2345' ], 'pin: offered, and SIM PIN -> the configured PIN entered, once');
+	eq(resumed, [ 'm0' ], 'pin: ...and the core asked to resume the modem that had waited for the card');
+
+	// a card power cycle genuinely re-arms the card's PIN: one fresh entry
+	at = [];
+	client.fire('CARD_RESET_IND', { slot: 1 });
+	run_for(50);
+	eq(at, [ 'AT+CPIN?', 'AT+CPIN=2345' ], 'pin: a power cycle offers the card again -> one fresh entry');
+
+	// READY: nothing of ours to enter
+	cpin_state = 'READY';
+	at = [];
+	client.fire('CARD_RESET_IND', { slot: 1 });
+	run_for(50);
+	eq(at, [ 'AT+CPIN?' ], 'pin: a READY card is only asked');
+
+	// a PUK is never touched: the attempts are spent, unblocking is the
+	// operator's
+	cpin_state = 'SIM PUK';
+	at = [];
+	client.fire('CARD_RESET_IND', { slot: 1 });
+	run_for(50);
+	eq(at, [ 'AT+CPIN?' ], 'pin: a PUK card is sent nothing but the question');
+
+	// an unreadable PIN state: the question repeats a few times, then stops —
+	// never answered by entering anything blind
+	cpin_state = '';
+	at = [];
+	client.fire('CARD_RESET_IND', { slot: 1 });
+	run_for(150);
+	eq(at, [ 'AT+CPIN?', 'AT+CPIN?', 'AT+CPIN?' ], 'pin: no +CPIN answer -> asked three times, nothing entered');
+
+	// a refused entry (a wrong PIN) burns its attempt and latches: this
+	// power cycle's entry goes out — and is refused
+	cpin_state = 'SIM PIN';
+	cpin_ok = false;
+	at = [];
+	client.fire('CARD_RESET_IND', { slot: 1 });
+	run_for(50);
+	eq(at, [ 'AT+CPIN?', 'AT+CPIN=2345' ], 'pin: the entry of its power cycle is sent — and refused');
+	at = [];
+	client.fire('CARD_RESET_IND', { slot: 1 });
+	run_for(50);
+	eq(at, [], 'pin: ...then never again this session, not even the question');
+	at = [];
+	client.fire('CARD_RESET_IND', { slot: 1 });
+	run_for(50);
+	eq(at, [], 'pin: ...nor after another');
+
+	// nothing configured: the card is asked (the question costs nothing),
+	// its PIN is never guessed
+	{
+		let at2 = [], logs2 = [];
+		let reader2 = fake_reader(card_model());
+		let client2 = fake_client();
+		let p2 = rsim.create({
+			pin_settle_ms: 20, pin_ask_wait_ms: 20, pin_ledger: MK_LEDGER,
+			log: (l, m) => push(logs2, m),
+			sim_changed: () => null,
+			open_helper: reader2.open_helper, helper_path: '/usr/lib/wwand/rsim-card',
+			modem_of: (ref) => ({ modem: modem_obj(ref) }),
+			qmi_client: (ref, schema, cb) => cb(null, client2),
+			qmi_release: (ref, c) => { c.released = true; },
+			now: () => 5000,
+			modem_at: (ref, cmd, cb) => {
+				push(at2, cmd);
+				cb(null, { lines: [ '+CPIN: SIM PIN', 'OK' ] });
+			},
+		});
+
+		p2.tick('m9', EXT);
+		run_for(20);
+		client2.fire('CONNECT_IND', { slot: 1 });
+		run_for(50);
+		eq(at2, [ 'AT+CPIN?' ], 'pin: no pincode configured -> asked, nothing entered');
+		ok(length(filter(logs2, (m) => index(m, 'none is configured for it') >= 0)) == 1,
+		   'pin: ...and the log says what is missing');
+	}
+}
+
+// --- the refusal ledger: a refused (card, PIN) pair is never tried again -----------
+// The reboot case is the one that bricks cards: a session-scoped latch resets
+// with every restart, and each restart spends one of the card's three attempts
+// on the same wrong PIN. The ledger persists the refusal, keyed by the card's
+// ICCID (the power-up EF-ICCID read supplies it here).
+{
+	let LED = '/tmp/test-rsim-pin-ledger.json';
+
+	fs.unlink(LED);
+	fs.unlink(MK_LEDGER);
+
+	let mkp = (t0, more) => {
+		let r = { at: [], logs: [], cpin: 'SIM PIN', ok: true,
+			reader: fake_reader(card_model()), client: fake_client() };
+
+		r.p = rsim.create({
+			pin_settle_ms: 20, pin_ask_wait_ms: 20, pin_ledger: LED,
+			log: (l, m) => push(r.logs, m),
+			sim_changed: () => null,
+			open_helper: r.reader.open_helper, helper_path: '/usr/lib/wwand/rsim-card',
+			modem_of: (ref) => ({ modem: modem_obj(ref) }),
+			qmi_client: (ref, schema, cb) => cb(null, r.client),
+			qmi_release: (ref, c) => { c.released = true; },
+			now: () => t0.now,
+			modem_at: (ref, cmd, cb) => {
+				push(r.at, cmd);
+
+				if (cmd == 'AT+CPIN?')
+					return cb(null, { lines: [ sprintf('+CPIN: %s', r.cpin), 'OK' ] });
+
+				cb(r.ok ? null : { error: 'cme', code: 16 }, r.ok ? { lines: [ 'OK' ] } : null);
+			},
+			retry_sim: () => null,
+			...(more ?? {}),
+		});
+
+		return r;
+	};
+
+	// one refusal, persisted
+	let a = mkp({ now: 1000 });
+	a.ok = false;
+	a.p.tick('m0', { ...EXT, pincode: '2345' });
+	run_for(20);
+	a.client.fire('CONNECT_IND', { slot: 1 });
+	run_for(60);
+
+	eq(a.at, [ 'AT+CPIN?', 'AT+CPIN=2345' ], 'ledger: the session sends its one entry — and the card refuses it');
+	let led = json(fs.readfile(LED) ?? '{}');
+	ok(led['011234567890123421']?.pin == '2345', 'ledger: the refusal is persisted, keyed by the card\'s ICCID');
+	ok(length(filter(a.logs, (m) => index(m, 'never tried again') >= 0)) == 1,
+	   'ledger: ...and the log says so, with the way out');
+
+	// THE REBOOT CASE: a fresh instance, the same ledger — the question may
+	// be asked, the PIN is never sent again
+	let b = mkp({ now: 9000 });
+	b.p.tick('m0', { ...EXT, pincode: '2345' });
+	run_for(20);
+	b.client.fire('CONNECT_IND', { slot: 1 });
+	run_for(60);
+
+	eq(b.at, [ 'AT+CPIN?' ], 'ledger: after a restart, the refused PIN is never sent again');
+	let row = b.p.status('m0', { ...EXT, pincode: '2345' });
+	ok(row?.level == 'error' && index(row?.text ?? '', 'pin-clear') >= 0,
+	   'ledger: the status row says the card refused the pin, and how to clear it');
+
+	// the operator fixes the pin: the CHANGED pair gets exactly one chance
+	b.p.tick('m0', { ...EXT, pincode: '9999' });
+	b.client.fire('CARD_RESET_IND', { slot: 1 });
+	run_for(60);
+	eq(b.at, [ 'AT+CPIN?', 'AT+CPIN?', 'AT+CPIN=9999' ], 'ledger: a changed pin re-arms one fresh entry');
+	ok(json(fs.readfile(LED) ?? '{}')['011234567890123421'] == null,
+	   'ledger: the successful entry forgets the old refusal');
+
+	// the card's own binding wins: a wwand_sim section with a pincode is
+	// entered INSTEAD of the modem-wide one — one card's pin never reaches
+	// another card
+	let c = mkp({ now: 20000 }, { sim_sections: () => ({ wwsim_011234567890123421: { pincode: '1111' } }) });
+	c.p.tick('m0', { ...EXT, pincode: '2345' });
+	run_for(20);
+	c.client.fire('CONNECT_IND', { slot: 1 });
+	run_for(60);
+	eq(filter(c.at, (x) => substr(x, 0, 8) == 'AT+CPIN='), [ 'AT+CPIN=1111' ],
+	   'ledger: the card\'s wwand_sim pincode is entered, not the modem-wide one');
+
+	// the explicit way back in: pin_clear
+	c.ok = false;
+	c.client.fire('CARD_RESET_IND', { slot: 1 });
+	run_for(60);
+	eq(json(fs.readfile(LED) ?? '{}')['011234567890123421']?.pin, '1111',
+	   'ledger: the refused card-bound pin is persisted too');
+	let cleared = null;
+	c.p.ops.pin_clear('m0', { ...EXT, pincode: '2345' }, {}, (e, r2) => { cleared = r2; });
+	ok(cleared?.ok == true && +cleared?.cleared >= 1, 'ledger: pin_clear answers');
+	eq(json(fs.readfile(LED) ?? '{}'), {}, 'ledger: ...and empties the ledger');
+	c.ok = true;
+	c.client.fire('CARD_RESET_IND', { slot: 1 });
+	run_for(60);
+	eq(filter(c.at, (x) => substr(x, 0, 8) == 'AT+CPIN='), [ 'AT+CPIN=1111', 'AT+CPIN=1111', 'AT+CPIN=1111' ],
+	   'ledger: after pin-clear the configured pin is tried again — once per power-up, as always (success, refusal, retry)');
+
+	// the one-shot force vouches past the ledger — and is consumed by the
+	// one entry it buys
+	let d = mkp({ now: 40000 });
+	d.ok = false;
+	d.p.tick('m0', { ...EXT, pincode: '2345' });
+	run_for(20);
+	d.client.fire('CONNECT_IND', { slot: 1 });
+	run_for(60);
+	eq(d.at, [ 'AT+CPIN?', 'AT+CPIN=2345' ], 'ledger: (d) the first refusal');
+	d.at = [];
+
+	d.p.ops.pin_force('m0', { ...EXT, pincode: '2345' }, {}, (e, r2) => { cleared = r2; });
+	d.client.fire('CARD_RESET_IND', { slot: 1 });
+	run_for(60);
+	eq(d.at, [ 'AT+CPIN?', 'AT+CPIN=2345' ], 'ledger: pin-force buys exactly one entry past the refusal');
+	d.at = [];
+	d.client.fire('CARD_RESET_IND', { slot: 1 });
+	run_for(60);
+	eq(d.at, [], 'ledger: ...and is spent: the session latches, the next power-up sends nothing');
+
+	fs.unlink(LED);
+}
+
+// --- the card-side retry guard: 63Cn read from the card's own VERIFY answers ---
+// The count the card itself reports guards the entry: a PIN1 burned elsewhere
+// (63C1 = one attempt left) is not entered — and a PIN2 (fixed dialing) refusal
+// says nothing about PIN1's counter, so it must NOT block (the P2 filter).
+{
+	let LED = '/tmp/test-rsim-pin-guard.json';
+
+	fs.unlink(LED);
+
+	let mk_guard = (t0, card) => {
+		let r = { at: [], logs: [], cpin: 'SIM PIN', ok: true,
+			reader: fake_reader(card), client: fake_client() };
+
+		r.p = rsim.create({
+			pin_settle_ms: 20, pin_ask_wait_ms: 20, pin_ledger: LED,
+			log: (l, m) => push(r.logs, m),
+			sim_changed: () => null,
+			open_helper: r.reader.open_helper, helper_path: '/usr/lib/wwand/rsim-card',
+			modem_of: (ref) => ({ modem: modem_obj(ref) }),
+			qmi_client: (ref, schema, cb) => cb(null, r.client),
+			qmi_release: (ref, c) => { c.released = true; },
+			now: () => t0.now,
+			modem_at: (ref, cmd, cb) => {
+				push(r.at, cmd);
+
+				if (cmd == 'AT+CPIN?')
+					return cb(null, { lines: [ sprintf('+CPIN: %s', r.cpin), 'OK' ] });
+
+				cb(r.ok ? null : { error: 'cme', code: 16 }, r.ok ? { lines: [ 'OK' ] } : null);
+			},
+			retry_sim: () => null,
+		});
+
+		return r;
+	};
+
+	// a card whose VERIFY answers 63C1 (one attempt left), whatever P2 it names
+	let burned = () => {
+		let base = card_model();
+
+		return { ...base, answer: (d) => (substr(d, 2, 2) == '20') ? '63C1' : base.answer(d) };
+	};
+
+	// a PIN1 VERIFY burned elsewhere: the entry is refused here, with the way out
+	let g1 = mk_guard({ now: 1000 }, burned());
+	g1.p.tick('m0', { ...EXT, pincode: '2345' });
+	run_for(20);
+	g1.client.fire('CONNECT_IND', { slot: 1 });
+	run_for(10);
+	g1.client.fire('APDU_IND', { slot: 1, apdu_id: 50, command: rsim.bytes('00200001083132333435363738') });
+	run_for(60);
+
+	eq(g1.at, [ 'AT+CPIN?' ], 'guard: one PIN attempt left on the card -> asked, not entered');
+	ok(length(filter(g1.logs, (m) => index(m, 'attempts remaining') >= 0)) == 1,
+	   'guard: ...and the log says so, with pin-force as the way out');
+
+	// a PIN2 (fixed dialing) VERIFY burned: PIN1's counter is untouched
+	let g2 = mk_guard({ now: 9000 }, burned());
+	g2.p.tick('m0', { ...EXT, pincode: '2345' });
+	run_for(20);
+	g2.client.fire('CONNECT_IND', { slot: 1 });
+	run_for(10);
+	g2.client.fire('APDU_IND', { slot: 1, apdu_id: 51, command: rsim.bytes('00200081083132333435363738') });
+	run_for(60);
+
+	eq(g2.at, [ 'AT+CPIN?', 'AT+CPIN=2345' ], 'guard: a refused PIN2 does not block the PIN1 entry');
+
+	fs.unlink(LED);
 }
 
 // --- review round: races and leftovers ----------------------------------------------

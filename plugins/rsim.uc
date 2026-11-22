@@ -41,7 +41,7 @@ function helper_found()
 const SSH_KEY_DIR = '/etc/wwand/rsim';
 // rspro: a card in an osmo-remsim SIM bank; the helper is the remsim client
 // and reaches the server itself, so it is never run over SSH
-const LOCAL_READER = /^((phoenix|pcsc|at|bt):.|wbsm:)/;
+const LOCAL_READER = /^((phoenix|pcsc|at|bt|tcp):.|wbsm:)/;
 const RSPRO_READER = /^rspro:(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(:[0-9]{1,5})?(\/[0-9]{1,5}:[0-9]{1,5})?$/;
 
 // the numbers too, as rsim-card checks them: a port 1..65535, an id or a
@@ -508,6 +508,8 @@ function cfg_of(ext)
 		// a modem's card on ANOTHER wwand router, lent by its wwand-rsim
 		proxy = (substr(remote.reader, 0, 6) == 'wwand:');
 	}
+	else if (substr(r, 0, 4) == 'tcp:' && !match(r, /^tcp:[0-9A-Za-z._-]+:[0-9]{1,5}$/))
+		return null;
 	else if (!match(r, LOCAL_READER) && !rspro_ok(r))
 		return null;
 
@@ -562,7 +564,16 @@ function cfg_of(ext)
 function helper_argv(cfg, path, sys)
 {
 	let reader = cfg.local_reader ?? cfg.reader;
-	let argv = [ cfg.ssh ? (cfg.ssh.helper ?? 'rsim-card') : (path ?? HELPER), reader ];
+	let argv;
+
+	// bench wifi-sim prototype: a tcp:host:port reader is a raw line-JSON
+	// relay (SapRelay / fake-phone-sim) - netcat is the channel, no helper
+	if (substr(reader, 0, 4) == 'tcp:') {
+		let tp = split(substr(reader, 4), ':');
+		argv = [ 'nc', tp[0], tp[1] ];
+	} else {
+		argv = [ cfg.ssh ? (cfg.ssh.helper ?? 'rsim-card') : (path ?? HELPER), reader ];
+	}
 
 	// the other router's wwand lends the card: its proxy speaks the helper's
 	// protocol, so only the command differs
@@ -1597,12 +1608,13 @@ function create(deps)
 	};
 	let read_modems = deps.modem_sections ?? (() => load_network('wwand_modem'));
 	let read_readers = deps.readers ?? (() => load_network('wwand_simreader'));
+	let read_sims = deps.sim_sections ?? (() => load_network('wwand_sim'));
 	let conf_cache = null, conf_stamp = null;
 	let conf = () => {
 		let st = config_stamp();
 
 		if (conf_cache == null || st == null || st !== conf_stamp) {
-			conf_cache = { modems: read_modems() ?? {}, readers: read_readers() ?? {} };
+			conf_cache = { modems: read_modems() ?? {}, readers: read_readers() ?? {}, sims: read_sims() ?? {} };
 			conf_stamp = st;
 		}
 
@@ -1610,6 +1622,7 @@ function create(deps)
 	};
 	let modem_sections = () => conf().modems;
 	let readers = () => conf().readers;
+	let sim_sections = () => conf().sims;
 
 	// ext -> { cfg } (null cfg: no remote SIM) or { error } for a modem that
 	// names a reader which is not there or cannot work
@@ -1648,6 +1661,85 @@ function create(deps)
 
 	// per modem: the session with the modem and the card
 	let sessions = {};
+	// the configured PIN per modem (option pincode on its wwand_modem),
+	// refreshed by every tick — the card's, entered at most once per card
+	// power-up (pin_offer below)
+	let pins = {};
+
+	// A refused PIN is never tried again — PERSISTENTLY, per card and per
+	// PIN. The card's counter is a one-way ratchet (three wrong CHV1
+	// entries end in PUK, and only a correct entry resets it; the count is
+	// not even readable over AT on every firmware — the RG502Q answers
+	// AT+CPINR with ERROR), and the manager world stores no PIN to enter
+	// at all: ModemManager and oFono expose explicit SendPin-style calls
+	// and read the counters from the card. This plugin chooses to enter a
+	// CONFIGURED one (a headless router has nobody to ask), so it owes the
+	// choice a memory: after a refusal, that (card, PIN) pair is refused
+	// forever — across daemon restarts, reboots and new sessions — until
+	// the PIN configured for that card changes, or the operator clears
+	// the ledger (`wwandctl rsim <modem> pin-clear`). Without this, every
+	// reboot would quietly spend another of the card's three attempts.
+	// Keyed by the card's ICCID where it is known (the reader's info
+	// event, or the power-up EF-ICCID read), else by the reader it came
+	// through. The file holds the refused PIN — the same secret the
+	// config already carries, on the same box, root-readable like it.
+	// The rule, for any automation that sends a credential: bind the
+	// credential to the identity it belongs to (pin_of below), latch the
+	// attempt before it leaves (pin_done, set before the command runs),
+	// and remember refusals across restarts (this ledger).
+	let PIN_LEDGER = deps.pin_ledger ?? '/etc/wwand/rsim/pin-refused';
+	let pin_ledger = null;
+
+	let pin_ledger_of = () => {
+		if (pin_ledger == null) {
+			try { pin_ledger = json(fs.readfile(PIN_LEDGER) ?? '') ?? {}; }
+			catch (e) { pin_ledger = {}; }
+
+			if (type(pin_ledger) != 'object')
+				pin_ledger = {};
+		}
+
+		return pin_ledger;
+	};
+
+	let pin_ledger_save = () => {
+		// the ledger's own directory (mkdir of an existing dir answers
+		// EEXIST — tolerate it)
+		try { fs.mkdir(replace(PIN_LEDGER, /\/[^/]*$/, '')); } catch (e) { }
+
+		try {
+			fs.writefile(PIN_LEDGER, sprintf('%J', pin_ledger_of()));
+		}
+		catch (e) {
+			log('warn', sprintf('rsim: the refused-PIN ledger could not be written (%s) — the pair is refused for this session only', e));
+		}
+	};
+
+	// The digits of an ICCID (section names are wwsim_<iccid>; the card
+	// read is 18-20 digits) — the identity a PIN binds to
+	let iccid_digits = (v) => replace(sprintf('%s', v ?? ''), /[^0-9]/g, '');
+
+	// The PIN for the card this modem is being offered: the card's own
+	// first — a `wwand_sim` section (the same per-card settings the core
+	// matches for its local unlock) carries a pincode bound to that ICCID,
+	// so one card's PIN is never offered to another (a stored PIN reaching
+	// the wrong SIM is a real failure of the tooling elsewhere:
+	// openwrt/packages#28540). The modem-wide `pincode` stays the
+	// fallback for cards without a section of their own.
+	let pin_of = (s) => {
+		let id = iccid_digits(s.card_iccid);
+
+		if (length(id) >= 10)
+			for (let name, sec in sim_sections()) {
+				let sid = iccid_digits(sec?.iccid ?? name);
+
+				if (sec?.pincode && length(sid) >= 10 &&
+				    (sid == id || index(id, sid) == 0 || index(sid, id) == 0))
+					return { pin: sprintf('%s', sec.pincode), from: sprintf('wwand_sim %s', name) };
+			}
+
+		return pins[s.ref] ? { pin: sprintf('%s', pins[s.ref]), from: 'pincode' } : null;
+	};
 	// per modem: the session whose teardown is still in flight. Its
 	// card-removed / connection-unavailable reach the modem asynchronously,
 	// so a new session started meanwhile would be withdrawn by the old one's
@@ -1980,6 +2072,15 @@ function create(deps)
 		ref: ref, cfg: cfg, key: sprintf('%J', cfg),
 		state: 'starting',     // starting | waiting | connected | powered | failed
 		rpc: null, client: null, atr: null, card_gen: 0,
+		// the card's ICCID as known from the reader (the info event, or the
+		// power-up EF-ICCID read) — the identity a configured PIN binds to
+		// and the refusal ledger is keyed by
+		card_iccid: null,
+		// the PIN dance's latch: pin_epoch counts card power-ups (each one
+		// may re-arm the card's PIN), pin_done the epoch it last entered
+		// the PIN for, pin_bad a refusal (a wrong PIN) — never again then
+		pin_epoch: 0, pin_done: null, pin_bad: false, pin_force: false, pin_count: null,
+		modem_had: false,      // the modem took the card at least once
 		apdus: 0, last_sw: null, last_error: null, since: now(),
 		queue: [], busy: false,
 	});
@@ -2044,6 +2145,184 @@ function create(deps)
 			}, { no_recovery: true });
 	};
 
+	// The identity of the card this modem runs remotely, published the
+	// core's way where it has the seam (deps.reader_card, the documented
+	// plugin card-identity interface) and straight onto the modem object
+	// where it does not — the core's sim.uc unlock/read_identity read
+	// modem.reader_card either way.
+	let publish_card = (ref, card) => {
+		if (deps.reader_card)
+			return deps.reader_card(ref, card);
+
+		let m = deps.modem_of?.(ref)?.modem;
+
+		if (m)
+			m.reader_card = card;
+
+		return !!m;
+	};
+
+	// The PIN entry for the card this modem runs remotely — the half of the
+	// PIN story the core deliberately has none of (ddimension/wwand#80: PIN
+	// entry belongs in the plugin). The card never appears in the modem's
+	// UIM slots, so the core's unlock cannot offer the configured pincode to
+	// it; the modem's own SIM manager asks on its AT layer, which the core's
+	// modem_at dep reaches.
+	//
+	// ONCE, by design, per card power-up: every entry attempt burns one of
+	// the card's three attempts and the third ends in PUK — so the entry is
+	// latched BEFORE the command leaves (an answer that never comes back may
+	// still have reached the card), a refused entry (a wrong PIN) is never
+	// repeated for the life of the session, and only the QUESTION (AT+CPIN?,
+	// which burns nothing) is asked again, a few times, while it fails to
+	// answer. A card power cycle genuinely re-arms the card's PIN and allows
+	// one fresh entry — a power cycle is not an error, it is the card being
+	// offered again ("once, with no retry on any error that may have reached
+	// the card"). A PUK the plugin never touches: that is the operator's to
+	// unblock, off-router.
+	let PIN_SETTLE = +(deps.pin_settle_ms ?? 5000);
+	let PIN_ASK_WAIT = +(deps.pin_ask_wait_ms ?? 5000);
+	let PIN_ASKS = 3;
+
+	let ask;
+	ask = (s, epoch, tries) => {
+		// the session moved on: a later card power-up owns the next ask,
+		// a completed or refused entry ends the dance (a pin-force vouches
+		// past a refusal of THIS session too)
+		if (s.state == 'failed' || s.pin_epoch != epoch || s.pin_done == epoch || (s.pin_bad && !s.pin_force))
+			return;
+
+		// CPIN? answers the modem's SIM manager, which holds the card only
+		// once the modem connected: wait for that, quietly (no AT traffic)
+		if (!s.modem_had)
+			return uloop.timer(PIN_ASK_WAIT, () => ask(s, epoch, tries));
+
+		if (!deps.modem_at)
+			return;
+
+		deps.modem_at(s.ref, 'AT+CPIN?', (e, r) => {
+			if (s.state == 'failed' || s.pin_epoch != epoch || s.pin_done == epoch || s.pin_bad)
+				return;
+
+			let st = null;
+
+			for (let l in (r?.lines ?? [])) {
+				let m = match(l, /^\+CPIN:\s*(.+?)\s*$/);
+
+				if (m) {
+					st = trim(m[1]) || null;
+					break;
+				}
+			}
+
+			if (e || st == null) {
+				// the question burnt nothing; asked again a few times, then
+				// left alone — never answered by entering anything blind
+				if (++tries < PIN_ASKS)
+					return uloop.timer(PIN_ASK_WAIT, () => ask(s, epoch, tries));
+
+				return log('warn', sprintf('rsim %s: the card\'s PIN state stayed unreadable (%s) — nothing entered', s.ref, e?.error ?? 'no +CPIN answer'));
+			}
+
+			if (st != 'SIM PIN') {
+				// READY, PH-NET PIN, ...: nothing of ours to enter. A PUK
+				// means the attempts are spent already; only its operator
+				// can unblock the card, never this router
+				if (st == 'SIM PUK')
+					log('err', sprintf('rsim %s: the card asks for its PUK — not entered; the card must be unblocked off-router', s.ref));
+				return;
+			}
+
+			// The card's own retry count — read from the VERIFY (INS 20)
+			// responses in the reader's APDU stream. A fresh card answers
+			// 63C3 (three remaining); one burned elsewhere shows 63C2 or
+			// less. The operator's one-shot pin-force overrides this.
+			if (!s.pin_force && s.pin_count != null && s.pin_count < 3) {
+				return log('err', sprintf('rsim %s: the card%s reports %d PIN attempts remaining — not entering (burned elsewhere?); wwandctl rsim %s pin-force to override',
+					s.ref, s.card_iccid ? sprintf(' %s…', substr(iccid_digits(s.card_iccid), 0, 6)) : '', s.pin_count, s.ref));
+			}
+
+			let p = pin_of(s);
+
+			if (!p) {
+				// the card asks for a PIN and none is bound to it: say so
+				// and touch nothing — a PIN we do not have is never guessed
+				return log('err', sprintf('rsim %s: the card%s asks for its PIN and none is configured for it — not entered (a wwand_sim section or option pincode)',
+					s.ref, s.card_iccid ? sprintf(' %s…', substr(iccid_digits(s.card_iccid), 0, 6)) : ''));
+			}
+
+			// the ledger key: the card where it is known, else the reader
+			// it came through (an identity-less relay)
+			let key = iccid_digits(s.card_iccid) || sprintf('reader:%s', s.cfg.reader);
+			let refused = pin_ledger_of()[key];
+
+			// a refused (card, PIN) pair is never tried again — not by this
+			// session, not by the next one, not after a reboot. The session
+			// latch stays UNSET: the block is per (card, pin), so a pin
+			// that CHANGES gets its own one chance on the next power-up.
+			// The operator's one-shot pin-force vouches past this too.
+			if (refused?.pin == p.pin && !s.pin_force)
+				return log('err', sprintf('rsim %s: the card%s asks for its PIN and the configured one was REFUSED before — not tried again; fix the pin, then `wwandctl rsim %s pin-clear`',
+					s.ref, s.card_iccid ? sprintf(' %s…', substr(iccid_digits(s.card_iccid), 0, 6)) : '', s.ref));
+
+			// The one-shot force: the operator explicitly asked for this
+			// entry despite the guards (retry count, ledger). Consumed
+			// HERE — where an entry is actually about to leave — so a
+			// force that never reaches a send is not spent.
+			if (s.pin_force) {
+				s.pin_force = false;
+				log('notice', sprintf('rsim %s: pin-force — the operator asked for this entry despite the guards', s.ref));
+			}
+
+			// the configured PIN changed since the refusal: the refused
+			// pair is gone, the new one gets its one chance
+			if (refused) {
+				delete pin_ledger_of()[key];
+				pin_ledger_save();
+			}
+
+			// ONE entry, latched before the command leaves: whatever comes
+			// back — OK, a refusal, nothing — this card power-up is done
+			s.pin_done = epoch;
+			deps.modem_at(s.ref, sprintf('AT+CPIN=%s', p.pin), (e2) => {
+				if (e2) {
+					// refused: a wrong PIN stays wrong; repeating it would
+					// burn the remaining attempts to PUK. Never again —
+					// this session, the next, and after a reboot (ledger)
+					s.pin_bad = true;
+
+					let l = pin_ledger_of();
+
+					l[key] = { pin: p.pin, at: now(), count: +(l[key]?.count ?? 0) + 1 };
+					pin_ledger_save();
+
+					return log('err', sprintf('rsim %s: the card%s REFUSED the configured PIN (%s) — never tried again; fix the pin, then `wwandctl rsim %s pin-clear`',
+						s.ref, s.card_iccid ? sprintf(' %s…', substr(iccid_digits(s.card_iccid), 0, 6)) : '', e2.error ?? 'refused', s.ref));
+				}
+
+				log('notice', sprintf('rsim %s: the card\'s PIN entered (AT+CPIN)', s.ref));
+
+				// this pair is good; forget any older refusal of it
+				if (pin_ledger_of()[key]) {
+					delete pin_ledger_of()[key];
+					pin_ledger_save();
+				}
+
+				// a modem that had stopped for want of a usable card takes
+				// it from here (the core's dep; a modem mid-init ignores it)
+				deps.retry_sim?.(s.ref);
+			}, 10000);
+		}, 10000);
+	};
+
+	let pin_offer = (s) => {
+		let epoch = s.pin_epoch = +(s.pin_epoch ?? 0) + 1;
+
+		// the modem's SIM manager needs a moment with the card before its
+		// PIN state is there to ask about
+		uloop.timer(PIN_SETTLE, () => ask(s, epoch, 0));
+	};
+
 	// the card's ATR to the modem, after it (re)powered or reset the card
 	// Every card operation the modem asks for supersedes the ones before it:
 	// a power-up still on its way when a power-down (or a disconnect) comes
@@ -2071,6 +2350,60 @@ function create(deps)
 			s.card_failed = null;
 			s.state = 'powered';
 			s.powered_at ??= now();
+
+			// bench patch 2026-11-15 (phone relays): a reader that sends no
+			// info event (SapRelay over TCP, the BT helper) never sets the
+			// card identity, so the core's synth unlock never fires even
+			// though the card is demonstrably powered and serving APDUs.
+			// Push the marker AND read EF-ICCID through the channel — the
+			// ICCID identifies the card to the core (identity adoption and
+			// per-SIM matching) without which the daemon wedges REGISTERING
+			// with empty identity.
+			let m = deps.modem_of?.(s.ref)?.modem;
+			let card = m?.reader_card ?? { iccid: null, imsi: null };
+
+			// the card's identity for this session: already published (the
+			// reader's info event, an earlier session of the same reader),
+			// or the channel read below fills it
+			s.card_iccid ??= (card.iccid != null) ? sprintf('%s', card.iccid) : null;
+
+			publish_card(s.ref, card);
+
+			if (card.iccid == null) {
+				// EF-ICCID read via the channel: SELECT MF (3F00), SELECT
+				// 2FE2, READ BINARY 10 — the channel is transparent for file
+				// ops (proven: SELECT SW 9000 through every relay class).
+				let rd_iccid = (done) => {
+					s.rpc.call({ op: 'tpdu', data: '00A4000C023F00' }, (e1) => {
+						s.rpc.call({ op: 'tpdu', data: '00A4000C022FE2' }, (e2) => {
+							s.rpc.call({ op: 'tpdu', data: '00B000000A' }, (e3, r3) => {
+								let hex = r3?.data ?? '';
+								// SW 9000 + 10 data bytes = the ICCID
+								if (!e3 && length(hex) >= 24 && substr(hex, -4) == '9000') {
+									let raw = substr(hex, 0, 20);
+									// swap nibbles, drop the first (length) byte
+									let iccid = '';
+									for (let i = 2; i < length(raw); i += 2) {
+										iccid += substr(raw, i + 1, 1) + substr(raw, i, 1);
+									}
+									if (length(iccid) >= 18) {
+										publish_card(s.ref, { iccid: iccid, imsi: card.imsi ?? null });
+										s.card_iccid = iccid;
+										log('notice', sprintf('rsim %s: channel-read ICCID %s (EF-ICCID through the reader)', s.ref, iccid));
+									}
+								}
+								done();
+							});
+						});
+					});
+				};
+				rd_iccid(() => null);
+			}
+
+			// a card power-up is the offering the PIN rule keys on (the
+			// card re-arms its PIN each time); nothing configured -> a no-op
+			pin_offer(s);
+
 			log('notice', sprintf('rsim %s: card %s, ATR %s', s.ref,
 				(op == 'reset') ? 'reset' : 'powered up', s.atr));
 			event(s, EV_CARD_RESET, { atr: bytes(s.atr) });
@@ -2130,6 +2463,26 @@ function create(deps)
 			log('debug', sprintf('rsim %s: apdu %d INS %02X -> SW %s, %d bytes, %d ms', s.ref,
 				a.apdu_id, a.command[1] ?? 0, s.last_sw, length(resp) - 2, ms));
 
+			// Track the card's remaining PIN attempts: every VERIFY (INS
+			// 20) response carries them in SW 63CX (X = remaining). A
+			// successful verify (9000) resets to 3 — the card is open.
+			// P2 says WHICH password was verified — 00/01 is the (first)
+			// PIN across both card generations (GSM 11.11 CHV1, TS 31.102
+			// PIN1); 81 is the second (fixed dialing). A refused PIN2 says
+			// nothing about OUR PIN's counter, so it is not tracked —
+			// without the filter, a burned PIN2 elsewhere would block the
+			// PIN1 entry here.
+			if ((a.command[1] ?? 0) == 0x20 && (a.command[3] ?? 0) <= 1) {
+				if (s.last_sw == '9000')
+					s.pin_count = 3;
+				else if (substr(s.last_sw, 0, 2) == '63')
+					// 63Cx: the count is the LOW NIBBLE of SW2 (63C1 = one
+					// attempt left) — read as a NUMBER: hexdec() is a hex
+					// to BINARY string function here, and the whole SW2
+					// would read "C1" as 193 attempts
+					s.pin_count = int(substr(s.last_sw, 3, 1), 16);
+			}
+
 			for (let seg in segments(resp))
 				s.client?.request('APDU', { status: 0, slot: s.cfg.slot, apdu_id: a.apdu_id, ...seg },
 					(e) => e ? log('warn', sprintf('rsim %s: modem refused apdu %d answer: %J', s.ref, a.apdu_id, e)) : null,
@@ -2154,6 +2507,7 @@ function create(deps)
 
 			s.state = 'connected';
 			s.card_failed = null;
+			s.modem_had = true;
 			log('notice', sprintf('rsim %s: the modem connected to the remote card (slot %d)', s.ref, s.cfg.slot));
 			card_up(s, 'power_up');
 
@@ -2258,6 +2612,17 @@ function create(deps)
 				// its wwand_sim, not in the status (the password)
 				delete i.sim;
 				s.reader_info = i;
+
+				// bench patch (2026-11-14, router→router lending): publish the
+				// reader's card identity. The modem's own identity reads (UIM
+				// EF, DMS cache, AT) cannot see a card that rides a reader
+				// session — it never appears in the modem's UIM slots
+				// (HW-proven: `wwandctl slots` shows the active remote slot
+				// as absent while its APDU session runs). sim.uc's unlock
+				// and read_identity consult this to let a reader card through.
+				publish_card(ref, { iccid: i.iccid ?? null, imsi: i.imsi ?? null });
+				s.card_iccid = (i.iccid != null && i.iccid != '') ? sprintf('%s', i.iccid) : s.card_iccid;
+
 				keep_settings(ref, ev.iccid, ev.sim);
 				return;
 			}
@@ -2265,6 +2630,9 @@ function create(deps)
 			if (ev.event == 'removed') {
 				log('notice', sprintf('rsim %s: card removed from the reader', ref));
 				s.atr = null;
+				// the next card is not this one: its identity — and the PIN
+				// bound to it — start over
+				s.card_iccid = null;
 				// nothing for that card is answered any more; the modem
 				// stays connected and powers the next card up itself
 				s.card_gen++;
@@ -2513,6 +2881,10 @@ function create(deps)
 		s.state = 'failed';
 		s.queue = [];
 
+		// bench patch (2026-11-14): the reader card is gone — withdraw the
+		// identity the plugin published (see the info event handler)
+		publish_card(s.ref, null);
+
 		let c = s.client;
 
 		s.client = null;
@@ -2588,6 +2960,10 @@ function create(deps)
 		// every 10 s per modem (plugins.uc): bring the session in line with
 		// the configuration and the modem's life
 		tick: (ref, ext) => {
+			// the PIN the card may ask for (option pincode, the modem's own —
+			// the core's unlock never sees this card, so it is entered here)
+			pins[ref] = ext?.pincode ?? null;
+
 			let rs = resolve(ext);
 			let cfg = rs.cfg;
 			let s = sessions[ref];
@@ -2917,6 +3293,20 @@ function create(deps)
 
 			if (rs.error)
 				return { label: 'remote SIM', text: rs.error, level: 'error' };
+
+			// a PIN the card refused: never tried again until the pin
+			// changes or `pin-clear` — say so, or the silence reads as a
+			// broken reader
+			{
+				let ps = sessions[ref];
+				let pp = ps ? pin_of(ps) : null;
+				let pk = ps ? (iccid_digits(ps.card_iccid) || sprintf('reader:%s', ps.cfg.reader)) : null;
+
+				if (pp && pk && pin_ledger_of()[pk]?.pin == pp.pin)
+					return { label: 'remote SIM', level: 'error',
+					         text: sprintf('the card%s refused the configured PIN — not tried again; fix the pin, then `wwandctl rsim %s pin-clear`',
+					                       ps.card_iccid ? sprintf(' %s…', substr(iccid_digits(ps.card_iccid), 0, 6)) : '', ref) };
+			}
 
 			let l = lend_of(ref);
 
@@ -3322,6 +3712,46 @@ function create(deps)
 				});
 			},
 
+			// the refused-PIN ledger: forget every refused (card, PIN)
+			// pair — the operator's explicit "I fixed the pin", the only
+			// way back in besides changing the configured pin itself
+			pin_clear: (ref, ext, args, cb) => {
+				let l = pin_ledger_of();
+				let n = length(keys(l));
+
+				for (let k in keys(l))
+					delete l[k];
+
+				pin_ledger_save();
+
+				for (let other, os in sessions)
+					os.pin_bad = false;
+
+				log('notice', sprintf('rsim %s: refused-PIN ledger cleared (%d) — the next card power-up tries again', ref, n));
+				cb(null, { ok: true, cleared: n });
+			},
+
+			// one-shot: the operator asks for exactly one PIN entry
+			// despite the guards (ledger, retry count) — their vouch
+			pin_force: (ref, ext, args, cb) => {
+				let found = false;
+
+				for (let other, os in sessions) {
+					if (os.ref != ref)
+						continue;
+
+					os.pin_force = true;
+					os.pin_bad = false;  // release the session latch too
+					found = true;
+				}
+
+				if (!found)
+					return cb({ error: 'no_session' });
+
+				log('notice', sprintf('rsim %s: pin-force armed — the next card offering enters the configured PIN once regardless of the ledger or retry count', ref));
+				cb(null, { ok: true });
+			},
+
 			status: (ref, ext, args, cb) => {
 				let s = sessions[ref];
 				let rs = resolve(ext);
@@ -3484,6 +3914,12 @@ return {
 	           // slot, an eSIM profile) and back after
 	           'rsim_lend_switch',
 	           // a named SIM reader (config wwand_simreader) instead of the above
-	           'rsim' ],
+	           'rsim',
+	           // the modem's own option, read here too: the PIN of the card it
+	           // runs remotely — that card never reaches the core's unlock
+	           // (it does not appear in the modem's UIM slots), so the plugin
+	           // enters it: once per card power-up, never retried on a
+	           // refusal (pin_offer)
+	           'pincode' ],
 	create: create,
 };

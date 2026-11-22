@@ -86,6 +86,49 @@ Options on the `wwand_modem` section: `rsim_reader` (`phoenix:<tty>` or
 below), and for Phoenix readers `rsim_clock` (kHz, 3579), `rsim_reset`
 (`auto|rts|rts_inv|dtr|dtr_inv`), `rsim_detect` (`none|cts|dsr|cd`).
 
+A remote card that needs its PIN: the PIN comes either from a
+`wwand_sim` section bound to that card's ICCID (`option pincode` on
+`config wwand_sim` — the same per-card settings the core matches for its
+own unlock; a PIN bound to one card is never offered to another) or,
+for cards without a section, from the modem's own `option pincode`.
+Once the card is offered and `AT+CPIN?` answers `SIM PIN`, `AT+CPIN=<pin>`
+is sent **once per card power-up**. No entry is ever retried on an error
+that may have reached the card — each blind attempt burns one of the
+card's three, and the third ends in PUK. A refused entry (a wrong PIN)
+is **never tried again, by any later session or reboot either**: the
+refusal is kept in a small ledger under `/etc/wwand/rsim/pin-refused`,
+keyed by the card's ICCID (or the reader, where no identity is known),
+holding the refused pin — the same secret the config carries, on the
+same box. The next power-up with the *same* pin asks nothing and says so
+in the log and the status; a *changed* pin gets its own one chance, and
+`wwandctl rsim <modem> pin-clear` is the operator's explicit way back
+in. Without the ledger, every reboot would quietly spend another of
+the card's attempts on the same wrong PIN. A card asking for its PUK is
+never sent anything (unblock it off-router), and a card whose PIN is
+asked but none is configured for it is not guessed at. After a
+successful entry the plugin asks the core to resume a modem that had
+stopped for want of a card (`deps.retry_sim`). Hardware-proven
+2026-11-21 on the bench chain (a Pixel 10's PIN-enabled SIM over
+Bluetooth SAP to an NR7101/RG502Q-EA): one entry per card power-up
+across three offerings, HOME registration on the card's network, the
+PIN never logged.
+
+Why the ledger, in one paragraph: the card's retry counter is a one-way
+ratchet that only a correct entry resets, and it cannot even be read
+over AT on every firmware (the RG502Q answers `AT+CPINR` with ERROR);
+the manager ecosystem — ModemManager, oFono — therefore stores no PIN
+to enter at all and leaves verification to explicit calls, and where a
+stored PIN does meet a modem it has reached the wrong SIM
+(openwrt/packages#28540: a proto-held PIN delivered to whichever modem
+`-i any` resolved to, and re-sent at every setup retry). Auto-entering
+a configured PIN is this plugin's headless choice, so it carries the
+memory that choice obliges: a refused pair is refused forever. The rule
+generalizes to any automation that sends a credential: bind the
+credential to the identity it belongs to (it cannot reach the wrong
+device), latch the attempt before it leaves (a lost answer cannot be
+retried blind), and remember refusals across restarts (a wrong
+credential fails once, loudly — not quietly forever).
+
 Readers: `phoenix:<tty>` (a Phoenix/Smartmouse serial reader with switches),
 `wbsm:[USB serial]` (WB Electronics Smartmouse USB: clock and mode set by
 software, `rsim_clock` 3580/3680/6000, `rsim_mode` phoenix/smartmouse),

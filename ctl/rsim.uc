@@ -1209,6 +1209,8 @@ return {
 		'rsim [modem] switch                   the modem firmware switch for UIM Remote',
 		'rsim [modem] enable|disable [--reset] set it (a modem reset applies it)',
 		'rsim [modem] restart                  give the modem its own SIM back, then offer the remote one again',
+		'rsim [modem] pin-clear                forget refused card PINs
+					  pin-force                try the PIN once despite guards (one-shot) — the next card power-up tries the configured one again',
 		'rsim ssh-key [user@host]              the router\'s key, and the restricted authorized_keys line for each machine',
 		'rsim readers                          the SIM readers defined (config wwand_simreader) and who uses them',
 		'rsim scan [user@host] [--json]        the readers and ports a machine offers (here, or a SIM host over SSH)',
@@ -1365,8 +1367,16 @@ return {
 			printf('modem %s: remote SIM restarted — `wwandctl rsim` shows how it goes\n', r.modem);
 			break;
 
+		case 'pin-force':
+			ctx.call_ok('modem_plugin', { modem: r.modem, plugin: 'rsim', op: 'pin_force' });
+			break;
+		case 'pin-clear':
+			ctx.call_ok('modem_plugin', { modem: r.modem, plugin: 'rsim', op: 'pin_clear' });
+			printf('modem %s: refused-PIN ledger cleared — the next card power-up tries the configured pin again\n', r.modem);
+			break;
+
 		default:
-			die('usage: wwandctl rsim [modem] [status|switch|enable [--reset]|disable [--reset]|restart|probe|donor-test|sap-switch|sap-enable [--reset]|take-back|lend-allow]');
+			die('usage: wwandctl rsim [modem] [status|switch|enable [--reset]|disable [--reset]|restart|pin-clear|probe|donor-test|sap-switch|sap-enable [--reset]|take-back|lend-allow]');
 		}
 	},
 };
