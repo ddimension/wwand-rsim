@@ -88,6 +88,14 @@ uloop.init();
 	// a paired phone's SIM over the Bluetooth SIM Access Profile
 	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: 'bt:00:11:22:AA:BB:CC' }), '/x'), [ '/x', 'bt:00:11:22:AA:BB:CC' ],
 	   'cfg bt: the phone\'s address; its channel from SDP by the helper\'s default');
+	// a raw line-JSON relay (SapRelay / fake-phone-sim) — netcat is the channel
+	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: 'tcp:192.168.5.51:8802' }), '/x'),
+	   [ 'nc', '192.168.5.51', '8802' ],
+	   'cfg tcp: netcat to the relay, no helper binary and no ssh');
+	eq(rsim.cfg_of({ rsim_reader: 'tcp:192.168.5.51:8802' })?.local_reader, 'tcp:192.168.5.51:8802',
+	   'cfg tcp: a local reader (no ssh dest parsed out)');
+	eq(rsim.cfg_of({ rsim_reader: 'tcp:fe80::1:8802' }), null,
+	   'cfg tcp: bare IPv6 is not supported (brackets unspecified) — refused, not misparsed');
 	eq(rsim.helper_argv(rsim.cfg_of({ rsim_reader: 'bt:00:11:22:AA:BB:CC', rsim_bt_channel: '8', rsim_bt_security: 'high',
 	                                  rsim_bt_apdu: '7816', rsim_at_radio: 'keep', rsim_clock: '6000' }), '/x'),
 	   [ '/x', 'bt:00:11:22:AA:BB:CC', '--bt-channel', '8', '--bt-security', 'high', '--bt-apdu', '7816' ],
