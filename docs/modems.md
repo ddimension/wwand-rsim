@@ -34,13 +34,16 @@ confirming the new value first. The plugin never writes it on its own.
 | Quectel RM520N-GL | MBIM, through wwand's QMI-over-MBIM passthrough | **supported** — registered and connected on the Chateau's Huawei E392 card over SSH (APDU; no data with that SIM's plan); with a Smartmouse USB test card: card only (identity read, 431 commands, no service there) | HW-tested on a GL-X3000, 2026-09-26/27 (README, *What works*) |
 | Quectel RG502Q | QMI | **client works on physical slot 1 only**: it uses UIM Remote slot 1 only while it runs on physical slot 1. On slot 2 (its own card, `sim_slot '2'`) it sends one SELECT MF, gets a correct `61xx`/`9000`, sends nothing more and powers the card down 7 s later, for ever. With `sim_slot '1'` it read an RG650E eUICC lent over SSH completely (110+ APDUs, IMSI 26202). The plugin now switches the modem to the remote card's slot itself for the session and back afterwards (`sim_slot` hook) — that path is host-tested, **not yet HW-verified** | HW on a Zyxel NR7101 (RG502QEAACR13A04M4G_ZYXEL), 2026-11-21 |
 | Foxconn T99W373 (Dell DW5932e, Snapdragon X62) | MBIM, QMI-over-MBIM passthrough | switch **written** with `AT^EFS` (off by default; the vendor keeps UIM Remote unregistered), **not yet tested as a client end-to-end** | HW-observed on an HP EliteBook 850 G7, FW FDE.F0.3.0.1.1.DF.006, 2026-10-30 |
+| ZTE MF286DMODULE (BD_TELIAMF286DV1.0.0B12, the internal modem of the ZTE MF286D router) | QMI | **not supported** — `probe`: "UIM messages not listed by this firmware" (QMI error 71), UIM Remote not offered; `enable --reset` refuses, no EFS command (`AT+QNVFR` and `AT^EFS` both ERROR) | HW-tested on a ZTE MF286D, OpenWrt 25.12.6, 2026-11-07; the modem otherwise fully managed by wwand 1.8.0 |
 | other Quectel (Qualcomm-based) | QMI, or MBIM with the passthrough | **untested** — expected to work if the firmware carries the EFS item | — |
 
 Not a client, by design of the current implementation: NCM modems (no QMI at
 all, e.g. the MeiG SLM770A) and MBIM modems without the QMI passthrough.
 Qualcomm modems of other vendors are untested: the client side would run on
 them as it is, but only where their firmware has UIM Remote on already —
-wwand-rsim has no way to switch it on there (see below).
+wwand-rsim has no way to switch it on there (see below). The ZTE row above is
+the first hardware-tested case of that: the firmware offers no UIM Remote and
+answers neither known EFS command.
 
 ## Clients: other vendors and approaches — tbd
 
